@@ -79,7 +79,7 @@ must return distinct ids (`allocates_distinct_identifiers`).
 ### `Rotation`
 
 ```rust
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Rotation {
     #[default]
     None,
@@ -112,6 +112,9 @@ permits.
   (`composes_rotations_with_wraparound`: `ThreeQuarter.rotated_by(Half) ==
   Quarter`).
 - `swaps_axes()` is `true` only for `Quarter` and `ThreeQuarter`.
+
+`Hash` is derived so that `RenderRequest` (which contains a `Rotation`) can be
+used as a cache key — see [`RenderRequest`](#renderrequest).
 
 ### `PageSize`
 
@@ -208,9 +211,19 @@ every implementation must pass this function unmodified:
 | `insert_page` and `import_pages` accept a position equal to `page_count()` as a valid append, not an out-of-bounds error | `assert_append_positions_are_valid` |
 
 **Error semantics:** unknown `PageId` → `Error::PageNotFound`; index beyond
-range → `Error::IndexOutOfBounds { index, page_count }` (see
-[`error.rs`](../../opdf-core/src/error.rs) — copied in full below for
-convenience):
+range → `Error::IndexOutOfBounds { index, page_count }`. These are not merely
+documented: `assert_document_contract` pins each one with a `matches!`
+assertion on the specific variant, so an implementation that returns
+`Error::Malformed` for everything fails the suite. Where a call could plausibly
+report either — `move_page(unknown_id, 0)` — `PageNotFound` wins: the identity
+is checked before the index. `IndexOutOfBounds::page_count` is **the number of
+pages present when the operation was attempted**, which for `move_page` means
+the count *before* the page is lifted out, not after — a three-page document
+rejecting `to_index = 99` reports "out of bounds for 3 pages"
+(`reports_the_pre_move_page_count_when_rejecting_a_target`, in
+`fakes/vec_document.rs`). See
+[`error.rs`](../../opdf-core/src/error.rs), copied in full below for
+convenience:
 
 ```rust
 #[derive(Debug, thiserror::Error)]
@@ -312,7 +325,7 @@ minimal example (`SetRotation`) that exists only to prove the trait is
 usable — it is test-only, not a fake for reuse.
 
 ```rust
-pub trait Command<D: Document> {
+pub trait Command<D: Document>: Send {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>>;
     fn label(&self) -> String;
 }
@@ -322,13 +335,28 @@ pub trait Command<D: Document> {
 command. Undo/redo is a property of the architecture, not a feature added
 later (see the top-level `README.md`'s "Load-bearing decisions").
 
+**Why `Send` is a supertrait:** the render worker thread owns the document, so
+the UI thread cannot hold a `Document` at all (see
+["Why the render service mentions no document type"](#why-the-render-service-mentions-no-document-type)).
+Commands are therefore built on one thread and applied on another, and the undo
+stack storing the `Box<dyn Command<D>>` inverses may be owned by either side.
+The bound sits on the trait rather than at each use site so that
+`Box<dyn Command<D>>` is sendable everywhere it appears, including as `apply`'s
+return type. A command that captures a non-`Send` value (an `Rc`, a raw handle)
+will not compile — capture the data by value, or make it `Send`.
+
 **Behavioural requirements**, demonstrated by `command.rs`'s test module
 (there is no reusable contract-suite function for `Command` — each track's
 commands are exercised directly by their own tests):
 
 - Applying a command returns the command that reverses it; applying that
   inverse restores the document to its prior state exactly
-  (`applying_the_returned_inverse_restores_the_original_state`).
+  (`applying_the_returned_inverse_restores_the_original_state`). That test
+  compares whole `DocumentSnapshot`s before and after, not a single field —
+  copy that shape when testing a new command, because a one-field check
+  passes a lossy inverse that disturbs page order or identity.
+- `Box<dyn Command<D>>` is `Send`, so an undo stack of inverses can be moved
+  between threads (`boxed_commands_cross_thread_boundaries`).
 - On failure, the document must be left exactly as it was found (stated on
   the trait's doc comment; not separately unit-tested at this layer because
   `VecDocument`'s own mutation methods already guarantee it — see the
@@ -346,7 +374,7 @@ commands are exercised directly by their own tests):
 **Implemented by:** `opdf-core` itself (concrete struct).
 
 ```rust
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RenderRequest {
     pub page: PageId,
     pub scale: f32,
@@ -357,6 +385,10 @@ impl RenderRequest {
     pub fn new(page: PageId, scale: f32) -> Result<Self>;
     pub fn with_rotation(self, rotation: Rotation) -> Self;
 }
+
+impl PartialEq for RenderRequest { /* compares scale bitwise */ }
+impl Eq for RenderRequest {}
+impl std::hash::Hash for RenderRequest { /* hashes scale.to_bits() */ }
 ```
 
 **Purpose:** a request to rasterize one page. `scale` is a zoom factor where
@@ -369,6 +401,17 @@ table below).
 that is not finite and positive — this rejects `0.0`, negative values, `NaN`,
 and infinities (`rejects_a_non_positive_scale`, in `render.rs`'s test
 module).
+
+**Usable as a cache key.** `Eq` and `Hash` are implemented by hand rather than
+derived, because a derived `Eq` is impossible with an `f32` field. Both treat
+`scale` **bitwise**, via `f32::to_bits`, and `PartialEq` is written by hand to
+match so that equality and hashing agree. The consequence, which every track
+must share rather than each inventing its own key type: two requests whose
+scales differ only by floating-point noise are **distinct** keys. A caller that
+wants nearby zoom levels to share one cache entry must quantise `scale` itself
+before constructing the request. `RenderRequest::new` never produces `NaN` or a
+signed zero, so bitwise equality is reflexive in practice
+(`serves_as_a_hash_map_key`, in `render.rs`'s test module).
 
 **Known gap:** `new` does not reject a finite positive scale that is
 absurdly large (e.g. `1e30`) — see [Known gaps](#known-gaps).
@@ -404,6 +447,11 @@ impl Tile {
 
 - `new` returns `Error::Render` if either dimension is zero, or if
   `pixels.len() != width * height * 4` (`rejects_a_buffer_of_the_wrong_length`).
+- `new` computes the expected length with `checked_mul` and returns
+  `Error::Render` naming the dimensions when `width * height * 4` overflows
+  `usize` on the target, rather than wrapping and admitting a buffer far too
+  short for the dimensions claimed
+  (`rejects_dimensions_whose_buffer_length_overflows`).
 - `new` accepts a buffer of exactly the expected length
   (`accepts_a_buffer_of_the_exact_length`).
 - `pixel(x_px, y_px)` reads the four bytes at row-major offset
@@ -411,9 +459,6 @@ impl Tile {
   (`reads_pixels_in_row_major_order`).
 - `pixel` returns `Error::Render` for coordinates outside the tile
   (`rejects_pixels_outside_the_tile`).
-
-**Known gap:** `new` computes `width as usize * height as usize * 4` without
-overflow checking — see [Known gaps](#known-gaps).
 
 ---
 
@@ -472,6 +517,24 @@ pub trait RenderService: Send {
 must never block in `poll()`. The caller runs on the UI thread; a stalled
 poll drops frames.
 
+**Coalescing rule:** submitting the same request twice is permitted.
+**Identical pending requests may be answered by a single response; distinct
+requests each receive their own.** The contract suite's batch assertion submits
+two *distinct* requests and requires two responses, so it does not constrain
+coalescing either way.
+
+**Asynchrony and the contract suite:** because a real implementation answers on
+a worker thread, the suite never assumes a response is ready on the first
+`poll`. It calls a private `drain_responses(&service, expected)` helper that
+polls in a loop with a 5 ms sleep until `expected` responses arrive or a
+2-second deadline passes, then asserts the count *before* indexing. A
+synchronous implementation satisfies this on the first iteration; an
+asynchronous one is given time; a broken one fails on the length assertion with
+a message rather than hanging or panicking on a bare index. Two assertions
+deliberately use a single direct `poll()` instead, because there the
+requirement is that *nothing* arrives — waiting would defeat the check:
+polling an idle service, and confirming a drained batch is not redelivered.
+
 **Behavioural requirements**, as enforced by
 `opdf_core::contract::assert_render_service_contract`
 (`contract/render.rs`) — every implementation must pass this function
@@ -481,12 +544,13 @@ A4, `Rotation::None`; page 2: A4, `Rotation::Quarter`):
 | Requirement | Source assertion |
 | --- | --- |
 | Polling a service with nothing submitted returns an empty vector | `assert_polling_an_idle_service_is_empty` |
-| Each submitted request produces exactly one response, identifying the request it answers; a response is never delivered twice | `assert_every_request_is_answered_once` |
+| A submitted request produces exactly one response, identifying the request it answers; a response is never delivered twice (identical pending requests may share one response — see the coalescing rule above) | `assert_every_request_is_answered_once` |
 | Tile pixel dimensions equal `page_size_pt * scale`, rounded (A4 at scale 2.0 → 1190x1684) | `assert_tile_dimensions_follow_scale` |
+| The formula is exactly `round(size_pt * scale)` — round to **nearest**, floored at one pixel. A4 at scale 0.51 → 303x429 (rounding up would give 304x430); A4 at scale 0.0005 → 1x1, never a zero-sized tile | `assert_pixel_dimensions_round_to_nearest_with_a_one_pixel_floor` |
 | A page's stored rotation swaps the tile's width and height when it is a quarter turn (A4 stored at `Rotation::Quarter`, scale 1.0 → 842x595) | `assert_rotation_swaps_tile_axes` |
 | Submitting a request for an unknown `PageId` still produces exactly one response, and it is `RenderResponse::Failed` — never a panic | `assert_unknown_pages_fail_without_panicking` |
 | The request's `rotation` composes with the page's stored rotation (via `Rotation::rotated_by`), and the resulting tile dimensions reflect the **composed** rotation, not either rotation alone | `assert_view_rotation_composes_with_page_rotation` |
-| Submitting multiple requests before polling produces one response per request, each answering its own request | `assert_batched_requests_each_receive_a_response` |
+| Submitting multiple **distinct** requests before polling produces one response per request, each answering its own request | `assert_batched_requests_each_receive_a_response` |
 
 **Known gap:** `RenderRequest::new` (consumed here) accepts any finite
 positive scale, including absurdly large ones — see
@@ -553,6 +617,11 @@ composition. Both functions panic with a descriptive message on the first
 violated requirement, so a track failing the suite gets a specific pointer
 to what broke, not a bare `assert` failure.
 
+"Error semantics" here means the **specific variant**, not merely that an
+error was returned: every failure assertion in `assert_document_contract`
+uses `matches!` against the documented variant, so a CLI matching on
+`Error::PageNotFound` to print "no such page" can rely on getting it.
+
 **What passing does not prove:**
 
 - **Nothing about `DocumentIo`.** No contract-suite function exists for
@@ -579,23 +648,29 @@ to what broke, not a bare `assert` failure.
 ## Known gaps
 
 Recorded during review so a track does not silently rediscover — and
-silently "fix" or work around — the same issue twice. Both are deferred
-decisions, not accepted-as-correct behaviour:
+silently "fix" or work around — the same issue twice.
 
-1. **`Tile::new` integer overflow.** `width as usize * height as usize * 4`
-   is computed without overflow checking. On a 32-bit `usize` target, or
-   with sufficiently large `width`/`height` even on 64-bit, this can wrap.
-   The consequence is a `Tile` believed to be validated (`pixels.len()` was
-   checked against the wrapped `expected`) whose actual buffer does not
-   match its stated dimensions. Nobody has decided whether the fix is a
-   checked multiplication returning `Error::Render`, a `u32`-bounded pixel
-   count ceiling, or something else — that decision is still open.
+1. ~~**`Tile::new` integer overflow.**~~ **Closed.** `Tile::new` now computes
+   the expected buffer length with `checked_mul` and returns `Error::Render`
+   naming the dimensions when it overflows, on any target width of `usize`.
 
-2. **`RenderRequest::new` accepts absurd scales.** The only validation is
-   "finite and positive." A scale of, say, `1e12` passes `new` and would ask
-   a real rasterizer to produce a tile with astronomically many pixels
-   before anything downstream has a chance to reject it. There is currently
-   no upper bound, and no contract-suite assertion exercises this case. This
-   is left to whichever track first needs to render against a real
-   rasterizer and real memory limits (most likely Track B), not assumed to
-   already be handled.
+2. **`RenderRequest::new` accepts absurd scales.** *Still open at the
+   `RenderRequest` level.* The only validation is "finite and positive," so a
+   scale of `1e30` passes `new`. There is no upper bound on the type and no
+   contract-suite assertion exercising one, because the right ceiling depends
+   on the rasterizer and the memory budget — that decision is left to whichever
+   track first renders against a real rasterizer (most likely Track B).
+
+   What **is** settled is that an oversized request must not take the process
+   down. `FakeRenderService` clamps at a private
+   `MAX_TILE_PIXELS = 64 * 1024 * 1024` (64 mega-pixels, 256 MiB of RGBA):
+   it computes `width * height` with `checked_mul` and, when the result is
+   absent or above the limit, returns `RenderResponse::Failed` naming the
+   requested dimensions and the limit. It does **not** panic, and does **not**
+   silently render a smaller tile than asked for
+   (`fails_an_absurd_scale_instead_of_allocating_or_overflowing`). Without
+   this, an `f32 as u32` cast saturating to `u32::MAX` made
+   `width * height * 4` overflow `usize` even on 64-bit — a debug-build panic,
+   or a release-build wrap followed by a ~1.8e19-iteration loop. Any real
+   implementation is expected to behave the same way: fail the request, loudly,
+   with a reason.
