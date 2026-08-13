@@ -45,7 +45,10 @@ impl PageIdAllocator {
 }
 
 /// Page rotation, in quarter turns clockwise. PDF permits no other values.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+///
+/// `Hash` is derived so that [`crate::render::RenderRequest`] can serve as a
+/// cache key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Rotation {
     /// No rotation.
     #[default]
