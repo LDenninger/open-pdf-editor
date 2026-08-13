@@ -1,5 +1,7 @@
 //! Error type shared by every open-pdf-editor crate.
 
+use crate::page::PageId;
+
 /// Result alias used throughout the workspace.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -21,7 +23,7 @@ pub enum Error {
 
     /// The referenced page does not exist in this document.
     #[error("page not found: {0}")]
-    PageNotFound(u64),
+    PageNotFound(PageId),
 
     /// A positional argument fell outside the document's page range.
     #[error("index {index} out of bounds for {page_count} pages")]
