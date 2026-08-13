@@ -1,6 +1,7 @@
 //! Behavioural contract that every [`Document`] implementation must satisfy.
 
 use crate::document::Document;
+use crate::error::Error;
 use crate::page::{PageId, PageSize, Rotation};
 
 /// Assert that an implementation honours the [`Document`] contract.
@@ -48,8 +49,16 @@ fn assert_lists_ids_in_order<D: Document, F: Fn(usize) -> D>(make_document: &F) 
 fn assert_rejects_unknown_page_ids<D: Document, F: Fn(usize) -> D>(make_document: &F) {
     let document = make_document(1);
     let unknown = PageId::new(u64::MAX);
-    assert!(document.page(unknown).is_err(), "page() must reject unknown identities");
-    assert!(document.index_of(unknown).is_err(), "index_of() must reject unknown identities");
+    assert!(
+        matches!(document.page(unknown), Err(Error::PageNotFound(_))),
+        "page() must reject an unknown identity with Error::PageNotFound, got: {:?}",
+        document.page(unknown)
+    );
+    assert!(
+        matches!(document.index_of(unknown), Err(Error::PageNotFound(_))),
+        "index_of() must reject an unknown identity with Error::PageNotFound, got: {:?}",
+        document.index_of(unknown)
+    );
 }
 
 fn assert_removal_preserves_other_identities<D: Document, F: Fn(usize) -> D>(make_document: &F) {
@@ -58,7 +67,11 @@ fn assert_removal_preserves_other_identities<D: Document, F: Fn(usize) -> D>(mak
     document.remove_page(ids[0]).expect("removing an existing page must succeed");
 
     assert_eq!(document.page_count(), 2, "removal must reduce the page count by one");
-    assert!(document.page(ids[0]).is_err(), "a removed page must no longer resolve");
+    assert!(
+        matches!(document.page(ids[0]), Err(Error::PageNotFound(_))),
+        "a removed page must no longer resolve, and must report Error::PageNotFound, got: {:?}",
+        document.page(ids[0])
+    );
     assert_eq!(document.index_of(ids[1]).expect("survivors keep their identity"), 0);
     assert_eq!(document.index_of(ids[2]).expect("survivors keep their identity"), 1);
 }
@@ -79,7 +92,10 @@ fn assert_move_reorders_without_changing_identity<D: Document, F: Fn(usize) -> D
 fn assert_move_rejects_out_of_range_targets<D: Document, F: Fn(usize) -> D>(make_document: &F) {
     let mut document = make_document(2);
     let ids = document.page_ids();
-    assert!(document.move_page(ids[0], 99).is_err(), "move_page must reject positions beyond the document");
+    assert!(
+        matches!(document.move_page(ids[0], 99), Err(Error::IndexOutOfBounds { .. })),
+        "move_page must reject a position beyond the document with Error::IndexOutOfBounds"
+    );
     assert_eq!(document.page_ids(), ids, "a rejected move must leave the order untouched");
 }
 
@@ -102,8 +118,8 @@ fn assert_insert_returns_a_fresh_identity<D: Document, F: Fn(usize) -> D>(make_d
     assert_eq!(document.index_of(inserted).expect("inserted page must resolve"), 1);
     assert_eq!(document.page_count(), 3, "insert_page must increase the page count by one");
     assert!(
-        document.insert_page(99, PageSize::A4).is_err(),
-        "insert_page must reject positions beyond the document"
+        matches!(document.insert_page(99, PageSize::A4), Err(Error::IndexOutOfBounds { .. })),
+        "insert_page must reject a position beyond the document with Error::IndexOutOfBounds"
     );
 }
 
@@ -141,8 +157,8 @@ fn assert_import_rejects_out_of_range_positions<D: Document, F: Fn(usize) -> D>(
     let mut target = make_document(2);
 
     assert!(
-        target.import_pages(&source, &source_ids, 99).is_err(),
-        "import_pages must reject positions beyond the document"
+        matches!(target.import_pages(&source, &source_ids, 99), Err(Error::IndexOutOfBounds { .. })),
+        "import_pages must reject a position beyond the document with Error::IndexOutOfBounds"
     );
     assert_eq!(target.page_count(), 2, "a rejected import must leave the document untouched");
 }
@@ -152,11 +168,17 @@ fn assert_mutations_reject_unknown_page_ids<D: Document, F: Fn(usize) -> D>(make
     let mut document = make_document(2);
     let before = document.page_ids();
 
-    assert!(document.remove_page(unknown).is_err(), "remove_page must reject unknown identities");
-    assert!(document.move_page(unknown, 0).is_err(), "move_page must reject unknown identities");
     assert!(
-        document.set_rotation(unknown, Rotation::Quarter).is_err(),
-        "set_rotation must reject unknown identities"
+        matches!(document.remove_page(unknown), Err(Error::PageNotFound(_))),
+        "remove_page must reject an unknown identity with Error::PageNotFound"
+    );
+    assert!(
+        matches!(document.move_page(unknown, 0), Err(Error::PageNotFound(_))),
+        "move_page must reject an unknown identity with Error::PageNotFound, in preference to Error::IndexOutOfBounds"
+    );
+    assert!(
+        matches!(document.set_rotation(unknown, Rotation::Quarter), Err(Error::PageNotFound(_))),
+        "set_rotation must reject an unknown identity with Error::PageNotFound"
     );
     assert_eq!(document.page_ids(), before, "a rejected mutation must leave the document untouched");
 }
@@ -170,8 +192,8 @@ fn assert_import_rejects_unknown_source_pages<D: Document, F: Fn(usize) -> D>(ma
     ids.push(PageId::new(u64::MAX));
 
     assert!(
-        target.import_pages(&source, &ids, 0).is_err(),
-        "import_pages must reject unknown source identities"
+        matches!(target.import_pages(&source, &ids, 0), Err(Error::PageNotFound(_))),
+        "import_pages must reject an unknown source identity with Error::PageNotFound"
     );
     assert_eq!(target.page_ids(), before, "a rejected import must leave the document untouched");
 }
