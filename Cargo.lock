@@ -18,11 +18,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
+name = "opdf-app"
+version = "0.0.0"
+dependencies = [
+ "opdf-core",
+]
+
+[[package]]
+name = "opdf-cli"
+version = "0.0.0"
+dependencies = [
+ "opdf-core",
+]
+
+[[package]]
 name = "opdf-core"
 version = "0.0.0"
 dependencies = [
  "crossbeam-channel",
  "thiserror",
+]
+
+[[package]]
+name = "opdf-ops"
+version = "0.0.0"
+dependencies = [
+ "opdf-core",
+]
+
+[[package]]
+name = "opdf-pdf"
+version = "0.0.0"
+dependencies = [
+ "opdf-core",
+]
+
+[[package]]
+name = "opdf-render"
+version = "0.0.0"
+dependencies = [
+ "opdf-core",
 ]
 
 [[package]]
