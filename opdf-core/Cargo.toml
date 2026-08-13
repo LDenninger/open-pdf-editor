@@ -13,4 +13,3 @@ contract-tests = []
 
 [dependencies]
 thiserror.workspace = true
-crossbeam-channel.workspace = true
