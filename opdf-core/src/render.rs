@@ -6,7 +6,16 @@ use crate::error::Error;
 use crate::page::{PageId, Rotation};
 
 /// A request to rasterize one page.
-#[derive(Clone, Copy, PartialEq, Debug)]
+///
+/// This type is usable as a cache key: a tile cache and the UI's tile map both
+/// key on it directly, rather than each inventing its own quantised-scale key.
+///
+/// `scale` participates in equality and hashing **bitwise**, through
+/// [`f32::to_bits`]. Two requests whose scales differ only by floating-point
+/// noise are therefore distinct keys, not the same one. A caller that wants
+/// nearby scales to share a cache entry must quantise the scale itself before
+/// building the request.
+#[derive(Clone, Copy, Debug)]
 pub struct RenderRequest {
     /// Page to rasterize.
     pub page: PageId,
@@ -37,6 +46,27 @@ impl RenderRequest {
     }
 }
 
+//---------------------------------------------------------------------
+// RenderRequest as a cache key: bitwise scale equality and hashing
+//---------------------------------------------------------------------
+
+impl PartialEq for RenderRequest {
+    /// Compare `scale` bitwise, so that equality agrees with [`Hash`].
+    fn eq(&self, other: &Self) -> bool {
+        self.page == other.page && self.rotation == other.rotation && self.scale.to_bits() == other.scale.to_bits()
+    }
+}
+
+impl Eq for RenderRequest {}
+
+impl std::hash::Hash for RenderRequest {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.page.hash(state);
+        self.rotation.hash(state);
+        self.scale.to_bits().hash(state);
+    }
+}
+
 /// A rasterized image, stored as 8-bit RGBA in row-major order.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Tile {
@@ -49,12 +79,19 @@ impl Tile {
     /// Wrap a pixel buffer.
     ///
     /// Returns [`Error::Render`] if the buffer length does not equal
-    /// `width * height * 4`, or if either dimension is zero.
+    /// `width * height * 4`, if either dimension is zero, or if
+    /// `width * height * 4` overflows `usize` on the target — which it can do
+    /// for plausible dimensions on a 32-bit target, where an unchecked
+    /// multiplication would wrap and admit a buffer far too short for the
+    /// dimensions claimed.
     pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Result<Self> {
         if width == 0 || height == 0 {
             return Err(Error::Render(format!("tile dimensions {width}x{height} must both be non-zero")));
         }
-        let expected = width as usize * height as usize * 4;
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixel_count| pixel_count.checked_mul(4))
+            .ok_or_else(|| Error::Render(format!("tile dimensions {width}x{height} overflow the addressable buffer length")))?;
         if pixels.len() != expected {
             return Err(Error::Render(format!("tile buffer has {} bytes, expected {expected}", pixels.len())));
         }
@@ -125,8 +162,9 @@ impl RenderResponse {
 /// Implementations must never block in [`RenderService::poll`]: the caller runs
 /// on the UI thread and a stalled poll drops frames.
 pub trait RenderService: Send {
-    /// Queue a request. Submitting the same request twice is permitted, and
-    /// implementations may coalesce duplicates.
+    /// Queue a request. Submitting the same request twice is permitted:
+    /// identical pending requests may be answered by a single response, while
+    /// distinct requests each receive their own response.
     fn submit(&self, request: RenderRequest);
 
     /// Collect every response completed since the last call, without blocking.
@@ -165,8 +203,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_dimensions_whose_buffer_length_overflows() {
+        //--- u32::MAX squared fits a 64-bit usize, but the four bytes per pixel do not ---
+        let result = Tile::new(u32::MAX, u32::MAX, Vec::new());
+        assert!(
+            matches!(result, Err(Error::Render(_))),
+            "an overflowing buffer length must be reported as Error::Render, not accepted or panicked on"
+        );
+    }
+
+    #[test]
     fn rejects_a_non_positive_scale() {
         assert!(RenderRequest::new(PageId::new(0), 0.0).is_err());
         assert!(RenderRequest::new(PageId::new(0), f32::NAN).is_err());
+    }
+
+    #[test]
+    fn serves_as_a_hash_map_key() {
+        let first = RenderRequest::new(PageId::new(1), 1.0).unwrap();
+        let same = RenderRequest::new(PageId::new(1), 1.0).unwrap();
+        let different_scale = RenderRequest::new(PageId::new(1), 1.5).unwrap();
+
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(first, "first");
+        cache.insert(same, "same");
+        cache.insert(different_scale, "different");
+
+        assert_eq!(cache.len(), 2, "two equal requests must collapse to one key, a differing one must add a second");
+        assert_eq!(cache[&first], "same", "an equal request must address the entry the first one created");
     }
 }
