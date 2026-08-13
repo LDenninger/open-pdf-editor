@@ -26,6 +26,9 @@ where
     assert_insert_returns_a_fresh_identity(&make_document);
     assert_import_preserves_order_and_allocates_fresh_ids(&make_document);
     assert_import_rejects_out_of_range_positions(&make_document);
+    assert_mutations_reject_unknown_page_ids(&make_document);
+    assert_import_rejects_unknown_source_pages(&make_document);
+    assert_append_positions_are_valid(&make_document);
 }
 
 fn assert_reports_its_page_count<D: Document, F: Fn(usize) -> D>(make_document: &F) {
@@ -142,4 +145,63 @@ fn assert_import_rejects_out_of_range_positions<D: Document, F: Fn(usize) -> D>(
         "import_pages must reject positions beyond the document"
     );
     assert_eq!(target.page_count(), 2, "a rejected import must leave the document untouched");
+}
+
+fn assert_mutations_reject_unknown_page_ids<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let unknown = PageId::new(u64::MAX);
+    let mut document = make_document(2);
+    let before = document.page_ids();
+
+    assert!(document.remove_page(unknown).is_err(), "remove_page must reject unknown identities");
+    assert!(document.move_page(unknown, 0).is_err(), "move_page must reject unknown identities");
+    assert!(
+        document.set_rotation(unknown, Rotation::Quarter).is_err(),
+        "set_rotation must reject unknown identities"
+    );
+    assert_eq!(document.page_ids(), before, "a rejected mutation must leave the document untouched");
+}
+
+fn assert_import_rejects_unknown_source_pages<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let source = make_document(1);
+    let mut target = make_document(2);
+    let before = target.page_ids();
+
+    let mut ids = source.page_ids();
+    ids.push(PageId::new(u64::MAX));
+
+    assert!(
+        target.import_pages(&source, &ids, 0).is_err(),
+        "import_pages must reject unknown source identities"
+    );
+    assert_eq!(target.page_ids(), before, "a rejected import must leave the document untouched");
+}
+
+fn assert_append_positions_are_valid<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let mut document = make_document(2);
+    let end = document.page_count();
+    let appended = document
+        .insert_page(end, PageSize::A4)
+        .expect("inserting at page_count must append rather than fail");
+    assert_eq!(
+        document.index_of(appended).expect("an appended page must resolve"),
+        2,
+        "insert_page at page_count must place the page last"
+    );
+    assert_eq!(
+        document.page(appended).expect("an appended page must resolve").size,
+        PageSize::A4,
+        "insert_page must honour the requested page size"
+    );
+
+    let source = make_document(1);
+    let mut target = make_document(2);
+    let target_end = target.page_count();
+    let imported = target
+        .import_pages(&source, &source.page_ids(), target_end)
+        .expect("importing at page_count must append rather than fail");
+    assert_eq!(
+        target.index_of(imported[0]).expect("an imported page must resolve"),
+        2,
+        "import_pages at page_count must place pages last"
+    );
 }
