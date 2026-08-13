@@ -21,6 +21,7 @@ where
     assert_lists_ids_in_order(&make_document);
     assert_rejects_unknown_page_ids(&make_document);
     assert_removal_preserves_other_identities(&make_document);
+    assert_removed_pages_can_be_restored(&make_document);
     assert_move_reorders_without_changing_identity(&make_document);
     assert_move_rejects_out_of_range_targets(&make_document);
     assert_rotation_round_trips(&make_document);
@@ -39,11 +40,16 @@ where
 // Revision counter
 //---------------------------------------------------------------------
 
-/// Check each of the five mutating methods individually.
+/// Check each mutating method individually.
 ///
 /// Checking one and generalising would let an implementation that advances on
 /// `remove_page` but forgets `set_rotation` pass — and forgetting exactly one
 /// mutation is the realistic failure, not forgetting all of them.
+///
+/// `restore_page` is the exception to the file's layout, not to the rule: its
+/// revision behaviour on success and on failure is checked inside
+/// `assert_removed_pages_can_be_restored`, where the trash state it needs is
+/// already set up.
 fn assert_every_mutation_advances_the_revision<D: Document, F: Fn(usize) -> D>(make_document: &F) {
     let mut document = make_document(3);
     let ids = document.page_ids();
@@ -180,6 +186,110 @@ fn assert_removal_preserves_other_identities<D: Document, F: Fn(usize) -> D>(mak
     );
     assert_eq!(document.index_of(ids[1]).expect("survivors keep their identity"), 0);
     assert_eq!(document.index_of(ids[2]).expect("survivors keep their identity"), 1);
+}
+
+/// Check that a deletion can be undone exactly, not approximately.
+///
+/// The whole point of `restore_page` is that the page comes back as *itself*:
+/// an implementation that quietly substitutes a blank page of default geometry
+/// under a fresh identity satisfies every count-based assertion and still leaves
+/// undo broken, so identity, size, and rotation are each pinned individually.
+fn assert_removed_pages_can_be_restored<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    //--- a restored page keeps its identity, geometry, and rotation, and lands where it was asked to ---
+    let mut document = make_document(3);
+    let ids = document.page_ids();
+    document.set_rotation(ids[1], Rotation::Quarter).expect("setting rotation must succeed");
+    let before = document.page(ids[1]).expect("an existing page must resolve");
+
+    document.remove_page(ids[1]).expect("removing an existing page must succeed");
+    let revision_before_restore = document.revision();
+    document.restore_page(ids[1], 0).expect("restoring a removed page must succeed");
+
+    //--- read the identity off the page list first: a restore that allocated a fresh id would otherwise fail as a bare lookup miss, naming the symptom rather than the rule ---
+    assert_eq!(
+        document.page_ids().first().copied(),
+        Some(ids[1]),
+        "restore_page must bring the page back under its original identity, never a freshly allocated one"
+    );
+
+    let restored = document.page(ids[1]).expect("a restored page must resolve");
+    assert_eq!(
+        restored.id, before.id,
+        "a restored page must report its original identity through page(), consistently with page_ids()"
+    );
+    assert_eq!(
+        restored.size, before.size,
+        "a restored page must keep the geometry it had when it was removed, not a default size"
+    );
+    assert_eq!(
+        restored.rotation, before.rotation,
+        "a restored page must keep the rotation it had when it was removed, not Rotation::None"
+    );
+    assert_eq!(
+        document.index_of(ids[1]).expect("a restored page must resolve"),
+        0,
+        "restore_page must place the page at the requested index"
+    );
+    assert_eq!(document.page_count(), 3, "restore_page must increase the page count by one");
+    assert_ne!(
+        revision_before_restore,
+        document.revision(),
+        "restore_page must advance the revision on success"
+    );
+
+    //--- undoing the deletion of a last page restores at page_count, which is an append, not an error ---
+    let mut document = make_document(2);
+    let ids = document.page_ids();
+    document.remove_page(ids[1]).expect("removing an existing page must succeed");
+    let end = document.page_count();
+    document
+        .restore_page(ids[1], end)
+        .expect("restoring at page_count must append rather than fail, or the deletion of a last page cannot be undone");
+    assert_eq!(
+        document.index_of(ids[1]).expect("a restored page must resolve"),
+        1,
+        "restore_page at page_count must place the page last"
+    );
+
+    //--- an out-of-range index is rejected, changes nothing, and does not consume the page ---
+    let mut document = make_document(3);
+    let ids = document.page_ids();
+    document.remove_page(ids[0]).expect("removing an existing page must succeed");
+    let order = document.page_ids();
+    let revision = document.revision();
+
+    //--- each rejection is bound before it is inspected: a mutating call must not be repeated inside the failure message ---
+    let rejected = document.restore_page(ids[0], 99);
+    assert!(
+        matches!(rejected, Err(Error::IndexOutOfBounds { .. })),
+        "restore_page must reject a position beyond the document with Error::IndexOutOfBounds, got: {rejected:?}"
+    );
+    assert_eq!(document.page_ids(), order, "a rejected restore must leave the document untouched");
+    assert_eq!(document.revision(), revision, "a failed restore_page must leave the revision untouched");
+    document
+        .restore_page(ids[0], 0)
+        .expect("a restore rejected for its index must not have discarded the page");
+
+    //--- an identity the document never held is not restorable ---
+    let mut document = make_document(2);
+    let revision = document.revision();
+    let unknown = PageId::new(u64::MAX);
+    let rejected = document.restore_page(unknown, 0);
+    assert!(
+        matches!(rejected, Err(Error::PageNotFound(_))),
+        "restore_page must reject an identity the document never held with Error::PageNotFound, got: {rejected:?}"
+    );
+    assert_eq!(document.revision(), revision, "a failed restore_page must leave the revision untouched");
+
+    //--- restoring a live page is a caller error, distinct from both of the above ---
+    let ids = document.page_ids();
+    let rejected = document.restore_page(ids[0], 0);
+    assert!(
+        matches!(rejected, Err(Error::Unsupported(_))),
+        "restoring a page that is currently present must return Error::Unsupported, never succeed as a no-op or duplicate the page, got: {rejected:?}"
+    );
+    assert_eq!(document.page_ids(), ids, "a rejected restore must leave the document untouched");
+    assert_eq!(document.revision(), revision, "a failed restore_page must leave the revision untouched");
 }
 
 fn assert_move_reorders_without_changing_identity<D: Document, F: Fn(usize) -> D>(make_document: &F) {
