@@ -10,5 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod error;
+pub mod page;
 
 pub use error::{Error, Result};
+pub use page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
