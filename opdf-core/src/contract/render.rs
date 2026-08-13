@@ -39,6 +39,8 @@ where
     assert_tile_dimensions_follow_scale(&make_service);
     assert_rotation_swaps_tile_axes(&make_service);
     assert_unknown_pages_fail_without_panicking(&make_service);
+    assert_view_rotation_composes_with_page_rotation(&make_service);
+    assert_batched_requests_each_receive_a_response(&make_service);
 }
 
 fn assert_polling_an_idle_service_is_empty<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
@@ -95,4 +97,66 @@ fn assert_unknown_pages_fail_without_panicking<S: RenderService, F: Fn(DocumentS
         matches!(responses[0], RenderResponse::Failed { .. }),
         "an unknown page must report failure rather than a tile"
     );
+}
+
+fn assert_view_rotation_composes_with_page_rotation<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
+    //--- an unrotated page viewed at a quarter turn must swap its axes ---
+    let service = make_service(build_snapshot());
+    service.submit(
+        RenderRequest::new(PageId::new(1), 1.0)
+            .expect("scale 1.0 is valid")
+            .with_rotation(Rotation::Quarter),
+    );
+    let responses = service.poll();
+    match &responses[0] {
+        RenderResponse::Ready { tile, .. } => {
+            assert_eq!(tile.width(), 842, "an unrotated A4 page viewed at a quarter turn must be 842 pixels wide");
+            assert_eq!(tile.height(), 595, "an unrotated A4 page viewed at a quarter turn must be 595 pixels tall");
+        }
+        RenderResponse::Failed { reason, .. } => panic!("rendering with a view rotation must succeed, got: {reason}"),
+    }
+
+    //--- a quarter-turned page viewed at a further quarter turn composes to a half turn, restoring its axes ---
+    let service = make_service(build_snapshot());
+    service.submit(
+        RenderRequest::new(PageId::new(2), 1.0)
+            .expect("scale 1.0 is valid")
+            .with_rotation(Rotation::Quarter),
+    );
+    let responses = service.poll();
+    match &responses[0] {
+        RenderResponse::Ready { tile, .. } => {
+            assert_eq!(
+                tile.width(),
+                595,
+                "a quarter-turned A4 page viewed at a further quarter turn must be 595 pixels wide"
+            );
+            assert_eq!(
+                tile.height(),
+                842,
+                "a quarter-turned A4 page viewed at a further quarter turn must be 842 pixels tall"
+            );
+        }
+        RenderResponse::Failed { reason, .. } => panic!("composing page and view rotation must succeed, got: {reason}"),
+    }
+}
+
+fn assert_batched_requests_each_receive_a_response<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
+    let service = make_service(build_snapshot());
+    let first = RenderRequest::new(PageId::new(1), 1.0).expect("scale 1.0 is valid");
+    let second = RenderRequest::new(PageId::new(2), 1.0).expect("scale 1.0 is valid");
+    service.submit(first);
+    service.submit(second);
+
+    let responses = service.poll();
+    assert_eq!(responses.len(), 2, "every submitted request must receive its own response");
+    assert!(
+        responses.iter().any(|response| *response.request() == first),
+        "the first submitted request must be answered"
+    );
+    assert!(
+        responses.iter().any(|response| *response.request() == second),
+        "the second submitted request must be answered"
+    );
+    assert!(service.poll().is_empty(), "a drained batch must not be delivered again");
 }
