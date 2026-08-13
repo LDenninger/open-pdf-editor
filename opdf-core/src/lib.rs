@@ -20,3 +20,6 @@ pub mod document;
 pub use document::{Document, DocumentIo, DocumentSnapshot};
 
 pub mod fakes;
+
+#[cfg(feature = "contract-tests")]
+pub mod contract;
