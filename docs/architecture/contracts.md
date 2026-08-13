@@ -171,6 +171,7 @@ implementation does not exist yet.
 
 ```rust
 pub trait Document {
+    fn revision(&self) -> u64;
     fn page_count(&self) -> usize;
     fn page_ids(&self) -> Vec<PageId>;
     fn page(&self, id: PageId) -> Result<PageInfo>;
@@ -189,6 +190,36 @@ pub trait Document {
 modified. Pages are addressed by `PageId`, which survives reordering.
 Indices appear only as insertion positions and are always interpreted
 against the document's state at the moment of the call.
+
+### The revision counter
+
+`revision()` is a counter that advances whenever the document's structure
+changes. It exists so that a tile cache can key on document state: without it,
+a `RenderRequest` built after `set_rotation(page_3, Quarter)` is byte-identical
+to one built before it, and the cache serves the old orientation forever.
+
+The rules, all enforced by the contract suite:
+
+- **Every mutating method advances it on success** — `remove_page`,
+  `move_page`, `set_rotation`, `insert_page`, `import_pages`. Each is checked
+  individually, so an implementation that advances on four of the five fails.
+- **A failed mutation leaves it untouched.** This binds even when the
+  implementation mutated internally before discovering the failure:
+  `move_page` removes the page before bounds-checking `to_index` and reinserts
+  it on rejection, and that path must not advance the revision.
+- **Read-only calls never advance it** — `page_count`, `page_ids`, `page`,
+  `index_of`, and `revision()` itself.
+- **Values are opaque.** Only equality is meaningful — never ordering, never
+  arithmetic. A caller may ask "is this the revision my tile was rendered at?"
+  and nothing else. `VecDocument` happens to increment by one, and no caller
+  may rely on that.
+- **Undo advances it like any other mutation.** Applying a command's inverse
+  restores the page list but *not* the revision the document had before the
+  command; a revision that went backwards would let a cache resurrect entries
+  it had already invalidated
+  (`applying_the_returned_inverse_restores_the_original_state`, in
+  `command.rs`, which therefore compares `snapshot.pages` rather than whole
+  snapshots).
 
 **Behavioural requirements**, as enforced by
 `opdf_core::contract::assert_document_contract` (`contract/document.rs`) —
@@ -209,6 +240,9 @@ every implementation must pass this function unmodified:
 | `remove_page`, `move_page`, and `set_rotation` all reject an unknown `PageId` and leave the document untouched on rejection | `assert_mutations_reject_unknown_page_ids` |
 | `import_pages` rejects a request naming an unknown source page and leaves the target untouched | `assert_import_rejects_unknown_source_pages` |
 | `insert_page` and `import_pages` accept a position equal to `page_count()` as a valid append, not an out-of-bounds error | `assert_append_positions_are_valid` |
+| Each of `remove_page`, `move_page`, `set_rotation`, `insert_page`, and `import_pages` advances `revision()` on success — checked one method at a time | `assert_every_mutation_advances_the_revision` |
+| A mutation rejected for an unknown `PageId` **or** for an out-of-range index leaves `revision()` untouched, including `move_page`'s remove-then-reinsert path | `assert_failed_mutations_leave_the_revision_untouched` |
+| `page_count`, `page_ids`, `page`, and `index_of` never advance `revision()`, and two consecutive `revision()` reads with no mutation between them agree | `assert_read_only_calls_never_advance_the_revision` |
 
 **Error semantics:** unknown `PageId` → `Error::PageNotFound`; index beyond
 range → `Error::IndexOutOfBounds { index, page_count }`. These are not merely
@@ -297,6 +331,7 @@ exists for this trait yet — Track A adds one alongside its implementation):**
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct DocumentSnapshot {
     pub pages: Vec<PageInfo>,
+    pub revision: u64,
 }
 
 impl DocumentSnapshot {
@@ -305,13 +340,28 @@ impl DocumentSnapshot {
 }
 ```
 
-**Purpose:** an immutable copy of a document's page list. The UI holds a
-snapshot rather than the document itself — see
+**Purpose:** an immutable copy of a document's page list, together with the
+`Document::revision` it was captured at. The UI holds a snapshot rather than
+the document itself — see
 ["Why the render service mentions no document type"](#why-the-render-service-mentions-no-document-type).
 
-**Behavioural requirement:** `DocumentSnapshot::of` captures pages in
-document order, matching `document.page_ids()`
-(`snapshots_pages_in_document_order`, in `fakes/vec_document.rs`).
+**Behavioural requirements:**
+
+- `DocumentSnapshot::of` captures pages in document order, matching
+  `document.page_ids()` (`snapshots_pages_in_document_order`, in
+  `fakes/vec_document.rs`).
+- `DocumentSnapshot::of` captures `document.revision()` into `revision`, so a
+  snapshot taken after a mutation never reports the revision of one taken
+  before it (`snapshots_the_revision_alongside_the_pages`, same file). This is
+  the value a caller feeds to `RenderRequest::new`: the snapshot is the UI's
+  only view of the document, so it must carry everything a render request
+  needs.
+
+**Note on `PartialEq`:** because `revision` is a field, two snapshots of a
+structurally identical document taken at different revisions are **not** equal.
+A test asserting that some operation round-trips should compare
+`snapshot.pages`, not the whole snapshot — see the undo rule under
+[`Document`](#document).
 
 ---
 
@@ -377,30 +427,42 @@ commands are exercised directly by their own tests):
 #[derive(Clone, Copy, Debug)]
 pub struct RenderRequest {
     pub page: PageId,
+    pub revision: u64,
     pub scale: f32,
     pub rotation: Rotation,
 }
 
 impl RenderRequest {
-    pub fn new(page: PageId, scale: f32) -> Result<Self>;
+    pub fn new(page: PageId, revision: u64, scale: f32) -> Result<Self>;
     pub fn with_rotation(self, rotation: Rotation) -> Self;
 }
 
-impl PartialEq for RenderRequest { /* compares scale bitwise */ }
+impl PartialEq for RenderRequest { /* compares scale bitwise; revision participates */ }
 impl Eq for RenderRequest {}
-impl std::hash::Hash for RenderRequest { /* hashes scale.to_bits() */ }
+impl std::hash::Hash for RenderRequest { /* hashes revision and scale.to_bits() */ }
 ```
 
 **Purpose:** a request to rasterize one page. `scale` is a zoom factor where
 `1.0` renders at 72 dpi — one pixel per PDF point. `rotation` is a view
 rotation applied **on top of** the rotation already stored on the page (see
 `assert_view_rotation_composes_with_page_rotation` in the `RenderService`
-table below).
+table below). `revision` is the `Document::revision` the request was built
+against, normally read straight off the `DocumentSnapshot` the UI holds.
 
 **Behavioural requirement:** `new` returns `Error::Unsupported` for a scale
 that is not finite and positive — this rejects `0.0`, negative values, `NaN`,
 and infinities (`rejects_a_non_positive_scale`, in `render.rs`'s test
-module).
+module). It performs no validation on `revision`, which is an opaque `u64`
+and may be any value.
+
+**`revision` is a required argument, on purpose.** There is no default and no
+`with_revision` builder step, deliberately, and a track must not add one. A
+caller who omits the revision silently reintroduces exactly the bug the field
+exists to prevent — a tile cached before an edit served after it — and a bug
+that produces stale pixels rather than a compile error is one nobody finds. So
+the compiler forces the decision at every call site. `with_rotation` remains a
+builder step because forgetting a view rotation is visible on screen
+immediately; forgetting a revision is not.
 
 **Usable as a cache key.** `Eq` and `Hash` are implemented by hand rather than
 derived, because a derived `Eq` is impossible with an `f32` field. Both treat
@@ -412,6 +474,14 @@ wants nearby zoom levels to share one cache entry must quantise `scale` itself
 before constructing the request. `RenderRequest::new` never produces `NaN` or a
 signed zero, so bitwise equality is reflexive in practice
 (`serves_as_a_hash_map_key`, in `render.rs`'s test module).
+
+`revision` participates in both `PartialEq` and `Hash`, which is the entire
+point of the field: **two requests differing only in `revision` are distinct
+keys**, so a tile rasterized before a structural change is never returned for a
+request built after one, and the pre-change entry stays addressable under its
+own revision rather than being overwritten
+(`distinguishes_requests_by_revision`, in `render.rs`'s test module, and
+`assert_revision_distinguishes_cache_keys` in the `RenderService` suite).
 
 **Known gap:** `new` does not reject a finite positive scale that is
 absurdly large (e.g. `1e30`) — see [Known gaps](#known-gaps).
@@ -517,6 +587,22 @@ pub trait RenderService: Send {
 must never block in `poll()`. The caller runs on the UI thread; a stalled
 poll drops frames.
 
+**Hard requirement: a renderer does not validate `RenderRequest::revision`.**
+Also stated on the trait's doc comment, and enforced by the suite. The revision
+exists for the benefit of *caches*, not of the rasterizer. An implementation
+carries it and echoes it back unchanged inside the response's `request`, so a
+cache can file the tile under the key it asked for. It must **never** compare
+the revision against whatever state it happens to hold, and must never fail,
+drop, or defer a request because the two disagree.
+
+This is written down because rejecting a mismatched revision is a plausible
+thing for a track to implement and it would be wrong. A real rasterizer may
+legitimately hold several revisions at once — a request queued before an edit,
+a snapshot taken after it — so a service that rejected unfamiliar revisions
+would fail exactly the requests a cache most needs answered. **A service
+holding a snapshot at one revision must still answer a request naming
+another**, rasterizing it exactly as it would any other request.
+
 **Coalescing rule:** submitting the same request twice is permitted.
 **Identical pending requests may be answered by a single response; distinct
 requests each receive their own.** The contract suite's batch assertion submits
@@ -539,7 +625,10 @@ polling an idle service, and confirming a drained batch is not redelivered.
 `opdf_core::contract::assert_render_service_contract`
 (`contract/render.rs`) — every implementation must pass this function
 unmodified. The suite builds a fixed two-page `DocumentSnapshot` (page 1:
-A4, `Rotation::None`; page 2: A4, `Rotation::Quarter`):
+A4, `Rotation::None`; page 2: A4, `Rotation::Quarter`) at a private
+`SNAPSHOT_REVISION = 7` — deliberately not zero, so that an implementation
+quietly assuming a fresh document fails here rather than in a track's own
+tests:
 
 | Requirement | Source assertion |
 | --- | --- |
@@ -551,6 +640,8 @@ A4, `Rotation::None`; page 2: A4, `Rotation::Quarter`):
 | Submitting a request for an unknown `PageId` still produces exactly one response, and it is `RenderResponse::Failed` — never a panic | `assert_unknown_pages_fail_without_panicking` |
 | The request's `rotation` composes with the page's stored rotation (via `Rotation::rotated_by`), and the resulting tile dimensions reflect the **composed** rotation, not either rotation alone | `assert_view_rotation_composes_with_page_rotation` |
 | Submitting multiple **distinct** requests before polling produces one response per request, each answering its own request | `assert_batched_requests_each_receive_a_response` |
+| A request naming a revision the service does not hold is still answered, rasterized identically, with the requested revision echoed back unchanged — never `Failed`, never substituted | `assert_a_foreign_revision_is_still_answered` |
+| Two requests differing only in `revision` are distinct `HashMap` keys, so a pre-change tile is not addressable by a post-change request | `assert_revision_distinguishes_cache_keys` |
 
 **Known gap:** `RenderRequest::new` (consumed here) accepts any finite
 positive scale, including absurdly large ones — see
@@ -560,9 +651,10 @@ positive scale, including absurdly large ones — see
 
 ## Why the render service mentions no document type
 
-`RenderService::submit` takes a `RenderRequest` — a `PageId`, a scale, and a
-rotation — never a `Document` or a document handle of any kind. This is
-deliberate, not an oversight.
+`RenderService::submit` takes a `RenderRequest` — a `PageId`, a revision, a
+scale, and a rotation — never a `Document` or a document handle of any kind.
+This is deliberate, not an oversight. The revision is a bare `u64` for the same
+reason: it names document *state* without naming the document.
 
 The rasterizer that eventually sits behind `RenderService` (PDFium, via
 `opdf-render`) is **not thread-safe**. Per the top-level `README.md`'s
@@ -612,8 +704,9 @@ where
 **What passing proves:** the implementation satisfies every behavioural
 requirement listed in the tables above for `Document` and `RenderService`
 respectively — identity stability, ordering, error semantics on invalid
-input, and (for rendering) correct tile dimensions under scale and rotation
-composition. Both functions panic with a descriptive message on the first
+input, revision advancement on success and non-advancement on failure, and
+(for rendering) correct tile dimensions under scale and rotation composition
+plus revision pass-through. Both functions panic with a descriptive message on the first
 violated requirement, so a track failing the suite gets a specific pointer
 to what broke, not a bare `assert` failure.
 
