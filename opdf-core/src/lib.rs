@@ -14,3 +14,7 @@ pub mod page;
 
 pub use error::{Error, Result};
 pub use page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
+
+pub mod document;
+
+pub use document::{Document, DocumentIo, DocumentSnapshot};
