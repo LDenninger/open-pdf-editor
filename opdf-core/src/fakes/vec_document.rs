@@ -7,9 +7,14 @@ use crate::error::Error;
 use crate::page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
 
 /// A document that stores page metadata in a vector and no content at all.
+///
+/// Removed pages are moved to `removed` rather than dropped, so that
+/// [`Document::restore_page`] can hand back the original page — same identity,
+/// same geometry, same rotation — instead of an approximation of it.
 #[derive(Debug, Default)]
 pub struct VecDocument {
     pages: Vec<PageInfo>,
+    removed: Vec<PageInfo>,
     allocator: PageIdAllocator,
     revision: u64,
 }
@@ -82,7 +87,24 @@ impl Document for VecDocument {
 
     fn remove_page(&mut self, id: PageId) -> Result<()> {
         let index = self.find_index(id)?;
-        self.pages.remove(index);
+        //--- the page is retained rather than dropped, so that restore_page can return the original ---
+        let page = self.pages.remove(index);
+        self.removed.push(page);
+        self.advance_revision();
+        Ok(())
+    }
+
+    fn restore_page(&mut self, id: PageId, at_index: usize) -> Result<()> {
+        if self.pages.iter().any(|page| page.id == id) {
+            return Err(Error::Unsupported(format!("{id} is currently present and cannot be restored")));
+        }
+        //--- resolve the identity before the index, matching move_page's precedence ---
+        let trash_index = self.removed.iter().position(|page| page.id == id).ok_or(Error::PageNotFound(id))?;
+        self.check_insertion_index(at_index)?;
+
+        //--- both checks have passed, so nothing below can fail and leave the trash half-emptied ---
+        let page = self.removed.remove(trash_index);
+        self.pages.insert(at_index, page);
         self.advance_revision();
         Ok(())
     }
@@ -91,6 +113,7 @@ impl Document for VecDocument {
         let from_index = self.find_index(id)?;
         //--- capture the count before removing: the error reports the pages present when the move was attempted ---
         let page_count = self.pages.len();
+        //--- deliberately not remove_page: a move lifts the page out and puts it straight back, so it must never reach the trash ---
         let page = self.pages.remove(from_index);
         if to_index > self.pages.len() {
             //--- the page goes back where it came from, so this rejection is not a change: the revision must not advance ---
@@ -162,6 +185,52 @@ mod tests {
         document.remove_page(ids[0]).unwrap();
         assert_eq!(document.index_of(ids[2]).unwrap(), 1);
         assert_eq!(document.page(ids[2]).unwrap().id, ids[2]);
+    }
+
+    /// The round trip has to be exact, not merely the right shape: comparing whole
+    /// `PageInfo` values catches a restore that invents a fresh identity, forgets
+    /// the rotation, or drops the page back at the wrong index — each of which a
+    /// page-count check would wave through.
+    #[test]
+    fn restores_a_removed_page_into_an_identical_page_list() {
+        let mut document = VecDocument::with_pages(3, PageSize::A4);
+        let ids = document.page_ids();
+        document.set_rotation(ids[1], Rotation::Quarter).unwrap();
+        let before = DocumentSnapshot::of(&document).unwrap();
+
+        document.remove_page(ids[1]).unwrap();
+        document.restore_page(ids[1], 1).unwrap();
+
+        let after = DocumentSnapshot::of(&document).unwrap();
+        assert_eq!(
+            after.pages, before.pages,
+            "a remove-then-restore round trip must leave the page list exactly as it was, identity and rotation included"
+        );
+        assert_ne!(
+            after.revision, before.revision,
+            "restoring is a mutation like any other, so the revision must not return to its pre-removal value"
+        );
+    }
+
+    /// `move_page` lifts a page out of the vector and puts it straight back. If it
+    /// routed through the trash, the copy it left behind would be the *pre-move*
+    /// state, and a later restore would resurrect that stale copy in preference to
+    /// the page as it actually stood when it was removed.
+    #[test]
+    fn does_not_route_moves_through_the_trash() {
+        let mut document = VecDocument::with_pages(3, PageSize::A4);
+        let ids = document.page_ids();
+        document.move_page(ids[0], 2).unwrap();
+        document.set_rotation(ids[0], Rotation::Quarter).unwrap();
+        document.remove_page(ids[0]).unwrap();
+
+        document.restore_page(ids[0], 0).unwrap();
+
+        assert_eq!(
+            document.page(ids[0]).unwrap().rotation,
+            Rotation::Quarter,
+            "a move must not leave a stale copy in the trash for restore_page to find in preference to the real one"
+        );
     }
 
     #[test]

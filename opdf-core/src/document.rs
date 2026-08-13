@@ -40,6 +40,23 @@ pub trait Document {
     /// Returns [`crate::Error::PageNotFound`] if the page is absent.
     fn remove_page(&mut self, id: PageId) -> Result<()>;
 
+    /// Restore a page previously removed from this document, with its original
+    /// identity, geometry, and content, at `at_index`.
+    ///
+    /// A removed page is retained by the document, unreferenced, until an explicit
+    /// compaction purges it. This mirrors how PDF incremental save already works:
+    /// objects are never deleted, only unreferenced. It is what makes undo of a
+    /// deletion exact rather than approximate.
+    ///
+    /// Returns [`crate::Error::PageNotFound`] if `id` was never a page of this
+    /// document, or has been purged. Returns [`crate::Error::IndexOutOfBounds`] if
+    /// `at_index` exceeds the page count. Returns [`crate::Error::Unsupported`] if
+    /// `id` is currently present — restoring a live page is a caller error, not a
+    /// no-op.
+    ///
+    /// Advances the revision on success.
+    fn restore_page(&mut self, id: PageId, at_index: usize) -> Result<()>;
+
     /// Move a page to a new position.
     ///
     /// Removes the page from its current location, then inserts it at index
@@ -125,5 +142,24 @@ impl DocumentSnapshot {
     /// Number of pages captured.
     pub fn page_count(&self) -> usize {
         self.pages.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Document`] must remain usable as `dyn Document`.
+    ///
+    /// This is a compile-time assertion wearing a test's clothes: adding an
+    /// associated type, a generic method, or a `Self`-typed argument without a
+    /// `where Self: Sized` escape hatch makes the trait object-unsafe, and this
+    /// line stops compiling. That matters because a UI holding one of several
+    /// document implementations behind a `&dyn Document` cannot be written at all
+    /// once object safety is lost — and the compiler error would otherwise surface
+    /// in a dependent track rather than here.
+    #[test]
+    fn stays_object_safe() {
+        let _: Option<&dyn Document> = None;
     }
 }
