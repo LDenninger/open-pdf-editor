@@ -1,0 +1,6 @@
+//! In-memory implementations of the contracts, for use by dependent crates
+//! before real implementations exist.
+
+pub mod vec_document;
+
+pub use vec_document::VecDocument;
