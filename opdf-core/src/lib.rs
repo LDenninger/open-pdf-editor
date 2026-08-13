@@ -1,0 +1,10 @@
+//! Contract surface shared by every open-pdf-editor crate.
+//!
+//! This crate contains no implementation. It defines the traits and value types
+//! that implementation crates satisfy, in-memory fakes that let dependent crates
+//! be developed before real implementations exist, and contract test suites that
+//! every implementation must pass.
+
+#![warn(missing_docs)]
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
