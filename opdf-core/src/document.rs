@@ -32,11 +32,15 @@ pub trait Document {
     /// Returns [`crate::Error::PageNotFound`] if the page is absent.
     fn remove_page(&mut self, id: PageId) -> Result<()>;
 
-    /// Move a page to a new position, counting from zero in the document's
-    /// state *after* the page is lifted out.
+    /// Move a page to a new position.
     ///
-    /// Returns [`crate::Error::IndexOutOfBounds`] if the target exceeds the
-    /// page count, and [`crate::Error::PageNotFound`] if the page is absent.
+    /// Removes the page from its current location, then inserts it at index
+    /// `to_index` (0-indexed). After removal, `page_count() - 1` pages remain,
+    /// so `to_index` is valid if `to_index <= page_count() - 1` (where
+    /// `page_count()` is evaluated before the move).
+    ///
+    /// Returns [`crate::Error::PageNotFound`] if the page is absent, and
+    /// [`crate::Error::IndexOutOfBounds`] if `to_index` exceeds the valid range.
     fn move_page(&mut self, id: PageId, to_index: usize) -> Result<()>;
 
     /// Replace a page's rotation.
