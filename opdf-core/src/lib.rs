@@ -25,5 +25,9 @@ pub mod render;
 
 pub use render::{RenderRequest, RenderResponse, RenderService, Tile};
 
+pub mod command;
+
+pub use command::Command;
+
 #[cfg(feature = "contract-tests")]
 pub mod contract;
