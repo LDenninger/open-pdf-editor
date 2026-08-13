@@ -4,3 +4,7 @@
 pub mod vec_document;
 
 pub use vec_document::VecDocument;
+
+pub mod fake_render_service;
+
+pub use fake_render_service::FakeRenderService;

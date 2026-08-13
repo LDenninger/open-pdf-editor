@@ -8,3 +8,7 @@
 pub mod document;
 
 pub use document::assert_document_contract;
+
+pub mod render;
+
+pub use render::assert_render_service_contract;
