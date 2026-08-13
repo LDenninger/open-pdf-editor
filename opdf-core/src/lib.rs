@@ -21,5 +21,9 @@ pub use document::{Document, DocumentIo, DocumentSnapshot};
 
 pub mod fakes;
 
+pub mod render;
+
+pub use render::{RenderRequest, RenderResponse, RenderService, Tile};
+
 #[cfg(feature = "contract-tests")]
 pub mod contract;
