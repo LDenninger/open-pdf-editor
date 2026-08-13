@@ -57,9 +57,15 @@ mod tests {
         }
     }
 
-    /// Compare whole snapshots rather than a single field: a lossy inverse that
+    /// Compare whole page lists rather than a single field: a lossy inverse that
     /// restored the rotation but disturbed page order or identity would pass a
     /// one-field check. Every command's inverse test should follow this shape.
+    ///
+    /// The comparison is on `pages`, not on the whole snapshot, because undo is
+    /// itself a mutation: it advances [`Document::revision`] like any other, so
+    /// the restored document is structurally identical to the original but never
+    /// reports the original's revision. That is deliberate — a revision that went
+    /// backwards would let a tile cache serve entries it had already invalidated.
     #[test]
     fn applying_the_returned_inverse_restores_the_original_state() {
         let mut document = VecDocument::with_pages(3, crate::page::PageSize::A4);
@@ -73,16 +79,20 @@ mod tests {
         let inverse = command.apply(&mut document).unwrap();
         assert_eq!(document.page(page).unwrap().rotation, Rotation::Quarter);
         assert_ne!(
-            DocumentSnapshot::of(&document).unwrap(),
-            before,
+            DocumentSnapshot::of(&document).unwrap().pages,
+            before.pages,
             "applying the command must actually change the document"
         );
 
         inverse.apply(&mut document).unwrap();
+        let restored = DocumentSnapshot::of(&document).unwrap();
         assert_eq!(
-            DocumentSnapshot::of(&document).unwrap(),
-            before,
-            "the inverse must restore the whole document, not merely the field the command touched"
+            restored.pages, before.pages,
+            "the inverse must restore the whole page list, not merely the field the command touched"
+        );
+        assert_ne!(
+            restored.revision, before.revision,
+            "undo is a mutation: it must advance the revision rather than rewind it, so a cache cannot resurrect tiles it invalidated"
         );
     }
 

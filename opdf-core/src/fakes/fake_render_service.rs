@@ -110,6 +110,7 @@ mod tests {
 
     fn build_single_page_service() -> FakeRenderService {
         FakeRenderService::new(DocumentSnapshot {
+            revision: 3,
             pages: vec![PageInfo {
                 id: PageId::new(1),
                 size: PageSize::A4,
@@ -121,7 +122,7 @@ mod tests {
     #[test]
     fn fails_an_absurd_scale_instead_of_allocating_or_overflowing() {
         let service = build_single_page_service();
-        service.submit(RenderRequest::new(PageId::new(1), 1e30).unwrap());
+        service.submit(RenderRequest::new(PageId::new(1), 3, 1e30).unwrap());
 
         let responses = service.poll();
         assert_eq!(responses.len(), 1, "an oversized request must still be answered");

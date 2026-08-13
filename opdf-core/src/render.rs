@@ -15,10 +15,20 @@ use crate::page::{PageId, Rotation};
 /// noise are therefore distinct keys, not the same one. A caller that wants
 /// nearby scales to share a cache entry must quantise the scale itself before
 /// building the request.
+///
+/// `revision` is what keeps a cache honest across edits: two requests that
+/// differ only in revision are distinct keys, so a tile rasterized before a
+/// structural change can never be served for the document as it stands now.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderRequest {
     /// Page to rasterize.
     pub page: PageId,
+    /// The value [`crate::document::Document::revision`] held when this request
+    /// was built, normally read from a [`crate::document::DocumentSnapshot`].
+    ///
+    /// Opaque to the renderer, which neither validates nor interprets it — see
+    /// [`RenderService`].
+    pub revision: u64,
     /// Zoom factor, where 1.0 renders at 72 dpi — one pixel per PDF point.
     pub scale: f32,
     /// View rotation applied on top of the rotation stored on the page.
@@ -26,15 +36,21 @@ pub struct RenderRequest {
 }
 
 impl RenderRequest {
-    /// A request at the given scale with no additional view rotation.
+    /// A request at the given scale and document revision, with no additional
+    /// view rotation.
+    ///
+    /// `revision` is deliberately a required argument rather than a default or a
+    /// builder step: a caller who omits it silently reintroduces stale tiles, so
+    /// the decision is forced at the call site.
     ///
     /// Returns [`Error::Unsupported`] for a scale that is not finite and positive.
-    pub fn new(page: PageId, scale: f32) -> Result<Self> {
+    pub fn new(page: PageId, revision: u64, scale: f32) -> Result<Self> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(Error::Unsupported(format!("render scale {scale} must be finite and positive")));
         }
         Ok(Self {
             page,
+            revision,
             scale,
             rotation: Rotation::None,
         })
@@ -53,7 +69,7 @@ impl RenderRequest {
 impl PartialEq for RenderRequest {
     /// Compare `scale` bitwise, so that equality agrees with [`Hash`].
     fn eq(&self, other: &Self) -> bool {
-        self.page == other.page && self.rotation == other.rotation && self.scale.to_bits() == other.scale.to_bits()
+        self.page == other.page && self.revision == other.revision && self.rotation == other.rotation && self.scale.to_bits() == other.scale.to_bits()
     }
 }
 
@@ -62,6 +78,7 @@ impl Eq for RenderRequest {}
 impl std::hash::Hash for RenderRequest {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.page.hash(state);
+        self.revision.hash(state);
         self.rotation.hash(state);
         self.scale.to_bits().hash(state);
     }
@@ -161,10 +178,28 @@ impl RenderResponse {
 ///
 /// Implementations must never block in [`RenderService::poll`]: the caller runs
 /// on the UI thread and a stalled poll drops frames.
+///
+/// # A renderer must not validate `RenderRequest::revision`
+///
+/// The revision exists for the benefit of *caches*, not of the rasterizer. An
+/// implementation carries it, and echoes it back unchanged inside the response's
+/// request, so that a cache can tell an image of the old structure from an image
+/// of the current one. It must never compare the revision against whatever state
+/// it happens to hold, and must never fail, drop, or defer a request because the
+/// two disagree.
+///
+/// This is a hard requirement rather than a convention: a real rasterizer may
+/// legitimately hold several revisions at once — an in-flight request queued
+/// before an edit, a snapshot taken after it — and a service that rejected
+/// unfamiliar revisions would fail exactly the requests a cache most needs
+/// answered. A service holding a snapshot at one revision must still answer a
+/// request naming another.
 pub trait RenderService: Send {
     /// Queue a request. Submitting the same request twice is permitted:
     /// identical pending requests may be answered by a single response, while
     /// distinct requests each receive their own response.
+    ///
+    /// The request's `revision` is carried, not checked — see the trait docs.
     fn submit(&self, request: RenderRequest);
 
     /// Collect every response completed since the last call, without blocking.
@@ -214,15 +249,15 @@ mod tests {
 
     #[test]
     fn rejects_a_non_positive_scale() {
-        assert!(RenderRequest::new(PageId::new(0), 0.0).is_err());
-        assert!(RenderRequest::new(PageId::new(0), f32::NAN).is_err());
+        assert!(RenderRequest::new(PageId::new(0), 0, 0.0).is_err());
+        assert!(RenderRequest::new(PageId::new(0), 0, f32::NAN).is_err());
     }
 
     #[test]
     fn serves_as_a_hash_map_key() {
-        let first = RenderRequest::new(PageId::new(1), 1.0).unwrap();
-        let same = RenderRequest::new(PageId::new(1), 1.0).unwrap();
-        let different_scale = RenderRequest::new(PageId::new(1), 1.5).unwrap();
+        let first = RenderRequest::new(PageId::new(1), 0, 1.0).unwrap();
+        let same = RenderRequest::new(PageId::new(1), 0, 1.0).unwrap();
+        let different_scale = RenderRequest::new(PageId::new(1), 0, 1.5).unwrap();
 
         let mut cache = std::collections::HashMap::new();
         cache.insert(first, "first");
@@ -231,5 +266,20 @@ mod tests {
 
         assert_eq!(cache.len(), 2, "two equal requests must collapse to one key, a differing one must add a second");
         assert_eq!(cache[&first], "same", "an equal request must address the entry the first one created");
+    }
+
+    #[test]
+    fn distinguishes_requests_by_revision() {
+        let before = RenderRequest::new(PageId::new(1), 1, 1.0).unwrap();
+        let after = RenderRequest::new(PageId::new(1), 2, 1.0).unwrap();
+
+        assert_ne!(before, after, "requests differing only in revision must not compare equal");
+
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(before, "stale");
+        cache.insert(after, "current");
+
+        assert_eq!(cache.len(), 2, "a tile cached before an edit must not be addressable after one");
+        assert_eq!(cache[&before], "stale", "the pre-edit entry must survive under its own revision");
     }
 }

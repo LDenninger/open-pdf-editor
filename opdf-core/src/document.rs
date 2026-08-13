@@ -11,6 +11,14 @@ use crate::page::{PageId, PageInfo, Rotation};
 /// Indices appear only as insertion positions, and are always interpreted
 /// against the document's state at the moment of the call.
 pub trait Document {
+    /// A counter that advances whenever this document's structure changes.
+    ///
+    /// Tile caches key on this so that an image rendered before a change is never
+    /// mistaken for a current one. Every mutating method must advance it on success
+    /// and leave it untouched on failure. Read-only methods never advance it.
+    /// Values are opaque: only equality is meaningful, never ordering or arithmetic.
+    fn revision(&self) -> u64;
+
     /// Number of pages currently in the document.
     fn page_count(&self) -> usize;
 
@@ -93,16 +101,25 @@ pub trait DocumentIo: Document + Sized {
 pub struct DocumentSnapshot {
     /// Page metadata in document order.
     pub pages: Vec<PageInfo>,
+    /// The value [`Document::revision`] held when this snapshot was captured.
+    ///
+    /// A caller builds [`crate::render::RenderRequest`]s against this value, so
+    /// that tiles rendered from an older structure are never reused after a
+    /// mutation. Opaque: compare it for equality only.
+    pub revision: u64,
 }
 
 impl DocumentSnapshot {
-    /// Capture the current page list of a document.
+    /// Capture the current page list of a document, together with its revision.
     pub fn of<D: Document + ?Sized>(document: &D) -> Result<Self> {
         let mut pages = Vec::with_capacity(document.page_count());
         for id in document.page_ids() {
             pages.push(document.page(id)?);
         }
-        Ok(Self { pages })
+        Ok(Self {
+            pages,
+            revision: document.revision(),
+        })
     }
 
     /// Number of pages captured.

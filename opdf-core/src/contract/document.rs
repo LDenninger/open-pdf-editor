@@ -30,6 +30,112 @@ where
     assert_mutations_reject_unknown_page_ids(&make_document);
     assert_import_rejects_unknown_source_pages(&make_document);
     assert_append_positions_are_valid(&make_document);
+    assert_every_mutation_advances_the_revision(&make_document);
+    assert_failed_mutations_leave_the_revision_untouched(&make_document);
+    assert_read_only_calls_never_advance_the_revision(&make_document);
+}
+
+//---------------------------------------------------------------------
+// Revision counter
+//---------------------------------------------------------------------
+
+/// Check each of the five mutating methods individually.
+///
+/// Checking one and generalising would let an implementation that advances on
+/// `remove_page` but forgets `set_rotation` pass — and forgetting exactly one
+/// mutation is the realistic failure, not forgetting all of them.
+fn assert_every_mutation_advances_the_revision<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let mut document = make_document(3);
+    let ids = document.page_ids();
+    let before = document.revision();
+    document.remove_page(ids[0]).expect("removing an existing page must succeed");
+    assert_ne!(before, document.revision(), "remove_page must advance the revision on success");
+
+    let mut document = make_document(3);
+    let ids = document.page_ids();
+    let before = document.revision();
+    document.move_page(ids[0], 2).expect("moving to a valid position must succeed");
+    assert_ne!(before, document.revision(), "move_page must advance the revision on success");
+
+    let mut document = make_document(1);
+    let id = document.page_ids()[0];
+    let before = document.revision();
+    document.set_rotation(id, Rotation::Quarter).expect("setting rotation must succeed");
+    assert_ne!(before, document.revision(), "set_rotation must advance the revision on success");
+
+    let mut document = make_document(2);
+    let before = document.revision();
+    document.insert_page(1, PageSize::A4).expect("inserting at a valid position must succeed");
+    assert_ne!(before, document.revision(), "insert_page must advance the revision on success");
+
+    let source = make_document(2);
+    let mut target = make_document(2);
+    let before = target.revision();
+    target
+        .import_pages(&source, &source.page_ids(), 1)
+        .expect("importing existing pages must succeed");
+    assert_ne!(before, target.revision(), "import_pages must advance the revision on success");
+}
+
+/// A rejected mutation changed nothing, so a cache keyed on the revision must
+/// not be forced to discard tiles that are still valid.
+fn assert_failed_mutations_leave_the_revision_untouched<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let unknown = PageId::new(u64::MAX);
+
+    //--- an unknown identity: rejected before anything is touched ---
+    let mut document = make_document(2);
+    let before = document.revision();
+    assert!(document.remove_page(unknown).is_err(), "remove_page must reject an unknown identity");
+    assert_eq!(before, document.revision(), "a failed remove_page must leave the revision untouched");
+
+    assert!(document.move_page(unknown, 0).is_err(), "move_page must reject an unknown identity");
+    assert_eq!(before, document.revision(), "a failed move_page must leave the revision untouched");
+
+    assert!(
+        document.set_rotation(unknown, Rotation::Quarter).is_err(),
+        "set_rotation must reject an unknown identity"
+    );
+    assert_eq!(before, document.revision(), "a failed set_rotation must leave the revision untouched");
+
+    //--- an out-of-range index: an implementation may mutate internally before discovering this, and must still not advance ---
+    let ids = document.page_ids();
+    assert!(document.move_page(ids[0], 99).is_err(), "move_page must reject a position beyond the document");
+    assert_eq!(
+        before,
+        document.revision(),
+        "a move rejected for its index must leave the revision untouched, even if the page was lifted out and put back"
+    );
+
+    assert!(
+        document.insert_page(99, PageSize::A4).is_err(),
+        "insert_page must reject a position beyond the document"
+    );
+    assert_eq!(before, document.revision(), "a failed insert_page must leave the revision untouched");
+
+    let source = make_document(1);
+    assert!(
+        document.import_pages(&source, &source.page_ids(), 99).is_err(),
+        "import_pages must reject a position beyond the document"
+    );
+    assert_eq!(before, document.revision(), "a failed import_pages must leave the revision untouched");
+}
+
+fn assert_read_only_calls_never_advance_the_revision<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let document = make_document(2);
+    let before = document.revision();
+    let ids = document.page_ids();
+
+    let _ = document.page_count();
+    let _ = document.page_ids();
+    let _ = document.page(ids[0]);
+    let _ = document.index_of(ids[0]);
+
+    assert_eq!(before, document.revision(), "inspecting a document must not advance its revision");
+    assert_eq!(
+        document.revision(),
+        document.revision(),
+        "revision() must be stable when nothing has changed between two reads"
+    );
 }
 
 fn assert_reports_its_page_count<D: Document, F: Fn(usize) -> D>(make_document: &F) {

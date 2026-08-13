@@ -11,6 +11,7 @@ use crate::page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
 pub struct VecDocument {
     pages: Vec<PageInfo>,
     allocator: PageIdAllocator,
+    revision: u64,
 }
 
 impl VecDocument {
@@ -37,6 +38,15 @@ impl VecDocument {
         self.pages.iter().position(|page| page.id == id).ok_or(Error::PageNotFound(id))
     }
 
+    /// Advance the revision counter, called once by each mutation that succeeds.
+    ///
+    /// Wrapping is deliberate: the counter is opaque, only ever compared for
+    /// equality, so an overflow panic would be a worse outcome than the
+    /// unreachable collision it guards against.
+    fn advance_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     fn check_insertion_index(&self, index: usize) -> Result<()> {
         if index > self.pages.len() {
             return Err(Error::IndexOutOfBounds {
@@ -49,6 +59,10 @@ impl VecDocument {
 }
 
 impl Document for VecDocument {
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn page_count(&self) -> usize {
         self.pages.len()
     }
@@ -69,6 +83,7 @@ impl Document for VecDocument {
     fn remove_page(&mut self, id: PageId) -> Result<()> {
         let index = self.find_index(id)?;
         self.pages.remove(index);
+        self.advance_revision();
         Ok(())
     }
 
@@ -78,16 +93,19 @@ impl Document for VecDocument {
         let page_count = self.pages.len();
         let page = self.pages.remove(from_index);
         if to_index > self.pages.len() {
+            //--- the page goes back where it came from, so this rejection is not a change: the revision must not advance ---
             self.pages.insert(from_index, page);
             return Err(Error::IndexOutOfBounds { index: to_index, page_count });
         }
         self.pages.insert(to_index, page);
+        self.advance_revision();
         Ok(())
     }
 
     fn set_rotation(&mut self, id: PageId, rotation: Rotation) -> Result<()> {
         let index = self.find_index(id)?;
         self.pages[index].rotation = rotation;
+        self.advance_revision();
         Ok(())
     }
 
@@ -102,6 +120,7 @@ impl Document for VecDocument {
                 rotation: Rotation::None,
             },
         );
+        self.advance_revision();
         Ok(id)
     }
 
@@ -120,6 +139,7 @@ impl Document for VecDocument {
             self.pages.insert(at_index + offset, PageInfo { id, ..page });
             new_ids.push(id);
         }
+        self.advance_revision();
         Ok(new_ids)
     }
 }
@@ -171,6 +191,26 @@ mod tests {
         let snapshot = DocumentSnapshot::of(&document).unwrap();
         assert_eq!(snapshot.page_count(), 2);
         assert_eq!(snapshot.pages[0].id, document.page_ids()[0]);
+    }
+
+    #[test]
+    fn snapshots_the_revision_alongside_the_pages() {
+        let mut document = VecDocument::with_pages(2, PageSize::A4);
+        let before = DocumentSnapshot::of(&document).unwrap();
+        assert_eq!(before.revision, document.revision(), "a snapshot must carry the document's revision at capture");
+
+        document.set_rotation(document.page_ids()[0], Rotation::Quarter).unwrap();
+        let after = DocumentSnapshot::of(&document).unwrap();
+
+        assert_eq!(
+            after.revision,
+            document.revision(),
+            "a later snapshot must carry the revision current at its own capture"
+        );
+        assert_ne!(
+            before.revision, after.revision,
+            "a snapshot taken after a mutation must not report the revision of one taken before it"
+        );
     }
 
     #[cfg(feature = "contract-tests")]
