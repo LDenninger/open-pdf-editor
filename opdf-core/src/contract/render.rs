@@ -4,6 +4,23 @@ use crate::document::DocumentSnapshot;
 use crate::page::{PageId, PageInfo, PageSize, Rotation};
 use crate::render::{RenderRequest, RenderResponse, RenderService};
 
+/// Poll until `expected` responses have arrived or the deadline passes.
+///
+/// Contract implementations may answer asynchronously, so a single `poll` is
+/// not enough. The deadline keeps a broken implementation from hanging the suite.
+fn drain_responses<S: RenderService>(service: &S, expected: usize) -> Vec<RenderResponse> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut collected = Vec::new();
+    while collected.len() < expected {
+        collected.extend(service.poll());
+        if collected.len() >= expected || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    collected
+}
+
 /// Build a two-page snapshot the contract suite renders against.
 fn build_snapshot() -> DocumentSnapshot {
     DocumentSnapshot {
@@ -37,6 +54,7 @@ where
     assert_polling_an_idle_service_is_empty(&make_service);
     assert_every_request_is_answered_once(&make_service);
     assert_tile_dimensions_follow_scale(&make_service);
+    assert_pixel_dimensions_round_to_nearest_with_a_one_pixel_floor(&make_service);
     assert_rotation_swaps_tile_axes(&make_service);
     assert_unknown_pages_fail_without_panicking(&make_service);
     assert_view_rotation_composes_with_page_rotation(&make_service);
@@ -53,9 +71,10 @@ fn assert_every_request_is_answered_once<S: RenderService, F: Fn(DocumentSnapsho
     let request = RenderRequest::new(PageId::new(1), 1.0).expect("scale 1.0 is valid");
     service.submit(request);
 
-    let responses = service.poll();
+    let responses = drain_responses(&service, 1);
     assert_eq!(responses.len(), 1, "each submitted request must produce exactly one response");
     assert_eq!(*responses[0].request(), request, "a response must identify the request it answers");
+    //--- a direct poll, not a drain: the requirement is that nothing more arrives, so waiting for it would defeat the check ---
     assert!(service.poll().is_empty(), "a response must not be delivered twice");
 }
 
@@ -63,7 +82,8 @@ fn assert_tile_dimensions_follow_scale<S: RenderService, F: Fn(DocumentSnapshot)
     let service = make_service(build_snapshot());
     service.submit(RenderRequest::new(PageId::new(1), 2.0).expect("scale 2.0 is valid"));
 
-    let responses = service.poll();
+    let responses = drain_responses(&service, 1);
+    assert_eq!(responses.len(), 1, "a request at scale 2.0 must produce exactly one response");
     match &responses[0] {
         RenderResponse::Ready { tile, .. } => {
             assert_eq!(tile.width(), 1190, "A4 width of 595 points at scale 2.0 must be 1190 pixels");
@@ -73,11 +93,54 @@ fn assert_tile_dimensions_follow_scale<S: RenderService, F: Fn(DocumentSnapshot)
     }
 }
 
+/// Pin the pixel-dimension formula: `round(size_pt * scale)`, floored at one pixel.
+///
+/// Scale `0.51` distinguishes rounding to nearest from rounding up, and scale
+/// `0.0005` proves the floor produces a 1x1 tile rather than a zero-sized one.
+fn assert_pixel_dimensions_round_to_nearest_with_a_one_pixel_floor<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
+    //--- 595 * 0.51 = 303.45 and 842 * 0.51 = 429.42: rounding up would give 304x430 ---
+    let service = make_service(build_snapshot());
+    service.submit(RenderRequest::new(PageId::new(1), 0.51).expect("scale 0.51 is valid"));
+
+    let responses = drain_responses(&service, 1);
+    assert_eq!(responses.len(), 1, "a request at scale 0.51 must produce exactly one response");
+    match &responses[0] {
+        RenderResponse::Ready { tile, .. } => {
+            assert_eq!(tile.width(), 303, "595 points at scale 0.51 is 303.45, which rounds to nearest as 303");
+            assert_eq!(tile.height(), 429, "842 points at scale 0.51 is 429.42, which rounds to nearest as 429");
+        }
+        RenderResponse::Failed { reason, .. } => panic!("rendering at a fractional scale must succeed, got: {reason}"),
+    }
+
+    //--- 595 * 0.0005 = 0.2975 and 842 * 0.0005 = 0.421: both round to zero and must be floored to one ---
+    let service = make_service(build_snapshot());
+    service.submit(RenderRequest::new(PageId::new(1), 0.0005).expect("scale 0.0005 is valid"));
+
+    let responses = drain_responses(&service, 1);
+    assert_eq!(responses.len(), 1, "a request at scale 0.0005 must produce exactly one response");
+    match &responses[0] {
+        RenderResponse::Ready { tile, .. } => {
+            assert_eq!(
+                tile.width(),
+                1,
+                "a scale that rounds the width below one pixel must be floored to a 1-pixel width"
+            );
+            assert_eq!(
+                tile.height(),
+                1,
+                "a scale that rounds the height below one pixel must be floored to a 1-pixel height"
+            );
+        }
+        RenderResponse::Failed { reason, .. } => panic!("rendering at a tiny scale must succeed with a 1x1 tile, got: {reason}"),
+    }
+}
+
 fn assert_rotation_swaps_tile_axes<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
     let service = make_service(build_snapshot());
     service.submit(RenderRequest::new(PageId::new(2), 1.0).expect("scale 1.0 is valid"));
 
-    let responses = service.poll();
+    let responses = drain_responses(&service, 1);
+    assert_eq!(responses.len(), 1, "a request for a rotated page must produce exactly one response");
     match &responses[0] {
         RenderResponse::Ready { tile, .. } => {
             assert_eq!(tile.width(), 842, "a quarter-turned A4 page must be 842 pixels wide at scale 1.0");
@@ -91,7 +154,7 @@ fn assert_unknown_pages_fail_without_panicking<S: RenderService, F: Fn(DocumentS
     let service = make_service(build_snapshot());
     service.submit(RenderRequest::new(PageId::new(u64::MAX), 1.0).expect("scale 1.0 is valid"));
 
-    let responses = service.poll();
+    let responses = drain_responses(&service, 1);
     assert_eq!(responses.len(), 1, "an unknown page must still produce a response");
     assert!(
         matches!(responses[0], RenderResponse::Failed { .. }),
@@ -107,7 +170,8 @@ fn assert_view_rotation_composes_with_page_rotation<S: RenderService, F: Fn(Docu
             .expect("scale 1.0 is valid")
             .with_rotation(Rotation::Quarter),
     );
-    let responses = service.poll();
+    let responses = drain_responses(&service, 1);
+    assert_eq!(responses.len(), 1, "a request carrying a view rotation must produce exactly one response");
     match &responses[0] {
         RenderResponse::Ready { tile, .. } => {
             assert_eq!(tile.width(), 842, "an unrotated A4 page viewed at a quarter turn must be 842 pixels wide");
@@ -123,7 +187,8 @@ fn assert_view_rotation_composes_with_page_rotation<S: RenderService, F: Fn(Docu
             .expect("scale 1.0 is valid")
             .with_rotation(Rotation::Quarter),
     );
-    let responses = service.poll();
+    let responses = drain_responses(&service, 1);
+    assert_eq!(responses.len(), 1, "a request composing two rotations must produce exactly one response");
     match &responses[0] {
         RenderResponse::Ready { tile, .. } => {
             assert_eq!(
@@ -148,7 +213,7 @@ fn assert_batched_requests_each_receive_a_response<S: RenderService, F: Fn(Docum
     service.submit(first);
     service.submit(second);
 
-    let responses = service.poll();
+    let responses = drain_responses(&service, 2);
     assert_eq!(responses.len(), 2, "every submitted request must receive its own response");
     assert!(
         responses.iter().any(|response| *response.request() == first),
@@ -158,5 +223,6 @@ fn assert_batched_requests_each_receive_a_response<S: RenderService, F: Fn(Docum
         responses.iter().any(|response| *response.request() == second),
         "the second submitted request must be answered"
     );
+    //--- a direct poll, not a drain: the requirement is that nothing more arrives, so waiting for it would defeat the check ---
     assert!(service.poll().is_empty(), "a drained batch must not be delivered again");
 }
