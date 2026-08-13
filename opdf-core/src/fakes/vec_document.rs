@@ -74,13 +74,12 @@ impl Document for VecDocument {
 
     fn move_page(&mut self, id: PageId, to_index: usize) -> Result<()> {
         let from_index = self.find_index(id)?;
+        //--- capture the count before removing: the error reports the pages present when the move was attempted ---
+        let page_count = self.pages.len();
         let page = self.pages.remove(from_index);
         if to_index > self.pages.len() {
             self.pages.insert(from_index, page);
-            return Err(Error::IndexOutOfBounds {
-                index: to_index,
-                page_count: self.pages.len(),
-            });
+            return Err(Error::IndexOutOfBounds { index: to_index, page_count });
         }
         self.pages.insert(to_index, page);
         Ok(())
@@ -152,6 +151,18 @@ mod tests {
         let result = target.import_pages(&source, &[PageId::new(9999)], 0);
         assert!(result.is_err());
         assert_eq!(target.page_count(), 2);
+    }
+
+    #[test]
+    fn reports_the_pre_move_page_count_when_rejecting_a_target() {
+        let mut document = VecDocument::with_pages(3, PageSize::A4);
+        let ids = document.page_ids();
+        let error = document.move_page(ids[0], 99).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "index 99 out of bounds for 3 pages",
+            "the count must be the pages present when the move was attempted, not what remained mid-operation"
+        );
     }
 
     #[test]
