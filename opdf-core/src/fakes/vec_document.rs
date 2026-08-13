@@ -161,4 +161,10 @@ mod tests {
         assert_eq!(snapshot.page_count(), 2);
         assert_eq!(snapshot.pages[0].id, document.page_ids()[0]);
     }
+
+    #[cfg(feature = "contract-tests")]
+    #[test]
+    fn satisfies_the_document_contract() {
+        crate::contract::assert_document_contract(|count| VecDocument::with_pages(count, PageSize::A4));
+    }
 }
