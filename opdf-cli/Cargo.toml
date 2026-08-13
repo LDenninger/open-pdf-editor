@@ -1,0 +1,14 @@
+[package]
+name = "opdf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless page operations"
+
+[dependencies]
+opdf-core = { path = "../opdf-core" }
+
+[dev-dependencies]
+opdf-core = { path = "../opdf-core", features = ["contract-tests"] }

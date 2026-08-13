@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
-# Restored to all six members in Task 10.
-members = ["opdf-core"]
+members = ["opdf-core", "opdf-pdf", "opdf-render", "opdf-ops", "opdf-cli", "opdf-app"]
 
 [workspace.package]
 version = "0.0.0"
