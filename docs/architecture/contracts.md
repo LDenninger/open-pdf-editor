@@ -767,3 +767,24 @@ silently "fix" or work around — the same issue twice.
    or a release-build wrap followed by a ~1.8e19-iteration loop. Any real
    implementation is expected to behave the same way: fail the request, loudly,
    with a reason.
+
+3. **`RenderRequest`'s fields are public, so `new`'s validation is optional.**
+   Writing `RenderRequest { page, revision, scale: f32::NAN }` compiles and
+   bypasses the finite-and-positive check entirely. The `Eq`/`Hash`
+   implementations stay lawful either way, because both compare `scale.to_bits()`
+   rather than the float, so a `NaN` request is merely self-equal and useless —
+   not unsound. Prefer `RenderRequest::new` everywhere; if a track finds itself
+   wanting the struct literal, that is a signal the constructor is missing
+   something, and the fix is an additive change to `new`, not a bypass.
+
+4. **The revision counter proves freshness only if the caller threads the right
+   one.** Nothing in the type system forces a `RenderRequest` to carry the
+   revision of the document it is actually about — a track holding a stale
+   variable reintroduces exactly the stale-tile bug the field exists to prevent.
+   Whichever track builds the first real tile cache should derive requests from
+   the `DocumentSnapshot` it is drawing, rather than from a separately tracked
+   number, so that the two cannot drift.
+
+   Note also that `import_pages` advances the revision even when handed an empty
+   `ids` slice. That is deliberate: a spurious cache miss is cheap, a stale tile
+   is a visible defect. A real implementation should match it.
