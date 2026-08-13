@@ -59,6 +59,13 @@ change it without updating that test and any UI text that embeds it.
 **Requirement:** prefer `PageIdAllocator` over calling `PageId::new` directly
 outside of tests and fakes, so identities within one document stay unique.
 
+**Requirement: never persist a `PageId`.** It is unique within one document *in
+one process* and has no meaning after a save-and-reopen — the PDF format has
+nowhere to keep it. `PageId::get`'s doc comment ("for storage in formats that
+cannot hold a `PageId`") is about in-memory interchange, not about writing the
+number to disk. See [Known gaps](#known-gaps) item 5, which is binding on every
+track.
+
 ### `PageIdAllocator`
 
 ```rust
@@ -177,6 +184,7 @@ pub trait Document {
     fn page(&self, id: PageId) -> Result<PageInfo>;
     fn index_of(&self, id: PageId) -> Result<usize>;
     fn remove_page(&mut self, id: PageId) -> Result<()>;
+    fn restore_page(&mut self, id: PageId, at_index: usize) -> Result<()>;
     fn move_page(&mut self, id: PageId, to_index: usize) -> Result<()>;
     fn set_rotation(&mut self, id: PageId, rotation: Rotation) -> Result<()>;
     fn insert_page(&mut self, at_index: usize, size: crate::page::PageSize) -> Result<PageId>;
@@ -191,6 +199,77 @@ modified. Pages are addressed by `PageId`, which survives reordering.
 Indices appear only as insertion positions and are always interpreted
 against the document's state at the moment of the call.
 
+**The trait is object-safe, and must stay that way.** `import_pages` is the
+only method that names `Self` in its signature, and it carries
+`where Self: Sized` precisely so that it is excluded from the vtable rather
+than poisoning the whole trait. No track may add an associated type, a generic
+method, or another `Self`-typed argument without the same escape hatch.
+`document.rs`'s `stays_object_safe` test pins this with a single line —
+`let _: Option<&dyn Document> = None;` — so the breakage surfaces here, as a
+compile error in `opdf-core`, rather than in whichever dependent crate first
+tries to hold a `&dyn Document`.
+
+### The trash model
+
+`restore_page` exists because undo of a page deletion could not restore the
+page. `remove_page` destroyed it and `insert_page` only ever creates a *blank*
+page under a *fresh* `PageId`, so deleting page 3 and undoing gave an empty
+page with a new identity — and every operation built on deletion (split,
+delete-selection) inherited the defect.
+
+```rust
+/// Restore a page previously removed from this document, with its original
+/// identity, geometry, and content, at `at_index`.
+///
+/// A removed page is retained by the document, unreferenced, until an explicit
+/// compaction purges it. This mirrors how PDF incremental save already works:
+/// objects are never deleted, only unreferenced. It is what makes undo of a
+/// deletion exact rather than approximate.
+///
+/// Returns [`crate::Error::PageNotFound`] if `id` was never a page of this
+/// document, or has been purged. Returns [`crate::Error::IndexOutOfBounds`] if
+/// `at_index` exceeds the page count. Returns [`crate::Error::Unsupported`] if
+/// `id` is currently present — restoring a live page is a caller error, not a
+/// no-op.
+///
+/// Advances the revision on success.
+fn restore_page(&mut self, id: PageId, at_index: usize) -> Result<()>;
+```
+
+**Why a trash rather than a caller-held copy.** The alternative — having the
+delete command carry the removed page's data in its inverse — requires the
+`Document` contract to expose a page's full content as a value type that a
+command can hold and hand back. It does not, and making it do so would mean
+modelling every PDF page's object graph in `opdf-core`, which is exactly the
+job the contract layer refuses to take on. Retaining the page inside the
+document instead costs one indirection and is what the file format already
+does: an incremental save never deletes an object, it only stops referencing
+it. The trash model therefore aligns the in-memory representation with the
+on-disk one, and `save_compacted` — already specified as the only lossy,
+explicitly-requested save path — is the natural place for the purge.
+
+The rules, all enforced by the contract suite:
+
+- **A restored page is the original page**, not a reconstruction: same
+  `PageId`, same `PageSize`, same `Rotation` as it had at the moment of
+  removal. An implementation that returns a blank page of default geometry
+  under the right id fails the suite.
+- **`restore_page` returns `()`, not a `PageId`.** The identity is the one the
+  caller passed in. That is the entire point of the method, and a returned id
+  would invite a caller to believe it might differ.
+- **Restoring a page that is currently present is `Error::Unsupported`**, never
+  a silent success and never a duplicate. It is a caller error — a sign the
+  undo stack has lost track of what it undid.
+- **`at_index == page_count()` is a valid append**, not an out-of-range error.
+  Without this the deletion of a *last* page could not be undone.
+- **Identity is resolved before the index**, matching `move_page`: a restore
+  naming an unknown id and an out-of-range index reports `PageNotFound`.
+- **A rejected restore consumes nothing.** The page stays in the trash and a
+  later, valid restore still succeeds.
+- **Purging is explicit.** A removed page is retained until a compaction
+  discards it; nothing in the contract permits an implementation to drop a
+  trashed page on its own schedule.
+
 ### The revision counter
 
 `revision()` is a counter that advances whenever the document's structure
@@ -201,8 +280,14 @@ to one built before it, and the cache serves the old orientation forever.
 The rules, all enforced by the contract suite:
 
 - **Every mutating method advances it on success** — `remove_page`,
-  `move_page`, `set_rotation`, `insert_page`, `import_pages`. Each is checked
-  individually, so an implementation that advances on four of the five fails.
+  `restore_page`, `move_page`, `set_rotation`, `insert_page`, `import_pages`.
+  Each is checked individually, so an implementation that advances on five of
+  the six fails. `restore_page` is checked inside
+  `assert_removed_pages_can_be_restored` rather than alongside the others,
+  because it needs a removed page to work with; it is no less binding for that.
+  Note in particular that restoring a page advances the revision like any other
+  mutation — it does not rewind to the revision the document held before the
+  removal, for the same reason undo does not (below).
 - **A failed mutation leaves it untouched.** This binds even when the
   implementation mutated internally before discovering the failure:
   `move_page` removes the page before bounds-checking `to_index` and reinserts
@@ -231,6 +316,11 @@ every implementation must pass this function unmodified:
 | `page_ids()` returns identities in document order — `index_of` on the `n`-th id returns `n` | `assert_lists_ids_in_order` |
 | `page()` and `index_of()` return an error for an unknown `PageId` | `assert_rejects_unknown_page_ids` |
 | `remove_page` reduces the count by one, makes the removed id unresolvable, and does not disturb the identity or order of surviving pages | `assert_removal_preserves_other_identities` |
+| `restore_page` brings a removed page back with its original `PageId`, `PageSize`, and `Rotation`, at the requested index, increasing the count by one | `assert_removed_pages_can_be_restored` |
+| `restore_page` accepts `at_index == page_count()` as an append, so the deletion of a last page can be undone | `assert_removed_pages_can_be_restored` |
+| `restore_page` rejects an out-of-range index with `Error::IndexOutOfBounds`, leaves the document untouched, and does **not** consume the page — a later valid restore still succeeds | `assert_removed_pages_can_be_restored` |
+| `restore_page` rejects an id the document never held with `Error::PageNotFound`, and an id that is currently present with `Error::Unsupported` — never a silent no-op or a duplicated page | `assert_removed_pages_can_be_restored` |
+| `restore_page` advances `revision()` on success and leaves it untouched on every failure | `assert_removed_pages_can_be_restored` |
 | `move_page` reorders pages to the requested position without changing the page count or any page's identity | `assert_move_reorders_without_changing_identity` |
 | `move_page` rejects a `to_index` beyond the valid range and leaves order untouched on rejection | `assert_move_rejects_out_of_range_targets` |
 | `set_rotation` round-trips: setting then reading back returns the same rotation, including reverting to `Rotation::None` | `assert_rotation_round_trips` |
@@ -240,12 +330,13 @@ every implementation must pass this function unmodified:
 | `remove_page`, `move_page`, and `set_rotation` all reject an unknown `PageId` and leave the document untouched on rejection | `assert_mutations_reject_unknown_page_ids` |
 | `import_pages` rejects a request naming an unknown source page and leaves the target untouched | `assert_import_rejects_unknown_source_pages` |
 | `insert_page` and `import_pages` accept a position equal to `page_count()` as a valid append, not an out-of-bounds error | `assert_append_positions_are_valid` |
-| Each of `remove_page`, `move_page`, `set_rotation`, `insert_page`, and `import_pages` advances `revision()` on success — checked one method at a time | `assert_every_mutation_advances_the_revision` |
+| Each of `remove_page`, `move_page`, `set_rotation`, `insert_page`, and `import_pages` advances `revision()` on success — checked one method at a time (`restore_page` likewise, in its own function above) | `assert_every_mutation_advances_the_revision` |
 | A mutation rejected for an unknown `PageId` **or** for an out-of-range index leaves `revision()` untouched, including `move_page`'s remove-then-reinsert path | `assert_failed_mutations_leave_the_revision_untouched` |
 | `page_count`, `page_ids`, `page`, and `index_of` never advance `revision()`, and two consecutive `revision()` reads with no mutation between them agree | `assert_read_only_calls_never_advance_the_revision` |
 
 **Error semantics:** unknown `PageId` → `Error::PageNotFound`; index beyond
-range → `Error::IndexOutOfBounds { index, page_count }`. These are not merely
+range → `Error::IndexOutOfBounds { index, page_count }`; a `restore_page`
+naming a page that is currently present → `Error::Unsupported`. These are not merely
 documented: `assert_document_contract` pins each one with a `matches!`
 assertion on the specific variant, so an implementation that returns
 `Error::Malformed` for everything fails the suite. Where a call could plausibly
@@ -788,3 +879,25 @@ silently "fix" or work around — the same issue twice.
    Note also that `import_pages` advances the revision even when handed an empty
    `ids` slice. That is deliberate: a spurious cache miss is cheap, a stale tile
    is a visible defect. A real implementation should match it.
+
+5. **`PageId` is a within-session concept only.** *Open by construction; not a
+   defect to be fixed.* Supplied by Track A's plan author and verified against
+   `lopdf`: **the PDF format has nowhere to persist a `PageId`.** A page is a
+   dictionary reachable from the page tree, addressed by an object number that
+   an incremental save may renumber and a compacting save certainly does; there
+   is no standard key in which to stash an editor-assigned identity, and adding
+   a private one would be structure a conforming reader is free to discard.
+   `PageIdAllocator` accordingly hands out identities that are unique within one
+   document *in one process*, and nothing more.
+
+   **Therefore no track may store a `PageId` across a save-and-reopen.** An undo
+   stack that survives a save is wrong — the `Box<dyn Command<D>>` inverses it
+   holds name pages by `PageId`, and after a reopen those ids address different
+   pages or nothing at all. A session file recording "the user had page#7
+   selected" is wrong for the same reason. This binds the trash model too: the
+   pages `restore_page` hands back live in memory for as long as the document
+   object does and no longer, so undo of a deletion is exact *within a session*
+   and simply unavailable across one. If a track needs identity that outlives a
+   process, that is a new contract — a durable key derived from content or an
+   explicitly written-out mapping — and it must be designed as one, not
+   improvised by serializing a `PageId::get()`.
