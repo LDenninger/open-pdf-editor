@@ -14,6 +14,7 @@ otherwise noted. File paths are relative to that crate's `src/`.
 
 - [Page value types](#page-value-types) — `page.rs`
 - [`Document`](#document) — `document.rs`
+- [Compaction destroys undo of deletions](#compaction-destroys-undo-of-deletions)
 - [`DocumentIo`](#documentio) — `document.rs`
 - [`DocumentSnapshot`](#documentsnapshot) — `document.rs`
 - [`Command`](#command) — `command.rs`
@@ -374,6 +375,50 @@ the contract suite's assertions above but load-bearing): removing the page
 first leaves `page_count() - 1` pages, so `to_index` is valid if
 `to_index <= page_count() - 1`, where `page_count()` is the value **before**
 the move.
+
+---
+
+## Compaction destroys undo of deletions
+
+Three already-stated rules combine into a consequence none of them implies
+alone, so it is written down here rather than left for a track to
+rediscover mid-implementation.
+
+[The trash model](#the-trash-model) keeps a page removed by `remove_page` in
+the document, unreferenced, precisely so `restore_page` can bring it back
+exactly. `save_compacted` (below, under [`DocumentIo`](#documentio)) exists
+to purge unreferenced objects — that is what "compacted" means. A trashed
+page **is** an unreferenced object. Put together: **a compacting save
+discards everything currently in the trash**, and `restore_page` for any
+page removed before that save returns `Error::PageNotFound` afterward,
+exactly as if the page had never existed. `save_incremental`, the default
+save path, does not purge, so undo of a deletion survives it — compaction is
+the one save path that is destructive here, which is consistent with it
+already being the only explicitly-requested, non-default save path.
+
+This binds the three tracks starting in parallel on top of `Document`:
+
+- **Track C** (`opdf-ops`, the undo stack): a queued inverse of a deletion
+  becomes invalid the instant a compacting save succeeds. The stack must
+  drop or invalidate those entries at that point, not let them fail later
+  when the user actually presses undo. An inverse returning
+  `Error::PageNotFound` when applied is a defect in the undo stack, not an
+  acceptable error path.
+- **Track D** (`opdf-app`, the interface): compacting is a destructive
+  action from the user's point of view — it forecloses undo of every
+  deletion made so far in the session — so the interface must say so before
+  performing it, not perform it and silently drop undo history.
+- **Track A** (`opdf-pdf`): must purge unreferenced objects, including
+  trashed pages, in `save_compacted`, and must not purge them in
+  `save_incremental`. Already covered by Track A's own plan; recorded here
+  so the other two tracks can see why it matters to them too.
+
+This is distinct from [Known gaps item 5](#known-gaps): that item is about
+`PageId` having no meaning after a save-and-reopen at all, compacted or not,
+which follows from the existing rule that a `PageId` is never persisted. The
+rule here is narrower and applies within a single session — it is about
+compaction specifically discarding the trash, not about identity failing to
+survive a reopen.
 
 ---
 
@@ -901,3 +946,7 @@ silently "fix" or work around — the same issue twice.
    process, that is a new contract — a durable key derived from content or an
    explicitly written-out mapping — and it must be designed as one, not
    improvised by serializing a `PageId::get()`.
+
+   Within a session, compaction cuts that window short deliberately rather
+   than by construction — see
+   [Compaction destroys undo of deletions](#compaction-destroys-undo-of-deletions).
