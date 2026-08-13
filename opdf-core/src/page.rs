@@ -17,7 +17,12 @@ impl PageId {
         Self(raw)
     }
 
-    /// Unwrap the raw identifier, for storage in formats that cannot hold a `PageId`.
+    /// Unwrap the raw identifier, for in-memory interchange with code that cannot name the `PageId` type
+    /// (for example a widget id or a hash map key expressed as a bare `u64`).
+    ///
+    /// The returned value must never be written to disk or carried across a save-and-reopen: a `PageId`
+    /// is unique only within one document in one process, and the PDF format has nowhere to persist it.
+    /// See `docs/architecture/contracts.md`, "never persist a `PageId`".
     pub const fn get(self) -> u64 {
         self.0
     }
