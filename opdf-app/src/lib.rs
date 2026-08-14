@@ -14,6 +14,11 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod icons;
+pub mod theme;
+
+pub use theme::{Theme, apply_theme};
+
 /// Name shown in the window title bar and the about box.
 pub const APPLICATION_NAME: &str = "opdf";
 
