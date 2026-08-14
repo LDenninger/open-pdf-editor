@@ -8,3 +8,4 @@
 pub mod canvas;
 pub mod menu_bar;
 pub mod thumbnail_rail;
+pub mod toolbar;
