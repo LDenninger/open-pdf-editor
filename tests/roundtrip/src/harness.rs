@@ -1,10 +1,10 @@
 //! The round-trip assertion: open a document, save it unedited, reopen the
 //! result, and require the saved bytes to match the original exactly.
 //!
-//! This function is generic over [`opdf_core::DocumentIo`] and compiles
-//! against no implementation in particular. It is written now so it is
-//! waiting the moment Track A lands one; see `tests/corpus_round_trip.rs`
-//! for the integration test that actually calls it.
+//! This function is generic over [`opdf_core::DocumentIo`] rather than tied
+//! to `opdf-pdf`, so the two can be developed apart. `tests/corpus_round_trip.rs`
+//! is the integration test that drives it over the checked-in corpus with
+//! the real parser.
 
 use std::path::Path;
 
@@ -97,7 +97,12 @@ pub fn assert_round_trip<D: DocumentIo>(original_path: &Path, strength: RoundTri
         source,
     })?;
 
-    let saved_path = original_path.with_extension("roundtrip.pdf");
+    //--- a scratch directory, not `original_path.with_extension(...)`: the
+    //--- corpus files are tracked in git, and writing the saved copy beside
+    //--- them left artifacts in a tracked directory whenever an assertion
+    //--- panicked before the cleanup at the end of this function ---
+    let scratch = tempfile::tempdir()?;
+    let saved_path = scratch.path().join("roundtrip.pdf");
     document.save_incremental(&saved_path).map_err(|source| RoundTripFailure::Save {
         path: saved_path.clone(),
         source,
@@ -138,6 +143,7 @@ pub fn assert_round_trip<D: DocumentIo>(original_path: &Path, strength: RoundTri
         }
     };
 
-    let _ = std::fs::remove_file(&saved_path);
+    //--- the scratch directory removes itself on drop, including on a panic ---
+    drop(scratch);
     result
 }
