@@ -192,6 +192,31 @@ mod tests {
         assert!(matches!(result, Err(Error::Render(_))), "opening a missing file must fail loudly");
     }
 
+    #[cfg(feature = "contract-tests")]
+    #[test]
+    fn satisfies_the_render_service_contract() {
+        opdf_core::contract::assert_render_service_contract(|snapshot| {
+            PdfiumRenderService::open(&ensure_contract_fixture(), snapshot).expect("the contract fixture must open")
+        });
+    }
+
+    #[test]
+    fn polling_never_blocks_on_a_render_in_flight() {
+        let service = build_service();
+        //--- 595 x 842 at scale 4.0 is 2380 x 3368, about 32 MiB of RGBA: milliseconds of work, not microseconds ---
+        service.submit(RenderRequest::new(PageId::new(1), 7, 4.0).unwrap());
+
+        let started = std::time::Instant::now();
+        let _first_poll = service.poll();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "poll must return immediately while a render is in flight, took {elapsed:?}"
+        );
+
+        assert_eq!(drain(&service, 1).len(), 1, "the in-flight render must still be answered");
+    }
+
     #[test]
     fn an_unknown_page_identity_fails_without_panicking() {
         let service = build_service();
