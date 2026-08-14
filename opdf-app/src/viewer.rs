@@ -15,7 +15,7 @@ use opdf_core::render::RenderService;
 use crate::layout::{DocumentLayout, compute_document_layout, find_current_page, find_scroll_target, find_visible_pages};
 use crate::scheduler::{MAX_SUBMISSIONS_PER_FRAME, plan_render_requests};
 use crate::theme::Theme;
-use crate::tiles::{AbsorbReport, TextureCache, absorb_responses};
+use crate::tiles::{AbsorbReport, TextureCache, absorb_responses_routed};
 use crate::zoom::{anchor_scroll_offset, clamp_zoom, fit_page_zoom, fit_width_zoom, quantize_render_scale};
 
 /// How far beyond the viewport, in viewport heights, tiles are requested ahead of
@@ -212,26 +212,42 @@ pub struct FrameOutcome {
 /// particular response. When anything is submitted or still in flight, it schedules
 /// a repaint, because an idle event loop would otherwise never run the frame that
 /// collects the answer.
+///
+/// `caches[0]` is the canvas cache: page requests are planned into it, and it is
+/// the one evicted here. The remaining entries are the other surfaces' caches —
+/// the thumbnail rail's — which submit their own requests to the same service and
+/// so must be handed back their own answers. There is exactly one service because
+/// the rasterizer is not thread-safe, so a single `poll` drains every surface's
+/// responses at once and they have to be routed; see
+/// [`crate::tiles::absorb_responses_routed`].
+///
+/// Passing an empty slice is a no-op returning a default [`FrameOutcome`].
 pub fn step_render_service(
     state: &ViewerState,
     service: &dyn RenderService,
-    cache: &mut TextureCache,
+    caches: &mut [&mut TextureCache],
     ctx: &egui::Context,
     pixels_per_point: f32,
 ) -> FrameOutcome {
-    let frame_clock = cache.begin_frame();
+    let Some(canvas) = caches.first_mut() else {
+        return FrameOutcome::default();
+    };
+    let frame_clock = canvas.begin_frame();
     let snapshot = state.snapshot();
 
-    //--- one poll, never waited on ---
-    let absorbed = absorb_responses(cache, ctx, snapshot.revision, service.poll(), frame_clock);
+    //--- one poll, never waited on; each answer goes to the cache that asked ---
+    let absorbed = absorb_responses_routed(caches, ctx, snapshot.revision, service.poll(), frame_clock);
 
+    let Some(canvas) = caches.first_mut() else {
+        return FrameOutcome::default();
+    };
     let plan = plan_render_requests(
         snapshot,
         state.visible_pages(),
         state.current_page().unwrap_or(0),
         state.render_scale(pixels_per_point),
         state.view_rotation,
-        &mut |request| cache.mark_pending(*request),
+        &mut |request| canvas.mark_pending(*request),
         MAX_SUBMISSIONS_PER_FRAME,
     );
     for request in &plan.requests {
@@ -239,7 +255,8 @@ pub fn step_render_service(
     }
 
     //--- an answered request nobody collects is an invisible page; keep the loop turning ---
-    if !plan.requests.is_empty() || plan.skipped > 0 || cache.pending_count() > 0 {
+    let still_in_flight = caches.iter().any(|cache| cache.pending_count() > 0);
+    if !plan.requests.is_empty() || plan.skipped > 0 || still_in_flight {
         ctx.request_repaint();
     }
 
@@ -357,12 +374,12 @@ mod tests {
         let service = FakeRenderService::new(state.snapshot().clone());
         let mut cache = TextureCache::new(1 << 26);
 
-        let first = step_render_service(&state, &service, &mut cache, &ctx, 1.0);
+        let first = step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
         assert_eq!(first.absorbed.stored, 0, "nothing can have arrived before anything was asked for");
         assert!(first.submitted > 0, "the first frame must ask for the visible pages");
         assert!(cache.is_empty(), "the first frame draws placeholders; that is the case the canvas must handle");
 
-        let second = step_render_service(&state, &service, &mut cache, &ctx, 1.0);
+        let second = step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
         assert_eq!(second.absorbed.stored, first.submitted, "every request submitted must be answered exactly once");
         assert_eq!(second.submitted, 0, "a page already cached must not be requested again");
     }
@@ -374,7 +391,7 @@ mod tests {
         let service = FakeRenderService::new(state.snapshot().clone());
         let mut cache = TextureCache::new(1 << 26);
 
-        let first = step_render_service(&state, &service, &mut cache, &ctx, 1.0);
+        let first = step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
         //--- a second frame before the service has answered: the fake answers in poll, so drive the plan directly ---
         let mut wanted = 0;
         crate::scheduler::plan_render_requests(
@@ -408,7 +425,7 @@ mod tests {
         let service = FakeRenderService::new(state.snapshot().clone());
         let mut cache = TextureCache::new(1 << 26);
 
-        let outcome = step_render_service(&state, &service, &mut cache, &ctx, 1.0);
+        let outcome = step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
         assert!(
             outcome.submitted <= MAX_SUBMISSIONS_PER_FRAME,
             "a zoomed-out view of a long document must not queue hundreds of tiles in one frame"
@@ -427,8 +444,8 @@ mod tests {
             state.scroll_to_page(ii, 0.0);
             state.refresh_current_page();
             //--- two frames per page: one to submit, one to absorb ---
-            step_render_service(&state, &service, &mut cache, &ctx, 1.0);
-            step_render_service(&state, &service, &mut cache, &ctx, 1.0);
+            step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
+            step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
         }
         assert!(
             cache.used_bytes() <= 8 << 20,
@@ -444,13 +461,13 @@ mod tests {
         //--- a service still holding the old snapshot answers requests for the old revision ---
         let stale_service = FakeRenderService::new(state.snapshot().clone());
         let mut cache = TextureCache::new(1 << 26);
-        step_render_service(&state, &stale_service, &mut cache, &ctx, 1.0);
+        step_render_service(&state, &stale_service, &mut [&mut cache], &ctx, 1.0);
 
         let mut next = state.snapshot().clone();
         next.revision += 1;
         state.replace_snapshot(next, &theme, &mut [&mut cache]);
 
-        let outcome = step_render_service(&state, &stale_service, &mut cache, &ctx, 1.0);
+        let outcome = step_render_service(&state, &stale_service, &mut [&mut cache], &ctx, 1.0);
         assert_eq!(
             outcome.absorbed.stored, 0,
             "tiles rasterized for the previous revision must never enter the cache"

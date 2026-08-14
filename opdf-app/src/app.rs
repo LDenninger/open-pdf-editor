@@ -169,8 +169,16 @@ impl OpdfApp {
 impl eframe::App for OpdfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         //--- the render loop's service half, once per frame, before anything is drawn ---
+        //--- both caches are handed in: one service answers both surfaces, and a
+        //--- response has to reach the cache that asked or the rail never fills in ---
         let pixels_per_point = ctx.pixels_per_point();
-        step_render_service(&self.state, self.service.as_ref(), &mut self.canvas_cache, ctx, pixels_per_point);
+        step_render_service(
+            &self.state,
+            self.service.as_ref(),
+            &mut [&mut self.canvas_cache, &mut self.rail_cache],
+            ctx,
+            pixels_per_point,
+        );
 
         let mut pending_action = Self::collect_keyboard_action(ctx);
         self.apply_wheel_zoom(ctx);
@@ -313,7 +321,7 @@ mod tests {
         let (mut app, ctx) = build_app(10);
         //--- warm both caches ---
         for _ in 0..2 {
-            step_render_service(&app.state, app.service.as_ref(), &mut app.canvas_cache, &ctx, 1.0);
+            step_render_service(&app.state, app.service.as_ref(), &mut [&mut app.canvas_cache], &ctx, 1.0);
         }
         assert!(!app.canvas_cache.is_empty(), "the canvas cache must warm before this test means anything");
 
@@ -345,8 +353,8 @@ mod tests {
     fn steps_the_render_loop_without_a_display() {
         let (app, ctx) = build_app(40);
         let mut cache = TextureCache::new(1 << 24);
-        let first = step_render_service(&app.state, app.service.as_ref(), &mut cache, &ctx, 1.0);
-        let second = step_render_service(&app.state, app.service.as_ref(), &mut cache, &ctx, 1.0);
+        let first = step_render_service(&app.state, app.service.as_ref(), &mut [&mut cache], &ctx, 1.0);
+        let second = step_render_service(&app.state, app.service.as_ref(), &mut [&mut cache], &ctx, 1.0);
         assert!(first.submitted > 0);
         assert_eq!(second.absorbed.stored, first.submitted);
     }
