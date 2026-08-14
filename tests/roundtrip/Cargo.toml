@@ -10,3 +10,6 @@ description = "Structural-diff and round-trip verification harness for open-pdf-
 [dependencies]
 opdf-core = { path = "../../opdf-core" }
 thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+sha2 = "0.11"

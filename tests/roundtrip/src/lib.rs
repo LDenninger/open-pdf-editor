@@ -10,3 +10,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod corpus;
+
+pub use corpus::{CorpusEntry, CorpusError, CorpusManifest};

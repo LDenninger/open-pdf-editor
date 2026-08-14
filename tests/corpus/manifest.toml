@@ -1,0 +1,37 @@
+# Provenance for every file in tests/corpus/files/ (tier = "checked-in") and
+# every file tests/corpus/fetch_corpus.py downloads on demand (tier =
+# "fetched"). Every entry is required to carry a licence and an attribution,
+# enforced by opdf_roundtrip::corpus's test suite.
+
+[[entry]]
+file = "irs_f1040.pdf"
+sha256 = "3d31c226df0d189ced80e039d01cf0f8820c1019681a0f0ca6264de277b7e982"
+source_url = "https://www.irs.gov/pub/irs-pdf/f1040.pdf"
+license = "Public Domain (U.S. Government Work, 17 U.S.C. Sec. 105)"
+attribution = "Internal Revenue Service"
+fetched_on = "2026-08-14"
+tier = "checked-in"
+tags = ["xfa-form", "acroform", "javascript", "real-world", "small"]
+notes = "2025 Form 1040, a dynamic XFA form (Adobe LiveCycle Designer 6.5) with embedded JavaScript -- structurally unusual relative to a plain AcroForm PDF. 2 pages, 220237 bytes, PDF 1.7."
+
+[[entry]]
+file = "zh_wiki_monthly.pdf"
+sha256 = "a6a4b43e49d44dd5629bf437bd19b2c267cc6aa0b190630dcb82b007f545be3b"
+source_url = "https://commons.wikimedia.org/wiki/File:%E4%B8%AD%E6%96%87%E7%BB%B4%E5%9F%BA%E7%99%BE%E7%A7%91%E6%9C%88%E5%88%8A%E7%AC%AC%E4%BA%94%E6%9C%9F.pdf"
+license = "CC BY-SA 3.0"
+attribution = "HUANZHEN YE (Wikimedia Commons user Yhz1221)"
+fetched_on = "2026-08-14"
+tier = "checked-in"
+tags = ["cjk", "acroform", "real-world", "medium"]
+notes = "Chinese Wikipedia community monthly, issue 5. 14 pages of real Simplified/Traditional Chinese text; Producer is Mac OS X Quartz PDFContext via PowerPoint, a non-Adobe export path. 2904215 bytes, PDF 1.7. ShareAlike: any derivative built from this specific file stays CC BY-SA 3.0."
+
+[[entry]]
+file = "zero_byte.pdf"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+source_url = "generated"
+license = "N/A -- empty file, no content"
+attribution = "n/a"
+fetched_on = "2026-08-14"
+tier = "checked-in"
+tags = ["zero-byte", "pathological"]
+notes = "Zero-byte file. DocumentIo::open must reject this with an error, never panic."
