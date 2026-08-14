@@ -134,6 +134,15 @@ impl<T> TileCache<T> {
         true
     }
 
+    /// Whether a request has been submitted and not yet answered.
+    ///
+    /// This is what lets one poll of a shared render service be routed: a response
+    /// belongs to the cache that asked for it, and there is no other way to tell,
+    /// because the request itself carries no cache identity.
+    pub fn is_pending(&self, request: &RenderRequest) -> bool {
+        self.pending.contains(request)
+    }
+
     /// Forget that a request is in flight, after a response arrives for it —
     /// including a failed one, which never becomes an entry.
     pub fn clear_pending(&mut self, request: &RenderRequest) {
