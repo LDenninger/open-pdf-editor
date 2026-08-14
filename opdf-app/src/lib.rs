@@ -15,6 +15,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod icons;
+pub mod synthetic;
 pub mod theme;
 
 pub use theme::{Theme, apply_theme};
