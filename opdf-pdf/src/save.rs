@@ -1,11 +1,9 @@
 //! Writing in-memory page state back into PDF objects, and the `DocumentIo` contract.
 
-// Materialisation gains its first non-test caller when `save_incremental` lands
-// later in the track. Until then `-D warnings` would reject it as dead code.
-#![allow(dead_code)]
+use std::path::Path;
 
-use lopdf::{Object, ObjectId};
-use opdf_core::Result;
+use lopdf::{IncrementalDocument, Object, ObjectId};
+use opdf_core::{Document as _, DocumentIo, Error, Result};
 
 use crate::document::PdfDocument;
 use crate::error::convert_lopdf_error;
@@ -133,11 +131,60 @@ impl PdfDocument {
     }
 }
 
+impl DocumentIo for PdfDocument {
+    //---------------------------------------------------------------------
+    // Reading and writing files
+    //---------------------------------------------------------------------
+
+    fn open(path: &Path) -> Result<Self> {
+        let incremental = IncrementalDocument::load(path).map_err(convert_lopdf_error)?;
+        Self::build_from_incremental(incremental)
+    }
+
+    /// Write an incremental update appended to the bytes this document was opened from.
+    ///
+    /// When nothing has changed, the original bytes are reproduced exactly: an
+    /// incremental update with no changed objects is no update at all, and
+    /// appending an empty revision would grow the file for no reason. When
+    /// something has changed, the output is the original bytes verbatim
+    /// followed by one appended revision holding the changed objects and a new
+    /// cross-reference section.
+    ///
+    /// Returns [`Error::Unsupported`] for a document with no pages.
+    fn save_incremental(&mut self, path: &Path) -> Result<()> {
+        if self.page_count() == 0 {
+            return Err(Error::Unsupported("cannot save a document with no pages".to_string()));
+        }
+
+        if self.dirty.is_clean() {
+            std::fs::write(path, self.incremental().get_prev_documents_bytes())?;
+            return Ok(());
+        }
+
+        self.materialize_changes()?;
+
+        //--- serialising the cross-reference stream consumes an object id and rewrites the trailer in place; restore both so a second save produces the same bytes ---
+        let restored_max_id = self.incremental().new_document.max_id;
+        let restored_trailer = self.incremental().new_document.trailer.clone();
+        let outcome = self.incremental_mut().save(path);
+        self.incremental_mut().new_document.max_id = restored_max_id;
+        self.incremental_mut().new_document.trailer = restored_trailer;
+
+        //--- `IncrementalDocument::save` reports through `std::io::Error`, not `lopdf::Error` ---
+        outcome.map(|_| ()).map_err(Error::from)
+    }
+
+    /// Not implemented until Task 12.
+    fn save_compacted(&mut self, path: &Path) -> Result<()> {
+        Err(Error::Unsupported(format!("save_compacted({}) is not implemented yet", path.display())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fixture;
-    use opdf_core::{Document as _, PageSize, Rotation};
+    use opdf_core::{PageSize, Rotation};
 
     fn read_appended_page(document: &PdfDocument, object_id: lopdf::ObjectId) -> &lopdf::Dictionary {
         document
@@ -238,5 +285,267 @@ mod tests {
                 .unwrap_or(0),
             90
         );
+    }
+
+    use std::path::PathBuf;
+
+    fn write_fixture(directory: &Path, file_name: &str, bytes: &[u8]) -> PathBuf {
+        let path = directory.join(file_name);
+        std::fs::write(&path, bytes).expect("a fixture must be writable");
+        path
+    }
+
+    #[test]
+    fn opens_a_file_from_disk() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let path = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4; 3]));
+        let document = PdfDocument::open(&path).unwrap();
+        assert_eq!(document.page_count(), 3);
+    }
+
+    #[test]
+    fn reports_a_missing_file_as_an_io_error() {
+        let outcome = PdfDocument::open(Path::new("/nonexistent/definitely-not-here.pdf"));
+        assert!(
+            matches!(outcome, Err(opdf_core::Error::Io(_))),
+            "a missing file is an io error, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn saving_an_unedited_document_reproduces_the_file_byte_for_byte() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let original = fixture::build_flat_pages(&[PageSize::A4, PageSize::LETTER, PageSize::new(200.0, 400.0)]);
+        let source = write_fixture(directory.path(), "flat.pdf", &original);
+        let destination = directory.path().join("flat-saved.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            original,
+            "opening and saving without editing must produce the identical file"
+        );
+    }
+
+    #[test]
+    fn saving_after_an_edit_appends_to_the_original_bytes() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let original = fixture::build_flat_pages(&[PageSize::A4; 3]);
+        let source = write_fixture(directory.path(), "flat.pdf", &original);
+        let destination = directory.path().join("flat-edited.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        let saved = std::fs::read(&destination).unwrap();
+        assert!(
+            saved.starts_with(&original),
+            "an incremental save must append to the original bytes, never rewrite them"
+        );
+        assert!(saved.len() > original.len(), "an edit must actually append something");
+    }
+
+    #[test]
+    fn saving_after_an_edit_destroys_nothing_that_was_there() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let original = fixture::build_flat_pages(&[PageSize::A4; 3]);
+        let source = write_fixture(directory.path(), "flat.pdf", &original);
+        let destination = directory.path().join("flat-edited.pdf");
+
+        let object_count_before = lopdf::Document::load_mem(&original).unwrap().objects.len();
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        let reloaded = lopdf::Document::load(&destination).unwrap();
+        assert!(
+            reloaded.objects.len() >= object_count_before,
+            "a removed page's objects survive the save: removal unlinks them from the page tree, it never deletes them"
+        );
+    }
+
+    #[test]
+    fn a_page_removed_and_restored_before_saving_is_written_back_intact() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let sizes = [PageSize::new(100.0, 100.0), PageSize::new(200.0, 200.0), PageSize::new(300.0, 300.0)];
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&sizes));
+        let destination = directory.path().join("restored.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.set_rotation(ids[1], Rotation::Half).unwrap();
+        document.remove_page(ids[1]).unwrap();
+        document.restore_page(ids[1], 2).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        let reopened = PdfDocument::open(&destination).unwrap();
+        let geometry: Vec<(f32, Rotation)> = reopened
+            .page_ids()
+            .into_iter()
+            .map(|id| {
+                let info = reopened.page(id).unwrap();
+                (info.size.width_pt, info.rotation)
+            })
+            .collect();
+        assert_eq!(
+            geometry,
+            vec![(100.0, Rotation::None), (300.0, Rotation::None), (200.0, Rotation::Half)],
+            "a restored page must be written back at its restored position with the rotation it carried into the trash"
+        );
+    }
+
+    #[test]
+    fn a_restored_page_keeps_the_content_stream_it_always_had() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4; 3]));
+        let destination = directory.path().join("restored.pdf");
+
+        //--- capture the content the middle page renders from, before anything touches it ---
+        let original = lopdf::Document::load(&source).unwrap();
+        let original_page = original.page_iter().nth(1).expect("the fixture has three pages");
+        let content_before = original.get_page_content(original_page);
+        assert!(!content_before.is_empty(), "the fixture's pages carry content, or this test proves nothing");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        document.restore_page(ids[1], 1).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        let reopened = lopdf::Document::load(&destination).unwrap();
+        let reopened_page = reopened.page_iter().nth(1).expect("the saved file has three pages");
+        assert_eq!(
+            reopened.get_page_content(reopened_page),
+            content_before,
+            "a restored page must render from the same bytes it always did: this is the content half of the trash contract, and VecDocument cannot prove it"
+        );
+    }
+
+    #[test]
+    fn the_trash_does_not_survive_a_save_and_reopen() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4; 3]));
+        let destination = directory.path().join("trimmed.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        //--- the removed page's bytes are still in the file, but its identity is not: a PageId is a within-session concept ---
+        let mut reopened = PdfDocument::open(&destination).unwrap();
+        assert_eq!(reopened.page_count(), 2);
+
+        //--- the reopened document's trash is empty, so no identity at all is restorable ---
+        let never_held = opdf_core::PageId::new(u64::MAX);
+        let rejected = reopened.restore_page(never_held, 0);
+        assert!(
+            matches!(rejected, Err(opdf_core::Error::PageNotFound(_))),
+            "a trash keyed on PageId cannot outlive the session that allocated the ids, got: {rejected:?}"
+        );
+
+        //--- and it is worse than merely absent. Allocation restarts at zero on every open, so the
+        //--- removed page's id is now a live page — a different one. Replaying a deletion's inverse
+        //--- across a save is not just unavailable, it is misdirected, which is why an undo stack
+        //--- must never outlive a save.
+        let rejected = reopened.restore_page(ids[1], 0);
+        assert!(
+            matches!(rejected, Err(opdf_core::Error::Unsupported(_))),
+            "the removed page's identity now names a different, live page, got: {rejected:?}"
+        );
+        assert_eq!(reopened.page_count(), 2, "no rejected restore may add a page");
+    }
+
+    #[test]
+    fn a_saved_edit_reopens_with_the_edited_structure() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let sizes = [PageSize::new(100.0, 100.0), PageSize::new(200.0, 200.0), PageSize::new(300.0, 300.0)];
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&sizes));
+        let destination = directory.path().join("flat-edited.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.move_page(ids[0], 2).unwrap();
+        document.set_rotation(ids[2], Rotation::Quarter).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        let reopened = PdfDocument::open(&destination).unwrap();
+        let geometry: Vec<(f32, Rotation)> = reopened
+            .page_ids()
+            .into_iter()
+            .map(|id| {
+                let info = reopened.page(id).unwrap();
+                (info.size.width_pt, info.rotation)
+            })
+            .collect();
+        assert_eq!(
+            geometry,
+            vec![(200.0, Rotation::None), (300.0, Rotation::Quarter), (100.0, Rotation::None)],
+            "the reopened document must carry the edited order and rotation"
+        );
+    }
+
+    #[test]
+    fn a_nested_tree_survives_flattening_with_its_inherited_geometry() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "inherited.pdf", &fixture::build_inherited_geometry());
+        let destination = directory.path().join("inherited-edited.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.move_page(ids[0], 1).unwrap();
+        document.save_incremental(&destination).unwrap();
+
+        let reopened = PdfDocument::open(&destination).unwrap();
+        assert_eq!(reopened.page_count(), 2);
+        for id in reopened.page_ids() {
+            let info = reopened.page(id).unwrap();
+            assert_eq!(info.size, PageSize::A4, "inherited geometry must survive flattening");
+            assert_eq!(info.rotation, Rotation::Quarter);
+        }
+    }
+
+    #[test]
+    fn saving_twice_produces_identical_files() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4; 2]));
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.set_rotation(ids[0], Rotation::Quarter).unwrap();
+
+        let first = directory.path().join("first.pdf");
+        let second = directory.path().join("second.pdf");
+        document.save_incremental(&first).unwrap();
+        document.save_incremental(&second).unwrap();
+
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap(),
+            "saving the same state twice must produce the same bytes"
+        );
+    }
+
+    #[test]
+    fn refuses_to_save_a_document_with_no_pages() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4]));
+        let destination = directory.path().join("empty.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[0]).unwrap();
+
+        assert!(
+            matches!(document.save_incremental(&destination), Err(opdf_core::Error::Unsupported(_))),
+            "a pdf with no pages is not a pdf worth writing"
+        );
+        assert!(!destination.exists(), "a refused save must not leave a file behind");
     }
 }
