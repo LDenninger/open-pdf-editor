@@ -18,3 +18,7 @@ pub use corpus::{CorpusEntry, CorpusError, CorpusManifest};
 pub mod diff;
 
 pub use diff::{DiffError, PageGeometry, PageGeometryChange, StructuralDiff, diff_bytes};
+
+pub mod harness;
+
+pub use harness::{RoundTripFailure, RoundTripStrength, assert_round_trip};
