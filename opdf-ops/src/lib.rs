@@ -27,3 +27,7 @@ pub use insert_blank_page::InsertBlankPage;
 pub mod sequence;
 
 pub use sequence::Sequence;
+
+pub mod import_pages;
+
+pub use import_pages::ImportPages;
