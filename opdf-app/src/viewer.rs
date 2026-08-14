@@ -13,7 +13,7 @@ use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
 
 use crate::layout::{DocumentLayout, compute_document_layout, find_current_page, find_scroll_target, find_visible_pages};
-use crate::scheduler::{MAX_SUBMISSIONS_PER_FRAME, plan_render_requests};
+use crate::scheduler::{MAX_SUBMISSIONS_PER_FRAME, RenderSettings, plan_render_requests};
 use crate::theme::Theme;
 use crate::tiles::{AbsorbReport, TextureCache, absorb_responses_routed};
 use crate::zoom::{anchor_scroll_offset, clamp_zoom, fit_page_zoom, fit_width_zoom, quantize_render_scale};
@@ -47,6 +47,13 @@ pub struct ViewerState {
     pub scroll_offset_px: f32,
     /// Size of the canvas viewport in screen points, as `(width, height)`.
     pub viewport_size_px: (f32, f32),
+    /// Top-left corner of the canvas viewport in screen points, as `(x, y)`.
+    ///
+    /// Written by the canvas each frame. A pointer-anchored zoom measures its
+    /// anchor from here, not from the window origin: the menu bar, the toolbar,
+    /// and the rail sit between the two, so anchoring at the window origin slides
+    /// the page under the pointer by the height of that chrome on every zoom step.
+    pub viewport_origin_px: (f32, f32),
     /// Whether the zoom tracks the viewport size.
     pub fit_mode: FitMode,
     /// View rotation the user applied, composed by the renderer with each page's
@@ -75,6 +82,7 @@ impl ViewerState {
             zoom: 1.0,
             scroll_offset_px: 0.0,
             viewport_size_px: (0.0, 0.0),
+            viewport_origin_px: (0.0, 0.0),
             fit_mode: FitMode::Free,
             view_rotation: Rotation::None,
             rail_visible: true,
@@ -134,6 +142,20 @@ impl ViewerState {
     /// display's pixel density so a HiDPI screen gets a sharp tile.
     pub fn render_scale(&self, pixels_per_point: f32) -> f32 {
         quantize_render_scale(clamp_zoom(self.zoom) * pixels_per_point.max(1.0))
+    }
+
+    /// This frame's rasterization settings: quantised scale, view rotation, and
+    /// the backend's texture-size limit.
+    ///
+    /// The canvas and the scheduler both build their cache keys from this, so a
+    /// page capped for its size is looked up at the same capped scale it was
+    /// requested at.
+    pub fn render_settings(&self, pixels_per_point: f32, max_texture_side: usize) -> RenderSettings {
+        RenderSettings {
+            render_scale: self.render_scale(pixels_per_point),
+            view_rotation: self.view_rotation,
+            max_texture_side,
+        }
     }
 
     /// Recompute which page the user is on from the current scroll offset.
@@ -241,12 +263,12 @@ pub fn step_render_service(
     let Some(canvas) = caches.first_mut() else {
         return FrameOutcome::default();
     };
+    let max_texture_side = ctx.input(|input| input.max_texture_side);
     let plan = plan_render_requests(
         snapshot,
         state.visible_pages(),
         state.current_page().unwrap_or(0),
-        state.render_scale(pixels_per_point),
-        state.view_rotation,
+        state.render_settings(pixels_per_point, max_texture_side),
         &mut |request| canvas.mark_pending(*request),
         MAX_SUBMISSIONS_PER_FRAME,
     );
@@ -273,6 +295,10 @@ mod tests {
     use crate::synthetic::build_synthetic_snapshot;
     use opdf_core::fakes::FakeRenderService;
     use opdf_core::render::RenderRequest;
+
+    /// A texture limit no synthetic page reaches, so these tests exercise the
+    /// scheduler rather than the per-page size cap.
+    const TEST_MAX_TEXTURE_SIDE: usize = 16_384;
 
     fn build_viewer(page_count: usize) -> (ViewerState, Theme) {
         let theme = Theme::dark();
@@ -398,9 +424,8 @@ mod tests {
             state.snapshot(),
             state.visible_pages(),
             0,
-            state.render_scale(1.0),
-            state.view_rotation,
-            &mut |request| {
+            state.render_settings(1.0, TEST_MAX_TEXTURE_SIDE),
+            &mut |request: &opdf_core::render::RenderRequest| {
                 let fresh = cache.mark_pending(*request);
                 if fresh {
                     wanted += 1;

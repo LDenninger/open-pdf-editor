@@ -82,9 +82,11 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut ViewerState, cache: &mut Textu
     }
 
     let zoom = crate::zoom::clamp_zoom(state.zoom);
-    let render_scale = state.render_scale(pixels_per_point);
     let revision = state.snapshot().revision;
-    let view_rotation = state.view_rotation;
+    //--- the same settings the scheduler built its requests from, so a page whose
+    //--- scale was capped for its size is looked up at that capped scale ---
+    let max_texture_side = ui.ctx().input(|input| input.max_texture_side);
+    let settings = state.render_settings(pixels_per_point, max_texture_side);
 
     let output = scroll_area.show_viewport(ui, |ui, viewport| {
         let (content_width_px, content_height_px) = state.content_size_px();
@@ -99,14 +101,15 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut ViewerState, cache: &mut Textu
         for placement in state.layout().placements.get(visible).unwrap_or_default() {
             let page_rect = place_page_rect(content_rect.min, placement, zoom);
 
-            //--- tier 1: the exact tile for this scale ---
-            let exact = opdf_core::render::RenderRequest::new(placement.id, revision, render_scale)
+            //--- tier 1: the exact tile for this page's scale, capped as the scheduler capped it ---
+            let page_scale = settings.scale_for_page(opdf_core::page::PageSize::new(placement.width_pt, placement.height_pt));
+            let exact = opdf_core::render::RenderRequest::new(placement.id, revision, page_scale)
                 .ok()
-                .map(|request| request.with_rotation(view_rotation));
+                .map(|request| request.with_rotation(settings.view_rotation));
             let key = match exact.filter(|request| cache.contains(request)) {
                 Some(request) => Some(request),
                 //--- tier 2: any cached scale of the same page at the same revision ---
-                None => cache.find_nearest_scale(placement.id, revision, render_scale),
+                None => cache.find_nearest_scale(placement.id, revision, page_scale),
             };
 
             match key.and_then(|key| cache.get(&key)) {
@@ -119,6 +122,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut ViewerState, cache: &mut Textu
 
     state.scroll_offset_px = output.state.offset.y;
     state.viewport_size_px = (output.inner_rect.width(), output.inner_rect.height());
+    state.viewport_origin_px = (output.inner_rect.min.x, output.inner_rect.min.y);
     state.refresh_current_page();
 }
 

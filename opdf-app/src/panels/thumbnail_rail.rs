@@ -100,6 +100,7 @@ pub fn show_thumbnail_rail(ui: &mut egui::Ui, state: &mut ViewerState, cache: &m
         .last()
         .map_or(0.0, |slot| slot.top_px + slot.height_px + THUMBNAIL_LABEL_HEIGHT + theme.gutter);
     let current = state.current_page();
+    let max_texture_side = ui.ctx().input(|input| input.max_texture_side);
     let frame_clock = cache.begin_frame();
     let mut clicked = None;
 
@@ -118,7 +119,10 @@ pub fn show_thumbnail_rail(ui: &mut egui::Ui, state: &mut ViewerState, cache: &m
             );
 
             //--- request this thumbnail if it is not already cached or in flight ---
-            let scale = compute_thumbnail_scale(page.display_size().width_pt);
+            //--- capped for the same reason the canvas caps: a page of extreme aspect
+            //--- ratio is 132 points wide and still taller than the backend allows ---
+            let size = page.display_size();
+            let scale = crate::zoom::fit_render_scale_to_texture_limit(compute_thumbnail_scale(size.width_pt), size.width_pt, size.height_pt, max_texture_side);
             let Ok(request) = RenderRequest::new(page.id, snapshot.revision, scale) else {
                 continue;
             };
