@@ -6,4 +6,4 @@ pub mod cache;
 pub mod texture;
 
 pub use cache::TileCache;
-pub use texture::{AbsorbReport, TextureCache, absorb_responses, build_color_image, measure_tile_bytes, name_texture};
+pub use texture::{AbsorbReport, TextureCache, absorb_responses, absorb_responses_routed, build_color_image, measure_tile_bytes, name_texture};

@@ -68,9 +68,38 @@ pub fn name_texture(request: &RenderRequest) -> String {
 /// cleared from the pending set (making it retryable) and the canvas shows a
 /// placeholder.
 pub fn absorb_responses(cache: &mut TextureCache, ctx: &Context, revision: u64, responses: Vec<RenderResponse>, protected_since: u64) -> AbsorbReport {
+    absorb_responses_routed(&mut [cache], ctx, revision, responses, protected_since)
+}
+
+/// File every response into **whichever cache asked for it**, discarding any that
+/// answers a revision other than `revision`, then evict every cache to budget.
+///
+/// A [`opdf_core::render::RenderService`] is a single worker owning a single
+/// document — the rasterizer is not thread-safe, so there can be only one — and
+/// one call to `poll` therefore drains the answers to *every* surface's requests
+/// at once. The canvas and the thumbnail rail hold separate caches with separate
+/// budgets, so a response has to be routed back to the cache that submitted it;
+/// a response nobody claims falls to `caches[0]`, the canvas.
+///
+/// Filing everything into one cache instead is the bug this function exists to
+/// prevent: the unclaimed cache's requests stay pending forever and its surface
+/// draws placeholders that never resolve.
+pub fn absorb_responses_routed(
+    caches: &mut [&mut TextureCache],
+    ctx: &Context,
+    revision: u64,
+    responses: Vec<RenderResponse>,
+    protected_since: u64,
+) -> AbsorbReport {
     let mut report = AbsorbReport::default();
     for response in responses {
         let request = *response.request();
+        //--- the cache that asked, or the canvas if the request is no longer claimed ---
+        let owner = caches.iter().position(|cache| cache.is_pending(&request)).unwrap_or(0);
+        let Some(cache) = caches.get_mut(owner) else {
+            continue;
+        };
+
         if request.revision != revision {
             cache.clear_pending(&request);
             report.discarded += 1;
@@ -89,7 +118,11 @@ pub fn absorb_responses(cache: &mut TextureCache, ctx: &Context, revision: u64, 
             }
         }
     }
-    report.evicted = cache.evict_to_budget(protected_since);
+    //--- `protected_since` belongs to caches[0]'s clock, and a clock is per-cache:
+    //--- every other cache is evicted by whoever calls `begin_frame` on it ---
+    if let Some(canvas) = caches.first_mut() {
+        report.evicted = canvas.evict_to_budget(protected_since);
+    }
     report
 }
 
@@ -217,6 +250,69 @@ mod tests {
             "absorbing must leave the cache within budget, got {} bytes",
             cache.used_bytes()
         );
+    }
+
+    #[test]
+    fn files_a_response_into_the_cache_that_asked_for_it() {
+        let ctx = Context::default();
+        let mut canvas = TextureCache::new(1 << 20);
+        let mut rail = TextureCache::new(1 << 20);
+        let page_request = build_request(1, 7, 1.0);
+        let thumbnail_request = build_request(1, 7, 0.25);
+        canvas.mark_pending(page_request);
+        rail.mark_pending(thumbnail_request);
+
+        //--- one poll of one service answers both surfaces at once ---
+        let frame = canvas.begin_frame();
+        let report = absorb_responses_routed(
+            &mut [&mut canvas, &mut rail],
+            &ctx,
+            7,
+            vec![
+                RenderResponse::Ready {
+                    request: page_request,
+                    tile: build_tile(8, 8, 255),
+                },
+                RenderResponse::Ready {
+                    request: thumbnail_request,
+                    tile: build_tile(4, 4, 255),
+                },
+            ],
+            frame,
+        );
+
+        assert_eq!(report.stored, 2);
+        assert!(canvas.contains(&page_request), "the canvas must receive the page it asked for");
+        assert!(rail.contains(&thumbnail_request), "the rail must receive the thumbnail it asked for");
+        assert!(
+            !canvas.contains(&thumbnail_request),
+            "a thumbnail must not be filed into the canvas cache: the rail would then wait forever for a tile it already has an answer to"
+        );
+        assert_eq!(rail.pending_count(), 0, "the rail's request must leave its pending set");
+    }
+
+    #[test]
+    fn files_an_unclaimed_response_into_the_canvas_cache() {
+        let ctx = Context::default();
+        let mut canvas = TextureCache::new(1 << 20);
+        let mut rail = TextureCache::new(1 << 20);
+        let orphan = build_request(3, 7, 1.0);
+        let frame = canvas.begin_frame();
+
+        let report = absorb_responses_routed(
+            &mut [&mut canvas, &mut rail],
+            &ctx,
+            7,
+            vec![RenderResponse::Ready {
+                request: orphan,
+                tile: build_tile(8, 8, 255),
+            }],
+            frame,
+        );
+
+        assert_eq!(report.stored, 1);
+        assert!(canvas.contains(&orphan), "a response nobody is waiting for falls to the canvas");
+        assert!(rail.is_empty());
     }
 
     #[test]
