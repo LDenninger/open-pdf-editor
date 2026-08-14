@@ -68,7 +68,9 @@ impl PdfiumRenderService {
 
     /// Point the worker at a new snapshot, after a structural edit.
     ///
-    /// Requests already queued are unaffected — the renderer never validates a
+    /// Tiles rasterized at the previous revision are dropped: their requests
+    /// can never match again, so keeping them only costs memory. Requests
+    /// already queued are unaffected — the renderer never validates a
     /// revision, it only carries it.
     pub fn rebind(&self, snapshot: DocumentSnapshot) {
         let _ = self.requests.send(WorkerMessage::Rebind(Box::new(snapshot)));
@@ -259,6 +261,59 @@ mod tests {
             RenderResponse::Ready { tile, .. } => panic!("an absurd scale must fail, not yield a {}x{} tile", tile.width(), tile.height()),
         }
         assert_eq!(service.rasterizations(), 0, "a rejected request must never reach pdfium");
+    }
+
+    #[test]
+    fn a_repeated_request_is_answered_from_the_cache() {
+        let service = build_service();
+        let request = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+
+        service.submit(request);
+        assert_eq!(drain(&service, 1).len(), 1);
+        assert_eq!(service.rasterizations(), 1);
+
+        service.submit(request);
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1, "a repeated request must still receive its own response");
+        match &responses[0] {
+            RenderResponse::Ready { tile, .. } => assert_eq!((tile.width(), tile.height()), (595, 842)),
+            RenderResponse::Failed { reason, .. } => panic!("a cached request must succeed, got: {reason}"),
+        }
+        assert_eq!(service.rasterizations(), 1, "the second answer must come from the cache, not from pdfium");
+    }
+
+    #[test]
+    fn rebinding_changes_the_geometry_and_drops_the_old_revision() {
+        let service = build_service();
+        let before = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        service.submit(before);
+        assert_eq!(drain(&service, 1).len(), 1);
+        assert_eq!(service.rasterizations(), 1);
+
+        //--- the user rotates page one: a new revision, a new snapshot, and a page whose axes have swapped ---
+        let mut rotated = build_snapshot();
+        rotated.revision = 8;
+        rotated.pages[0].rotation = Rotation::Quarter;
+        service.rebind(rotated);
+
+        let after = RenderRequest::new(PageId::new(1), 8, 1.0).unwrap();
+        service.submit(after);
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1);
+        match &responses[0] {
+            RenderResponse::Ready { tile, .. } => assert_eq!((tile.width(), tile.height()), (842, 595), "the rebound rotation must be honoured"),
+            RenderResponse::Failed { reason, .. } => panic!("a request after a rebind must succeed, got: {reason}"),
+        }
+        assert_eq!(
+            service.rasterizations(),
+            2,
+            "a request at a new revision must be rasterized, never served from the old one"
+        );
+
+        //--- and the pre-rebind tile is gone rather than lingering in memory ---
+        service.submit(before);
+        assert_eq!(drain(&service, 1).len(), 1);
+        assert_eq!(service.rasterizations(), 3, "tiles from a superseded revision must have been pruned");
     }
 
     #[test]

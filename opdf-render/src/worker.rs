@@ -21,6 +21,7 @@ use opdf_core::{DocumentSnapshot, PageInfo, RenderRequest, RenderResponse, Rotat
 use pdfium_render::prelude::{PdfDocument, PdfPageIndex, PdfPageRenderRotation};
 
 use crate::backlog::{Backlog, MAX_BACKLOG};
+use crate::cache::{DEFAULT_CACHE_BYTES, TileCache};
 use crate::geometry::compute_tile_geometry;
 use crate::library::{bind_pdfium, lock_pdfium};
 use crate::raster::rasterize_page;
@@ -81,6 +82,7 @@ fn serve_requests(
 ) {
     let mut snapshot = snapshot;
     let mut backlog = Backlog::with_capacity(MAX_BACKLOG);
+    let mut cache = TileCache::with_budget(DEFAULT_CACHE_BYTES);
     let mut is_shutting_down = false;
 
     loop {
@@ -88,7 +90,7 @@ fn serve_requests(
         if backlog.is_empty() {
             match requests.recv() {
                 Ok(message) => {
-                    if !accept_message(message, &mut backlog, &mut snapshot, responses) {
+                    if !accept_message(message, &mut backlog, &mut snapshot, &mut cache, responses) {
                         is_shutting_down = true;
                     }
                 }
@@ -98,7 +100,7 @@ fn serve_requests(
 
         //--- take everything that has already arrived, so a newer request can overtake an older one ---
         for message in requests.try_iter() {
-            if !accept_message(message, &mut backlog, &mut snapshot, responses) {
+            if !accept_message(message, &mut backlog, &mut snapshot, &mut cache, responses) {
                 is_shutting_down = true;
             }
         }
@@ -108,7 +110,16 @@ fn serve_requests(
         }
 
         if let Some(request) = backlog.take_newest() {
-            let response = answer_request(document, &snapshot, request, rasterizations);
+            let response = match cache.get(&request) {
+                Some(tile) => RenderResponse::Ready { request, tile },
+                None => {
+                    let response = answer_request(document, &snapshot, request, rasterizations);
+                    if let RenderResponse::Ready { tile, .. } = &response {
+                        cache.insert(request, tile);
+                    }
+                    response
+                }
+            };
             if responses.send(response).is_err() {
                 return;
             }
@@ -120,7 +131,13 @@ fn serve_requests(
 ///
 /// A request evicted to keep the backlog bounded is answered immediately, so
 /// that every submitted request still receives exactly one response.
-fn accept_message(message: WorkerMessage, backlog: &mut Backlog, snapshot: &mut DocumentSnapshot, responses: &Sender<RenderResponse>) -> bool {
+fn accept_message(
+    message: WorkerMessage,
+    backlog: &mut Backlog,
+    snapshot: &mut DocumentSnapshot,
+    cache: &mut TileCache,
+    responses: &Sender<RenderResponse>,
+) -> bool {
     match message {
         WorkerMessage::Render(request) => {
             if let Some(superseded) = backlog.push(request) {
@@ -133,6 +150,7 @@ fn accept_message(message: WorkerMessage, backlog: &mut Backlog, snapshot: &mut 
         }
         WorkerMessage::Rebind(replacement) => {
             *snapshot = *replacement;
+            cache.retain_revision(snapshot.revision);
             true
         }
         WorkerMessage::Shutdown => false,
