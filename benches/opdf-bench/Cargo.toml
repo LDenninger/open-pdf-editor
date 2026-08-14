@@ -14,6 +14,14 @@ opdf-core = { path = "../../opdf-core" }
 [dev-dependencies]
 criterion = "0.8"
 
-# The [[bench]] entries land with the benchmark files themselves -- a declared
-# bench target whose file does not exist yet is a manifest parse error, not a
-# missing-target warning, and would break `cargo build --all` for every track.
+# A declared bench target whose file does not exist yet is a manifest parse
+# error, not a missing-target warning, so each [[bench]] entry lands in the
+# same commit as the file it names.
+
+[[bench]]
+name = "tile_alloc"
+harness = false
+
+[[bench]]
+name = "vec_document_mutations"
+harness = false
