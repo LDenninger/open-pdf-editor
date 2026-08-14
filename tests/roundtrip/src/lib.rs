@@ -14,3 +14,7 @@
 pub mod corpus;
 
 pub use corpus::{CorpusEntry, CorpusError, CorpusManifest};
+
+pub mod diff;
+
+pub use diff::{DiffError, PageGeometry, PageGeometryChange, StructuralDiff, diff_bytes};
