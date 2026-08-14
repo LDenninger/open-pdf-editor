@@ -20,6 +20,7 @@ pub mod scheduler;
 pub mod synthetic;
 pub mod theme;
 pub mod tiles;
+pub mod viewer;
 pub mod zoom;
 
 pub use theme::{Theme, apply_theme};
