@@ -34,6 +34,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod backlog;
 pub mod geometry;
 pub mod library;
 pub mod raster;
@@ -43,6 +44,7 @@ mod worker;
 #[cfg(test)]
 mod fixture;
 
+pub use backlog::{Backlog, MAX_BACKLOG};
 pub use geometry::{MAX_TILE_EDGE, MAX_TILE_PIXELS, TileGeometry, compute_tile_geometry};
 pub use library::bind_pdfium;
 pub use raster::rasterize_page;

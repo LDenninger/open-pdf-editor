@@ -20,6 +20,7 @@ use crossbeam_channel::{Receiver, Sender};
 use opdf_core::{DocumentSnapshot, PageInfo, RenderRequest, RenderResponse, Rotation};
 use pdfium_render::prelude::{PdfDocument, PdfPageIndex, PdfPageRenderRotation};
 
+use crate::backlog::{Backlog, MAX_BACKLOG};
 use crate::geometry::compute_tile_geometry;
 use crate::library::{bind_pdfium, lock_pdfium};
 use crate::raster::rasterize_page;
@@ -79,17 +80,62 @@ fn serve_requests(
     rasterizations: &AtomicU64,
 ) {
     let mut snapshot = snapshot;
-    while let Ok(message) = requests.recv() {
-        match message {
-            WorkerMessage::Render(request) => {
-                let response = answer_request(document, &snapshot, request, rasterizations);
-                if responses.send(response).is_err() {
-                    return;
+    let mut backlog = Backlog::with_capacity(MAX_BACKLOG);
+    let mut is_shutting_down = false;
+
+    loop {
+        //--- block only when there is nothing to do, so an idle worker costs no cpu ---
+        if backlog.is_empty() {
+            match requests.recv() {
+                Ok(message) => {
+                    if !accept_message(message, &mut backlog, &mut snapshot, responses) {
+                        is_shutting_down = true;
+                    }
                 }
+                Err(_) => return,
             }
-            WorkerMessage::Rebind(replacement) => snapshot = *replacement,
-            WorkerMessage::Shutdown => return,
         }
+
+        //--- take everything that has already arrived, so a newer request can overtake an older one ---
+        for message in requests.try_iter() {
+            if !accept_message(message, &mut backlog, &mut snapshot, responses) {
+                is_shutting_down = true;
+            }
+        }
+
+        if is_shutting_down {
+            return;
+        }
+
+        if let Some(request) = backlog.take_newest() {
+            let response = answer_request(document, &snapshot, request, rasterizations);
+            if responses.send(response).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Apply one message. Returns `false` when the worker has been told to stop.
+///
+/// A request evicted to keep the backlog bounded is answered immediately, so
+/// that every submitted request still receives exactly one response.
+fn accept_message(message: WorkerMessage, backlog: &mut Backlog, snapshot: &mut DocumentSnapshot, responses: &Sender<RenderResponse>) -> bool {
+    match message {
+        WorkerMessage::Render(request) => {
+            if let Some(superseded) = backlog.push(request) {
+                let _ = responses.send(RenderResponse::Failed {
+                    request: superseded,
+                    reason: format!("superseded: more than {MAX_BACKLOG} render requests were queued ahead of this one"),
+                });
+            }
+            true
+        }
+        WorkerMessage::Rebind(replacement) => {
+            *snapshot = *replacement;
+            true
+        }
+        WorkerMessage::Shutdown => false,
     }
 }
 
