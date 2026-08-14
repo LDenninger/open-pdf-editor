@@ -56,6 +56,22 @@ impl OpdfApp {
         }
     }
 
+    /// The viewer state this frame will draw: zoom, scroll offset, current page,
+    /// rail visibility.
+    pub fn state(&self) -> &ViewerState {
+        &self.state
+    }
+
+    /// The canvas's texture cache, for the status bar and for tests.
+    pub fn canvas_cache(&self) -> &TextureCache {
+        &self.canvas_cache
+    }
+
+    /// The thumbnail rail's texture cache, which has its own budget.
+    pub fn rail_cache(&self) -> &TextureCache {
+        &self.rail_cache
+    }
+
     /// Replace the document with a freshly generated synthetic one.
     fn load_synthetic(&mut self, page_count: usize) {
         let Ok(snapshot) = crate::synthetic::build_synthetic_snapshot(page_count) else {
@@ -148,13 +164,19 @@ impl OpdfApp {
     /// egui reports a pinch or a modifier-held wheel as `zoom_delta`, which is a
     /// multiplier. Anchoring at the pointer rather than the viewport centre is what
     /// makes zooming feel like the document is being pulled toward the cursor.
+    ///
+    /// The anchor is measured from the **canvas viewport's** top edge, not the
+    /// window's: the chrome above the canvas is tens of points tall, and
+    /// [`crate::zoom::anchor_scroll_offset`] multiplies any error in the anchor by
+    /// `new_zoom / old_zoom - 1`, so a window-relative anchor visibly slides the
+    /// page out from under the pointer on every step.
     pub fn apply_wheel_zoom(&mut self, ctx: &egui::Context) {
         let (zoom_delta, pointer) = ctx.input(|input| (input.zoom_delta(), input.pointer.hover_pos()));
         if (zoom_delta - 1.0).abs() < 1e-4 {
             return;
         }
         let anchor_px = match pointer {
-            Some(position) => (position.y - ctx.screen_rect().min.y).max(0.0),
+            Some(position) => (position.y - self.state.viewport_origin_px.1).clamp(0.0, self.state.viewport_size_px.1),
             None => self.state.viewport_size_px.1 * 0.5,
         };
         self.state.fit_mode = FitMode::Free;
@@ -166,8 +188,17 @@ impl OpdfApp {
 // The frame
 //---------------------------------------------------------------------
 
-impl eframe::App for OpdfApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl OpdfApp {
+    /// Run one whole frame: the service step, then every panel, then the actions
+    /// they produced.
+    ///
+    /// This is the body of [`eframe::App::update`], split out so it can be driven
+    /// without a window. `eframe::Frame` has no public constructor, so a test
+    /// cannot call `update` — but it can build an [`egui::Context`], feed it
+    /// synthetic [`egui::RawInput`], and run this. That is what makes scrolling,
+    /// wheel zoom, thumbnail clicks, and keyboard shortcuts testable in headless
+    /// CI rather than only by eye.
+    pub fn draw(&mut self, ctx: &egui::Context) {
         //--- the render loop's service half, once per frame, before anything is drawn ---
         //--- both caches are handed in: one service answers both surfaces, and a
         //--- response has to reach the cache that asked or the rail never fills in ---
@@ -245,6 +276,12 @@ impl eframe::App for OpdfApp {
         if let Some(action) = pending_action {
             self.apply_action(action, ctx);
         }
+    }
+}
+
+impl eframe::App for OpdfApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.draw(ctx);
     }
 }
 
