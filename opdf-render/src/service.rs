@@ -191,4 +191,63 @@ mod tests {
         let result = PdfiumRenderService::open(Path::new("/nonexistent/missing.pdf"), build_snapshot());
         assert!(matches!(result, Err(Error::Render(_))), "opening a missing file must fail loudly");
     }
+
+    #[test]
+    fn an_unknown_page_identity_fails_without_panicking() {
+        let service = build_service();
+        service.submit(RenderRequest::new(PageId::new(u64::MAX), 7, 1.0).unwrap());
+
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1, "an unknown page must still produce a response");
+        match &responses[0] {
+            RenderResponse::Failed { reason, .. } => assert!(reason.contains("unknown page"), "got: {reason}"),
+            RenderResponse::Ready { .. } => panic!("an unknown page must not yield a tile"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_position_beyond_the_file_fails_without_panicking() {
+        //--- a three-page snapshot over a two-page file: the third position has no pdfium page ---
+        let mut snapshot = build_snapshot();
+        snapshot.pages.push(PageInfo {
+            id: PageId::new(3),
+            size: PageSize::A4,
+            rotation: Rotation::None,
+        });
+        let service = PdfiumRenderService::open(&ensure_contract_fixture(), snapshot).unwrap();
+        service.submit(RenderRequest::new(PageId::new(3), 7, 1.0).unwrap());
+
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1);
+        assert!(matches!(responses[0], RenderResponse::Failed { .. }), "a position beyond the file must fail");
+    }
+
+    #[test]
+    fn an_absurd_scale_fails_rather_than_allocating() {
+        let service = build_service();
+        service.submit(RenderRequest::new(PageId::new(1), 7, 1e30).unwrap());
+
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1, "an oversized request must still be answered");
+        match &responses[0] {
+            RenderResponse::Failed { reason, .. } => assert!(reason.contains("exceeds"), "the failure must name the limit, got: {reason}"),
+            RenderResponse::Ready { tile, .. } => panic!("an absurd scale must fail, not yield a {}x{} tile", tile.width(), tile.height()),
+        }
+        assert_eq!(service.rasterizations(), 0, "a rejected request must never reach pdfium");
+    }
+
+    #[test]
+    fn a_foreign_revision_is_rasterized_and_echoed_back_unchanged() {
+        let service = build_service();
+        let request = RenderRequest::new(PageId::new(1), 4_242, 1.0).unwrap();
+        service.submit(request);
+
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1, "a revision the service does not hold must still be answered");
+        assert_eq!(responses[0].request().revision, 4_242, "the requested revision must be echoed back unchanged");
+        match &responses[0] {
+            RenderResponse::Ready { tile, .. } => assert_eq!((tile.width(), tile.height()), (595, 842)),
+            RenderResponse::Failed { reason, .. } => panic!("a foreign revision must not be rejected, got: {reason}"),
+        }
+    }
 }
