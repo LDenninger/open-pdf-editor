@@ -51,3 +51,7 @@ pub use extract::extract_range;
 pub mod split;
 
 pub use split::split_at;
+
+pub mod undo_stack;
+
+pub use undo_stack::UndoStack;
