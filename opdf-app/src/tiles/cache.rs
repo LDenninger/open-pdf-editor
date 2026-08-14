@@ -120,6 +120,18 @@ impl<T> TileCache<T> {
         self.entries.contains_key(request)
     }
 
+    /// Whether this request still needs rasterizing — neither cached nor
+    /// already in flight.
+    ///
+    /// The read-only half of [`TileCache::mark_pending`], for a caller that
+    /// must decide whether it *would* submit before deciding whether it
+    /// *can*. Planning a frame is exactly that: a request that does not fit
+    /// this frame's budget must not be recorded as in flight, or nothing will
+    /// ever clear it and the page stays blank forever.
+    pub fn wants(&self, request: &RenderRequest) -> bool {
+        !self.entries.contains_key(request) && !self.pending.contains(request)
+    }
+
     /// Record that `request` has been submitted, returning whether the caller
     /// should actually submit it.
     ///
