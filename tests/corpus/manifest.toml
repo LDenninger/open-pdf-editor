@@ -90,3 +90,14 @@ fetched_on = "2026-08-14"
 tier = "checked-in"
 tags = ["unusual-font-encoding", "synthetic", "hand-authored"]
 notes = "One page, one Type1 font with a non-standard /Differences encoding array remapping codes 65/66 to /copyright and /registered."
+
+[[entry]]
+file = "yanjingshiji1120ruan.pdf"
+sha256 = "a277c4fc0b0fbd77182ab3938e44ed573a6fa8dc64cd336d0ab5493ff6081319"
+source_url = "https://archive.org/download/yanjingshiji1120ruan/yanjingshiji1120ruan.pdf"
+license = "Public Domain (published 1823, pre-1929)"
+attribution = "Ruan Yuan (1823); digitized by the Internet Archive"
+fetched_on = "2026-08-14"
+tier = "fetched"
+tags = ["cjk", "huge-scan", "real-world", "large"]
+notes = "~274 MB scanned classical Chinese text, 1823 -- too large to check in. Used only by the scheduled 'full corpus' verification job and local OPDF_CORPUS_FULL=1 runs."
