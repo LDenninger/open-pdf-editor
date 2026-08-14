@@ -12,12 +12,13 @@
 //! taken per operation rather than for the worker's lifetime, so that one
 //! worker cannot starve another.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
-use opdf_core::{DocumentSnapshot, PageInfo, RenderRequest, RenderResponse, Rotation};
+use opdf_core::{DocumentSnapshot, PageId, PageInfo, RenderRequest, RenderResponse, Rotation};
 use pdfium_render::prelude::{PdfDocument, PdfPageIndex, PdfPageRenderRotation};
 
 use crate::backlog::{Backlog, MAX_BACKLOG};
@@ -65,17 +66,39 @@ pub(crate) fn run_worker(
         }
     };
 
+    //--- captured before the first edit can move a page: this is the one
+    //--- moment the snapshot's order and the file's order are the same ---
+    let file_indices = map_file_indices(&snapshot);
+
     if ready.send(Ok(())).is_ok() {
-        serve_requests(&document, snapshot, &requests, &responses, &rasterizations);
+        serve_requests(&document, snapshot, &file_indices, &requests, &responses, &rasterizations);
     }
 
     close_document(document);
+}
+
+/// Where each page sits in the file Pdfium has open.
+///
+/// Pdfium addresses pages by their position in the file it loaded, and that
+/// file never changes while the worker runs — a save produces a new service.
+/// The snapshot, by contrast, changes on every edit: `move_page` reorders it,
+/// `remove_page` shortens it, `insert_page` extends it. Resolving a request by
+/// its page's *current* snapshot position therefore addressed a different page
+/// after any edit, and the user saw another page's content under the page they
+/// asked for.
+///
+/// The mapping is taken once, from the snapshot the document was opened with,
+/// and is never rebuilt — a [`WorkerMessage::Rebind`] describes new in-memory
+/// state, not a new file.
+fn map_file_indices(snapshot: &DocumentSnapshot) -> HashMap<PageId, usize> {
+    snapshot.pages.iter().enumerate().map(|(position, page)| (page.id, position)).collect()
 }
 
 /// Answer requests until the channel closes or a shutdown arrives.
 fn serve_requests(
     document: &PdfDocument<'_>,
     snapshot: DocumentSnapshot,
+    file_indices: &HashMap<PageId, usize>,
     requests: &Receiver<WorkerMessage>,
     responses: &Sender<RenderResponse>,
     rasterizations: &AtomicU64,
@@ -113,7 +136,7 @@ fn serve_requests(
             let response = match cache.get(&request) {
                 Some(tile) => RenderResponse::Ready { request, tile },
                 None => {
-                    let response = answer_request(document, &snapshot, request, rasterizations);
+                    let response = answer_request(document, &snapshot, file_indices, request, rasterizations);
                     if let RenderResponse::Ready { tile, .. } = &response {
                         cache.insert(request, tile);
                     }
@@ -164,8 +187,16 @@ fn close_document(document: PdfDocument<'_>) {
 }
 
 /// Resolve, rasterize, and package one request. Never panics.
-fn answer_request(document: &PdfDocument<'_>, snapshot: &DocumentSnapshot, request: RenderRequest, rasterizations: &AtomicU64) -> RenderResponse {
-    let Some((position, page_info)) = find_page(snapshot, &request) else {
+fn answer_request(
+    document: &PdfDocument<'_>,
+    snapshot: &DocumentSnapshot,
+    file_indices: &HashMap<PageId, usize>,
+    request: RenderRequest,
+    rasterizations: &AtomicU64,
+) -> RenderResponse {
+    //--- geometry comes from the *current* snapshot, so an unsaved rotation
+    //--- shows immediately; the index comes from the file, which cannot move ---
+    let Some(page_info) = find_page(snapshot, &request) else {
         return RenderResponse::Failed {
             request,
             reason: format!("unknown page {}", request.page),
@@ -175,6 +206,16 @@ fn answer_request(document: &PdfDocument<'_>, snapshot: &DocumentSnapshot, reque
     let geometry = match compute_tile_geometry(page_info, &request) {
         Ok(geometry) => geometry,
         Err(reason) => return RenderResponse::Failed { request, reason },
+    };
+
+    let Some(&position) = file_indices.get(&request.page) else {
+        return RenderResponse::Failed {
+            request,
+            reason: format!(
+                "page {} is not in the file this service opened — it was created after the document was opened, and an unsaved page has nothing to rasterize",
+                request.page
+            ),
+        };
     };
 
     let index: PdfPageIndex = match position.try_into() {
@@ -220,13 +261,13 @@ fn answer_request(document: &PdfDocument<'_>, snapshot: &DocumentSnapshot, reque
     }
 }
 
-/// The position of a request's page in the snapshot, and its geometry.
-fn find_page(snapshot: &DocumentSnapshot, request: &RenderRequest) -> Option<(usize, PageInfo)> {
-    snapshot
-        .pages
-        .iter()
-        .position(|page| page.id == request.page)
-        .map(|position| (position, snapshot.pages[position]))
+/// The geometry a request's page currently has.
+///
+/// Deliberately does not report a position: a snapshot position is not a file
+/// position once the document has been edited. Use [`map_file_indices`] for
+/// the index Pdfium needs.
+fn find_page(snapshot: &DocumentSnapshot, request: &RenderRequest) -> Option<PageInfo> {
+    snapshot.pages.iter().find(|page| page.id == request.page).copied()
 }
 
 /// Translate the rotation Pdfium reports for a page into a core rotation.
