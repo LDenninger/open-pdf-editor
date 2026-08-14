@@ -1,0 +1,10 @@
+# Corpus fixtures are byte-exact test data: manifest.toml records a sha256 for
+# every one of them, so any end-of-line translation on checkout is a
+# provenance failure, not a formatting detail.
+#
+# This is not hypothetical. custom_encoding.pdf and huge_page_count.pdf are
+# hand-authored by generate_synthetic.py and contain no NUL byte, so git
+# classifies them as text and a Windows checkout (core.autocrlf=true, the
+# GitHub runner default) rewrites their LF to CRLF -- which is exactly how the
+# hash check first failed on the windows-latest leg of the CI matrix.
+files/** binary

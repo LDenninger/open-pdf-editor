@@ -1,0 +1,39 @@
+[package]
+name = "opdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.4", features = ["derive"] }
+opdf-core = { path = "../opdf-core" }
+
+# This crate is intentionally not part of the parent workspace — cargo-fuzz
+# builds it with nightly-only sanitizer flags that must never leak into
+# `cargo build --all` on stable.
+[workspace]
+
+[[bin]]
+name = "tile_new"
+path = "fuzz_targets/tile_new.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render_request_new"
+path = "fuzz_targets/render_request_new.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rotation_from_degrees"
+path = "fuzz_targets/rotation_from_degrees.rs"
+test = false
+doc = false
+bench = false
