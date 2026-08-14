@@ -129,6 +129,30 @@ impl PdfDocument {
         }
         Ok(())
     }
+
+    //---------------------------------------------------------------------
+    // Compaction
+    //---------------------------------------------------------------------
+
+    /// Merge the previous revision and the appended objects into one document.
+    ///
+    /// Objects the page tree no longer reaches are dropped and the survivors are
+    /// renumbered, so the result is a fresh file with no revision history. This
+    /// is lossy by design: anything unreferenced that a reader might still have
+    /// wanted — a superseded annotation, a stale outline — is gone. That is why
+    /// compaction is only ever invoked on an explicit user request.
+    fn build_compacted_document(&self) -> lopdf::Document {
+        let mut compacted = self.incremental().get_prev_documents().clone();
+        for (object_id, object) in &self.incremental().new_document.objects {
+            compacted.objects.insert(*object_id, object.clone());
+        }
+        compacted.max_id = self.incremental().new_document.max_id;
+        //--- a rewritten file has no earlier revision, so the trailer must not claim one ---
+        compacted.trailer.remove(b"Prev");
+        compacted.prune_objects();
+        compacted.renumber_objects();
+        compacted
+    }
 }
 
 impl DocumentIo for PdfDocument {
@@ -174,9 +198,31 @@ impl DocumentIo for PdfDocument {
         outcome.map(|_| ()).map_err(Error::from)
     }
 
-    /// Not implemented until Task 12.
+    /// Write a freshly serialized document, discarding unreferenced objects.
+    ///
+    /// Slower than [`DocumentIo::save_incremental`] and lossy with respect to
+    /// structure nothing in the page tree references, so it is only ever invoked
+    /// on an explicit user request — never as a default or an automatic fallback.
+    ///
+    /// This is the compaction the trash model names: pruning drops every removed
+    /// page's objects from the written file, so the in-memory trash is purged to
+    /// match and [`opdf_core::Document::restore_page`] reports
+    /// [`Error::PageNotFound`] for those pages afterwards. The purge runs only
+    /// once the file is written, so a failed compaction leaves the document
+    /// exactly as it was.
+    ///
+    /// Returns [`Error::Unsupported`] for a document with no pages.
     fn save_compacted(&mut self, path: &Path) -> Result<()> {
-        Err(Error::Unsupported(format!("save_compacted({}) is not implemented yet", path.display())))
+        if self.page_count() == 0 {
+            return Err(Error::Unsupported("cannot save a document with no pages".to_string()));
+        }
+        self.materialize_changes()?;
+        let mut compacted = self.build_compacted_document();
+        //--- `Document::save` reports through `std::io::Error`, not `lopdf::Error` ---
+        compacted.save(path).map_err(Error::from)?;
+        //--- the written file no longer contains the removed pages' objects, so the trash must stop claiming they are restorable ---
+        self.pages.purge_trash();
+        Ok(())
     }
 }
 
@@ -547,5 +593,106 @@ mod tests {
             "a pdf with no pages is not a pdf worth writing"
         );
         assert!(!destination.exists(), "a refused save must not leave a file behind");
+    }
+
+    #[test]
+    fn a_compacted_save_reopens_with_the_edited_structure() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let sizes = [PageSize::new(100.0, 100.0), PageSize::new(200.0, 200.0), PageSize::new(300.0, 300.0)];
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&sizes));
+        let destination = directory.path().join("compacted.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        document.save_compacted(&destination).unwrap();
+
+        let reopened = PdfDocument::open(&destination).unwrap();
+        let widths: Vec<f32> = reopened.page_ids().into_iter().map(|id| reopened.page(id).unwrap().size.width_pt).collect();
+        assert_eq!(widths, vec![100.0, 300.0], "compaction must preserve the surviving pages in order");
+    }
+
+    #[test]
+    fn a_compacted_save_drops_what_nothing_references() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4; 3]));
+        let incremental_path = directory.path().join("incremental.pdf");
+        let compacted_path = directory.path().join("compacted.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        document.save_incremental(&incremental_path).unwrap();
+        document.save_compacted(&compacted_path).unwrap();
+
+        let incremental_size = std::fs::metadata(&incremental_path).unwrap().len();
+        let compacted_size = std::fs::metadata(&compacted_path).unwrap().len();
+        assert!(
+            compacted_size < incremental_size,
+            "compaction discards the removed page and the superseded revision: {compacted_size} must be under {incremental_size}"
+        );
+
+        let reopened = lopdf::Document::load(&compacted_path).unwrap();
+        assert!(reopened.trailer.get(b"Prev").is_err(), "a rewritten file has no previous revision to point at");
+    }
+
+    #[test]
+    fn a_compacted_save_of_an_unedited_document_keeps_every_page() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "nested.pdf", &fixture::build_nested_page_tree());
+        let destination = directory.path().join("compacted.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        document.save_compacted(&destination).unwrap();
+
+        let reopened = PdfDocument::open(&destination).unwrap();
+        assert_eq!(reopened.page_count(), 3);
+    }
+
+    #[test]
+    fn a_compacting_save_purges_the_trash() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4; 3]));
+        let destination = directory.path().join("compacted.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        document.save_compacted(&destination).unwrap();
+
+        let rejected = document.restore_page(ids[1], 0);
+        assert!(
+            matches!(rejected, Err(opdf_core::Error::PageNotFound(_))),
+            "compaction discarded the page's objects, so the trash must not claim it is still restorable, got: {rejected:?}"
+        );
+        assert_eq!(document.page_count(), 2, "a purge must not disturb the live pages");
+    }
+
+    #[test]
+    fn a_failed_compaction_leaves_the_trash_intact() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4; 3]));
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+
+        //--- a directory that does not exist cannot be written into ---
+        assert!(document.save_compacted(&directory.path().join("no/such/dir/out.pdf")).is_err());
+        document
+            .restore_page(ids[1], 0)
+            .expect("a compaction that never wrote a file must not have destroyed the trash");
+    }
+
+    #[test]
+    fn refuses_to_compact_a_document_with_no_pages() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&[PageSize::A4]));
+        let destination = directory.path().join("compacted.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let ids = document.page_ids();
+        document.remove_page(ids[0]).unwrap();
+        assert!(matches!(document.save_compacted(&destination), Err(opdf_core::Error::Unsupported(_))));
     }
 }

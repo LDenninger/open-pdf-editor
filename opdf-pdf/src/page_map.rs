@@ -200,6 +200,18 @@ impl PageMap {
         self.slots.insert(to_index, slot);
         Ok(())
     }
+
+    /// Discard every removed page, making its identity unrestorable.
+    ///
+    /// Called only by a compacting save, which is the one path that actually
+    /// drops the pages' objects from the file. After this, [`PageMap::restore_slot`]
+    /// reports [`Error::PageNotFound`] for a purged identity — the same answer it
+    /// gives for one the map never held, which is what the contract requires.
+    /// Nothing else may call this: the contract forbids an implementation from
+    /// emptying the trash on its own schedule.
+    pub(crate) fn purge_trash(&mut self) {
+        self.removed.clear();
+    }
 }
 
 #[cfg(test)]
