@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["opdf-core", "opdf-pdf", "opdf-render", "opdf-ops", "opdf-cli", "opdf-app"]
+members = ["opdf-core", "opdf-pdf", "opdf-render", "opdf-ops", "opdf-cli", "opdf-app", "tests/roundtrip", "benches/opdf-bench"]
 
 [workspace.package]
 version = "0.0.0"
@@ -12,3 +12,4 @@ repository = "https://github.com/LDenninger/open-pdf-editor"
 [workspace.dependencies]
 thiserror = "2"
 crossbeam-channel = "0.5"
+lopdf = { version = "0.44", default-features = false }

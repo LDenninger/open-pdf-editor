@@ -1,0 +1,27 @@
+[package]
+name = "opdf-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Performance benchmarks for open-pdf-editor, tracking the operations the project promises stay fast on large documents"
+publish = false
+
+[dependencies]
+opdf-core = { path = "../../opdf-core" }
+
+[dev-dependencies]
+criterion = "0.8"
+
+# A declared bench target whose file does not exist yet is a manifest parse
+# error, not a missing-target warning, so each [[bench]] entry lands in the
+# same commit as the file it names.
+
+[[bench]]
+name = "tile_alloc"
+harness = false
+
+[[bench]]
+name = "vec_document_mutations"
+harness = false

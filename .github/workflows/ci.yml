@@ -11,7 +11,19 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is deliberately absent: scripts/fetch-pdfium.sh supports
+        # Linux and macOS only, so a Windows leg would fail at the fetch step
+        # on every run and `continue-on-error` would hide it. Add it back
+        # together with a Windows branch in the fetch script.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Linux is the hard gate; macOS is best-effort per the README ("ship when
+    # actually tested") and must not block a merge on its own while it is not
+    # yet part of the release process.
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     env:
       OPDF_PDFIUM_LIB_DIR: ${{ github.workspace }}/vendor/pdfium/lib
     steps:
@@ -20,6 +32,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
       - name: Fetch Pdfium
         run: ./scripts/fetch-pdfium.sh
       - name: Format
