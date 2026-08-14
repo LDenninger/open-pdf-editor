@@ -15,5 +15,6 @@ mod fixture;
 mod geometry;
 mod objects;
 mod page_map;
+mod save;
 
 pub use document::PdfDocument;
