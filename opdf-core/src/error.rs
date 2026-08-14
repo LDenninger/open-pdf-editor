@@ -34,6 +34,19 @@ pub enum Error {
         page_count: usize,
     },
 
+    /// A half-open page range was given with its end before its start.
+    ///
+    /// Distinct from [`Error::IndexOutOfBounds`], which reports a single
+    /// index outside the document: both ends of an inverted range can be
+    /// perfectly valid indices on their own.
+    #[error("invalid range {start}..{end}: the end precedes the start")]
+    InvalidRange {
+        /// The inclusive start of the offending range.
+        start: usize,
+        /// The exclusive end of the offending range.
+        end: usize,
+    },
+
     /// Rasterization failed.
     #[error("render failed: {0}")]
     Render(String),
@@ -47,6 +60,12 @@ mod tests {
     fn formats_index_out_of_bounds_with_both_numbers() {
         let error = Error::IndexOutOfBounds { index: 7, page_count: 3 };
         assert_eq!(error.to_string(), "index 7 out of bounds for 3 pages");
+    }
+
+    #[test]
+    fn formats_an_inverted_range_without_implying_either_end_is_out_of_bounds() {
+        let error = Error::InvalidRange { start: 5, end: 2 };
+        assert_eq!(error.to_string(), "invalid range 5..2: the end precedes the start");
     }
 
     #[test]
