@@ -33,3 +33,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod geometry;
+
+pub use geometry::{TileGeometry, compute_tile_geometry};
