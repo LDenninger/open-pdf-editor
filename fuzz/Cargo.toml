@@ -23,3 +23,17 @@ path = "fuzz_targets/tile_new.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "render_request_new"
+path = "fuzz_targets/render_request_new.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rotation_from_degrees"
+path = "fuzz_targets/rotation_from_degrees.rs"
+test = false
+doc = false
+bench = false
