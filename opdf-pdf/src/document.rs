@@ -582,4 +582,11 @@ mod tests {
         document.restore_page(ids[0], 0).unwrap();
         assert_ne!(before, document.revision(), "restore_page must advance the revision on success");
     }
+
+    #[test]
+    fn satisfies_the_document_contract() {
+        opdf_core::contract::assert_document_contract(|count| {
+            PdfDocument::load_from_bytes(&fixture::build_flat_pages(&vec![PageSize::A4; count])).expect("a generated fixture must open")
+        });
+    }
 }
