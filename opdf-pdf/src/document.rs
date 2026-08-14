@@ -1,10 +1,5 @@
 //! `PdfDocument`: a real PDF file behind the `Document` contract.
 
-// The dirty state and the `lopdf` accessors gain their first non-test callers
-// when the mutations and the save path land later in the track. Until then
-// `-D warnings` would reject them as dead code.
-#![allow(dead_code)]
-
 use lopdf::{IncrementalDocument, Object, ObjectId};
 use opdf_core::{Document, Error, PageId, PageInfo, Result};
 
