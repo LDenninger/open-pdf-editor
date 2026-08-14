@@ -1,0 +1,12 @@
+[package]
+name = "opdf-roundtrip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Structural-diff and round-trip verification harness for open-pdf-editor, plus the corpus provenance loader"
+
+[dependencies]
+opdf-core = { path = "../../opdf-core" }
+thiserror.workspace = true
