@@ -1,9 +1,5 @@
 //! Reading page geometry out of a PDF object graph.
 
-// The first non-test caller is `PdfDocument`, which lands later in the track.
-// Until then `-D warnings` would reject this module as dead code.
-#![allow(dead_code)]
-
 use lopdf::ObjectId;
 use opdf_core::{PageSize, Rotation};
 

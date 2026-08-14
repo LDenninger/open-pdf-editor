@@ -1,9 +1,5 @@
 //! Translation of `lopdf` errors into the workspace error type.
 
-// The first non-test caller is `PdfDocument`, which lands later in the track.
-// Until then `-D warnings` would reject this module as dead code.
-#![allow(dead_code)]
-
 use opdf_core::Error;
 
 /// Convert a `lopdf` error into the workspace error type.

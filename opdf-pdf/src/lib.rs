@@ -8,9 +8,12 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod document;
 mod error;
 #[cfg(test)]
 mod fixture;
 mod geometry;
 mod objects;
 mod page_map;
+
+pub use document::PdfDocument;
