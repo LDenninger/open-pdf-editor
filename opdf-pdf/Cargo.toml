@@ -9,6 +9,8 @@ description = "PDF parsing, object model, and incremental save"
 
 [dependencies]
 opdf-core = { path = "../opdf-core" }
+lopdf = { version = "0.44", default-features = false }
 
 [dev-dependencies]
 opdf-core = { path = "../opdf-core", features = ["contract-tests"] }
+tempfile = "3"
