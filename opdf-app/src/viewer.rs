@@ -269,10 +269,13 @@ pub fn step_render_service(
         state.visible_pages(),
         state.current_page().unwrap_or(0),
         state.render_settings(pixels_per_point, max_texture_side),
-        &mut |request| canvas.mark_pending(*request),
+        &|request| canvas.wants(request),
         MAX_SUBMISSIONS_PER_FRAME,
     );
+    //--- record as in flight only what is actually submitted: a request marked
+    //--- while planning but skipped for budget could never be cleared ---
     for request in &plan.requests {
+        canvas.mark_pending(*request);
         service.submit(*request);
     }
 
@@ -425,15 +428,12 @@ mod tests {
             state.visible_pages(),
             0,
             state.render_settings(1.0, TEST_MAX_TEXTURE_SIDE),
-            &mut |request: &opdf_core::render::RenderRequest| {
-                let fresh = cache.mark_pending(*request);
-                if fresh {
-                    wanted += 1;
-                }
-                fresh
-            },
+            &|request: &opdf_core::render::RenderRequest| cache.wants(request),
             MAX_SUBMISSIONS_PER_FRAME,
-        );
+        )
+        .requests
+        .iter()
+        .for_each(|_| wanted += 1);
         assert_eq!(
             wanted, 0,
             "a request already pending must not be planned again, or a scrolling viewer floods the service"
@@ -456,6 +456,56 @@ mod tests {
             "a zoomed-out view of a long document must not queue hundreds of tiles in one frame"
         );
         assert!(outcome.skipped > 0, "what did not fit must be reported, so the caller repaints and asks again");
+    }
+
+    /// The budget must defer a request, not lose it.
+    ///
+    /// Marking pending while planning meant everything past the budget was
+    /// recorded as in flight and never submitted. Nothing could clear it:
+    /// only a response clears a pending slot, and no response was coming.
+    /// The visible symptoms were a page that stayed a grey placeholder for
+    /// the life of the session and a repaint loop that never settled, both
+    /// reachable from six clicks of the toolbar's zoom-out button.
+    ///
+    /// Left settling on its own with no further input, the frame loop must
+    /// reach a quiet state: nothing in flight, and every visible page drawn.
+    #[test]
+    fn a_view_that_exceeds_the_frame_budget_still_settles_with_nothing_in_flight() {
+        let ctx = egui::Context::default();
+        let (mut state, _theme) = build_viewer(400);
+        state.zoom = 0.1;
+        state.viewport_size_px = (1000.0, 8000.0);
+        let service = FakeRenderService::new(state.snapshot().clone());
+        let mut cache = TextureCache::new(1 << 26);
+
+        let first = step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
+        assert!(first.skipped > 0, "this view must actually exceed the frame budget, or the test proves nothing");
+
+        //--- no input, only frames: everything deferred must come back round ---
+        for _ in 0..200 {
+            step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
+        }
+
+        assert_eq!(
+            cache.pending_count(),
+            0,
+            "a request deferred by the frame budget must be submitted on a later frame, not stranded in flight forever"
+        );
+
+        let snapshot = state.snapshot();
+        let settings = state.render_settings(1.0, TEST_MAX_TEXTURE_SIDE);
+        let undrawn: Vec<usize> = state
+            .visible_pages()
+            .filter(|index| {
+                snapshot.pages.get(*index).is_none_or(|page| {
+                    let Ok(request) = RenderRequest::new(page.id, snapshot.revision, settings.scale_for_page(page.display_size())) else {
+                        return false;
+                    };
+                    !cache.contains(&request.with_rotation(settings.view_rotation))
+                })
+            })
+            .collect();
+        assert!(undrawn.is_empty(), "pages {undrawn:?} never got a tile and would stay grey placeholders for the session");
     }
 
     #[test]
