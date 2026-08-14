@@ -11,3 +11,7 @@
 pub mod remove_page;
 
 pub use remove_page::{RemovePage, RestorePage};
+
+pub mod move_page;
+
+pub use move_page::MovePage;
