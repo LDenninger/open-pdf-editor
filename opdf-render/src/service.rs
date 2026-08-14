@@ -145,6 +145,54 @@ mod tests {
         PdfiumRenderService::open(&ensure_contract_fixture(), build_snapshot()).unwrap()
     }
 
+    /// A two-page A4 fixture whose pages are told apart by colour: page one
+    /// red, page two green.
+    ///
+    /// The shared contract fixture cannot serve here — both of its pages are
+    /// filled the same blue, so rasterizing the wrong one is invisible. That
+    /// is precisely the bug this fixture exists to expose.
+    fn write_two_colour_fixture() -> PathBuf {
+        let contents = ["1 0 0 rg 0 0 595 842 re f", "0 1 0 rg 0 0 595 842 re f"];
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> /Contents 5 0 R >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> /Contents 6 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{}\nendstream", contents[0].len(), contents[0]),
+            format!("<< /Length {} >>\nstream\n{}\nendstream", contents[1].len(), contents[1]),
+        ];
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.7\n");
+        let mut offsets: Vec<usize> = Vec::with_capacity(objects.len());
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n", objects.len() + 1).as_bytes());
+
+        let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-fixtures");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let pdf_path = target_dir.join("two-colour-a4.pdf");
+        //--- staged and renamed, for the reason given in fixture.rs ---
+        let staging_path = target_dir.join(format!("two-colour-a4.pdf.{}.part", std::process::id()));
+        std::fs::write(&staging_path, &bytes).unwrap();
+        std::fs::rename(&staging_path, &pdf_path).unwrap();
+        pdf_path
+    }
+
+    /// The red channel at the centre of a tile, as a coarse page identity.
+    fn centre_is_red(tile: &opdf_core::Tile) -> bool {
+        let centre = tile.pixel(tile.width() / 2, tile.height() / 2).unwrap();
+        centre[0] > 200 && centre[1] < 60
+    }
+
     fn drain(service: &PdfiumRenderService, expected: usize) -> Vec<RenderResponse> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut collected = Vec::new();
@@ -153,6 +201,90 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         collected
+    }
+
+    /// Pdfium addresses pages by their position in the file it opened; the
+    /// snapshot's order changes on every edit. Resolving a request through the
+    /// current snapshot's position meant that after a reorder, every page
+    /// rasterized some *other* page's content — silently, with the right
+    /// dimensions and the right revision.
+    #[test]
+    fn a_reordered_snapshot_still_rasterizes_each_page_from_its_own_place_in_the_file() {
+        let pdf_path = write_two_colour_fixture();
+        let red = PageInfo {
+            id: PageId::new(1),
+            size: PageSize::A4,
+            rotation: Rotation::None,
+        };
+        let green = PageInfo {
+            id: PageId::new(2),
+            size: PageSize::A4,
+            rotation: Rotation::None,
+        };
+
+        let service = PdfiumRenderService::open(
+            &pdf_path,
+            DocumentSnapshot {
+                revision: 1,
+                pages: vec![red, green],
+            },
+        )
+        .unwrap();
+
+        //--- baseline: before any edit, page one is the red page ---
+        service.submit(RenderRequest::new(PageId::new(1), 1, 1.0).unwrap());
+        match &drain(&service, 1)[0] {
+            RenderResponse::Ready { tile, .. } => assert!(centre_is_red(tile), "page one must be the red page before any edit"),
+            RenderResponse::Failed { reason, .. } => panic!("the baseline render must succeed, got: {reason}"),
+        }
+
+        //--- the user moves page two above page one; nothing is saved ---
+        service.rebind(DocumentSnapshot {
+            revision: 2,
+            pages: vec![green, red],
+        });
+
+        service.submit(RenderRequest::new(PageId::new(1), 2, 1.0).unwrap());
+        match &drain(&service, 1)[0] {
+            RenderResponse::Ready { tile, .. } => assert!(
+                centre_is_red(tile),
+                "page one is still the red page after the reorder; rasterizing green means the request was resolved through the snapshot's new position instead of the file's"
+            ),
+            RenderResponse::Failed { reason, .. } => panic!("rendering a moved page must succeed, got: {reason}"),
+        }
+    }
+
+    /// A page inserted after the document was opened has nothing to rasterize.
+    /// It must say so rather than address whatever page happens to sit at that
+    /// position in the file.
+    #[test]
+    fn a_page_created_after_opening_fails_loudly_rather_than_rendering_another_page() {
+        let service = build_service();
+
+        service.rebind(DocumentSnapshot {
+            revision: 8,
+            pages: vec![
+                PageInfo {
+                    id: PageId::new(1),
+                    size: PageSize::A4,
+                    rotation: Rotation::None,
+                },
+                PageInfo {
+                    id: PageId::new(99),
+                    size: PageSize::A4,
+                    rotation: Rotation::None,
+                },
+            ],
+        });
+
+        service.submit(RenderRequest::new(PageId::new(99), 8, 1.0).unwrap());
+        match &drain(&service, 1)[0] {
+            RenderResponse::Failed { reason, .. } => assert!(
+                reason.contains("not in the file this service opened"),
+                "the reason must name the cause, got: {reason}"
+            ),
+            RenderResponse::Ready { .. } => panic!("a page that is not in the opened file must not rasterize as some other page"),
+        }
     }
 
     #[test]
