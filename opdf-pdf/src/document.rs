@@ -174,7 +174,10 @@ impl Document for PdfDocument {
     //---------------------------------------------------------------------
 
     fn remove_page(&mut self, id: PageId) -> Result<()> {
-        Err(Error::Unsupported(format!("remove_page({id}) is not implemented yet")))
+        self.pages.remove_slot(id)?;
+        self.dirty.structure = true;
+        self.advance_revision();
+        Ok(())
     }
 
     fn restore_page(&mut self, id: PageId, at_index: usize) -> Result<()> {
@@ -182,11 +185,20 @@ impl Document for PdfDocument {
     }
 
     fn move_page(&mut self, id: PageId, to_index: usize) -> Result<()> {
-        Err(Error::Unsupported(format!("move_page({id}, {to_index}) is not implemented yet")))
+        self.pages.relocate_slot(id, to_index)?;
+        self.dirty.structure = true;
+        self.advance_revision();
+        Ok(())
     }
 
     fn set_rotation(&mut self, id: PageId, rotation: opdf_core::Rotation) -> Result<()> {
-        Err(Error::Unsupported(format!("set_rotation({id}, {rotation:?}) is not implemented yet")))
+        let slot = self.pages.find_slot_mut(id)?;
+        slot.rotation = rotation;
+        //--- record it even when the value is unchanged: the file may inherit a different one from an ancestor ---
+        slot.rotation_changed = true;
+        self.dirty.rotations = true;
+        self.advance_revision();
+        Ok(())
     }
 
     fn insert_page(&mut self, at_index: usize, size: opdf_core::PageSize) -> Result<PageId> {
@@ -262,5 +274,94 @@ mod tests {
         let _ = document.page(ids[0]);
         let _ = document.index_of(ids[0]);
         assert_eq!(before, document.revision(), "inspecting a document must not advance its revision");
+    }
+
+    fn build_document(count: usize) -> PdfDocument {
+        PdfDocument::load_from_bytes(&fixture::build_flat_pages(&vec![PageSize::A4; count])).expect("fixture must open")
+    }
+
+    #[test]
+    fn removes_a_page_without_disturbing_its_neighbours() {
+        let mut document = build_document(3);
+        let ids = document.page_ids();
+        document.remove_page(ids[0]).unwrap();
+
+        assert_eq!(document.page_count(), 2);
+        assert!(matches!(document.page(ids[0]), Err(opdf_core::Error::PageNotFound(_))));
+        assert_eq!(document.index_of(ids[1]).unwrap(), 0);
+        assert_eq!(document.index_of(ids[2]).unwrap(), 1);
+    }
+
+    #[test]
+    fn moves_a_page_without_changing_any_identity() {
+        let mut document = build_document(3);
+        let ids = document.page_ids();
+        document.move_page(ids[0], 2).unwrap();
+        assert_eq!(document.page_ids(), vec![ids[1], ids[2], ids[0]]);
+        assert_eq!(document.page_count(), 3);
+    }
+
+    #[test]
+    fn rejects_a_move_beyond_the_document_and_keeps_the_order() {
+        let mut document = build_document(2);
+        let ids = document.page_ids();
+        assert!(matches!(document.move_page(ids[0], 99), Err(opdf_core::Error::IndexOutOfBounds { .. })));
+        assert_eq!(document.page_ids(), ids);
+    }
+
+    #[test]
+    fn round_trips_a_rotation_including_clearing_it() {
+        let mut document = build_document(1);
+        let id = document.page_ids()[0];
+        document.set_rotation(id, Rotation::Quarter).unwrap();
+        assert_eq!(document.page(id).unwrap().rotation, Rotation::Quarter);
+        document.set_rotation(id, Rotation::None).unwrap();
+        assert_eq!(document.page(id).unwrap().rotation, Rotation::None);
+    }
+
+    #[test]
+    fn advances_the_revision_on_each_successful_mutation() {
+        let mut document = build_document(3);
+        let ids = document.page_ids();
+
+        let before = document.revision();
+        document.remove_page(ids[0]).unwrap();
+        assert_ne!(before, document.revision(), "remove_page must advance the revision");
+
+        let before = document.revision();
+        document.move_page(ids[1], 1).unwrap();
+        assert_ne!(before, document.revision(), "move_page must advance the revision");
+
+        let before = document.revision();
+        document.set_rotation(ids[1], Rotation::Half).unwrap();
+        assert_ne!(before, document.revision(), "set_rotation must advance the revision");
+    }
+
+    #[test]
+    fn leaves_the_revision_untouched_when_a_mutation_is_rejected() {
+        let mut document = build_document(3);
+        let ids = document.page_ids();
+        let unknown = opdf_core::PageId::new(u64::MAX);
+        let before = document.revision();
+
+        assert!(document.remove_page(unknown).is_err());
+        assert!(document.move_page(unknown, 0).is_err());
+        assert!(document.set_rotation(unknown, Rotation::Quarter).is_err());
+        assert!(document.move_page(ids[0], 99).is_err());
+        assert_eq!(
+            before,
+            document.revision(),
+            "a rejected mutation must leave the revision untouched, even where the page was lifted out and put back"
+        );
+    }
+
+    #[test]
+    fn prefers_page_not_found_over_index_out_of_bounds() {
+        let mut document = build_document(2);
+        let unknown = opdf_core::PageId::new(u64::MAX);
+        assert!(
+            matches!(document.move_page(unknown, 99), Err(opdf_core::Error::PageNotFound(_))),
+            "identity is checked before position"
+        );
     }
 }
