@@ -121,6 +121,37 @@ pub fn quantize_render_scale(effective_scale: f32) -> f32 {
         .unwrap_or(RENDER_SCALE_STEPS[RENDER_SCALE_STEPS.len() - 1])
 }
 
+/// The largest render scale at or below `scale` that keeps a page of `width_pt`
+/// by `height_pt` inside `max_texture_side` pixels on both axes.
+///
+/// [`MAX_ZOOM`] and [`RENDER_SCALE_STEPS`] bound the *scale*. Neither can bound
+/// the *tile*, because a tile's size is the scale multiplied by the page, and a
+/// PDF page has no maximum size: a 1200-point page at scale 2 is 2400 pixels
+/// tall, which is past what `egui::Context::default()` accepts and past what a
+/// modest GPU will upload. Asking for it spends the rasterizer's time on an image
+/// that cannot reach the screen.
+///
+/// The longest side is what is checked, so the answer holds whichever way a view
+/// rotation turns the page. A ladder step is preferred, to keep the cache's key
+/// space small; when even the smallest step is too large the scale is floored
+/// onto a fixed grid instead, which is stable frame to frame for that page.
+pub fn fit_render_scale_to_texture_limit(scale: f32, width_pt: f32, height_pt: f32, max_texture_side: usize) -> f32 {
+    let longest_pt = width_pt.max(height_pt);
+    let wanted = quantize_render_scale(scale);
+    if !longest_pt.is_finite() || longest_pt <= 0.0 || max_texture_side == 0 {
+        return wanted;
+    }
+    let limit = max_texture_side as f32 / longest_pt;
+    if wanted <= limit {
+        return wanted;
+    }
+    match RENDER_SCALE_STEPS.iter().copied().rev().find(|step| *step <= limit) {
+        Some(step) => step,
+        //--- floored, never rounded: rounding could land back above the limit ---
+        None => (limit * 256.0).floor().max(1.0) / 256.0,
+    }
+}
+
 /// Round a scale to a fixed grid, so that scales computed per page — thumbnails,
 /// which fit a target width rather than following the ladder — remain stable
 /// cache keys across frames.
@@ -248,6 +279,51 @@ mod tests {
         for step in [f32::NAN, -3.0, 0.0] {
             let quantised = quantize_scale(step, 256.0);
             assert!(quantised.is_finite() && quantised > 0.0, "quantising {step} produced {quantised}");
+        }
+    }
+
+    #[test]
+    fn leaves_a_scale_alone_when_the_tile_fits() {
+        //--- A4 at scale 2 is 1190x1684, inside a 2048 limit ---
+        assert_eq!(fit_render_scale_to_texture_limit(2.0, 595.0, 842.0, 2048), 2.0);
+    }
+
+    #[test]
+    fn caps_a_tall_page_before_it_exceeds_the_texture_limit() {
+        //--- the synthetic set's 1200-point page at scale 2 would be 2400px tall ---
+        let scale = fit_render_scale_to_texture_limit(2.0, 420.0, 1200.0, 2048);
+        assert!(
+            1200.0 * scale <= 2048.0,
+            "a {scale} scale renders the page 1200pt page at {}px, past the 2048 limit",
+            1200.0 * scale
+        );
+        assert!(scale > 0.0, "the page must still be rendered, just smaller");
+    }
+
+    #[test]
+    fn caps_against_the_longest_side_whichever_way_the_view_is_rotated() {
+        //--- a wide page must be capped on its width, not its height ---
+        let scale = fit_render_scale_to_texture_limit(4.0, 3000.0, 200.0, 2048);
+        assert!(3000.0 * scale <= 2048.0, "the wide axis must bind, got scale {scale}");
+    }
+
+    #[test]
+    fn stays_on_the_ladder_whenever_a_ladder_step_fits() {
+        let scale = fit_render_scale_to_texture_limit(4.0, 420.0, 1200.0, 2048);
+        assert!(
+            RENDER_SCALE_STEPS.contains(&scale),
+            "a capped scale should still be a ladder step where one fits, got {scale}"
+        );
+    }
+
+    #[test]
+    fn always_caps_to_a_scale_a_render_request_accepts() {
+        for (width, height, limit) in [(1.0_f32, 1.0_f32, 2048), (600.0, 900.0, 0), (1e9, 1e9, 2048), (0.0, 0.0, 2048)] {
+            let scale = fit_render_scale_to_texture_limit(4.0, width, height, limit);
+            assert!(
+                scale.is_finite() && scale > 0.0,
+                "capping {width}x{height} against {limit} produced {scale}, which RenderRequest::new would reject"
+            );
         }
     }
 
