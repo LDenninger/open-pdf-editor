@@ -40,6 +40,17 @@ concurrently. See [`docs/architecture/ownership.md`](docs/architecture/ownership
 for the track map and the protocol for changing a contract once tracks are
 underway.
 
+**Track B (rendering) is complete.** `opdf-render` implements `RenderService`
+over PDFium and passes `assert_render_service_contract` unmodified: one worker
+thread per service owns the document, a bounded newest-first backlog absorbs
+fast scrolling, and a byte-budgeted LRU tile cache keyed on the request drops
+tiles from superseded revisions on rebind. Every call into PDFium is
+serialized process-wide, because PDFium is not thread-safe and
+`pdfium-render`'s `thread_safe` feature does not sequence calls. The library
+itself is fetched by `scripts/fetch-pdfium.sh` rather than vendored. Text
+extraction, text selection geometry, search, and printing are deliberately not
+implemented — the crate turns a `RenderRequest` into pixels and nothing else.
+
 ## Background
 
 Free PDF tools force a choice between viewing and editing.
@@ -178,7 +189,7 @@ The fakes are what make parallelism possible: the UI is built against
 | Track | Owns | Delivers |
 | --- | --- | --- |
 | A — Document | `opdf-pdf` | Open, enumerate, save unchanged |
-| B — Rendering | `opdf-render` | PDFium worker and tile cache |
+| B — Rendering | `opdf-render` | PDFium worker and tile cache — **complete** |
 | C — Ops & CLI | `opdf-ops`, `opdf-cli` | Invertible page operations |
 | D — Shell | `opdf-app` | Application chrome and canvas |
 | E — Verification | `tests`, `fuzz`, `benches` | Corpus, round-trip harness, fuzzing |

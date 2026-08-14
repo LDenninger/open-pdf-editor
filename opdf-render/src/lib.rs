@@ -29,6 +29,43 @@
 //! does not. The rotation actually handed to PDFium is the difference between
 //! the rotation the snapshot asks for and the rotation stored in the file, so a
 //! page rotated by an unsaved command still rasterizes the way the UI expects.
+//!
+//! # Threading
+//!
+//! Pdfium is not thread-safe, and neither is a document handle. One worker
+//! thread owns the document, the tile cache, and the backlog;
+//! [`service::PdfiumRenderService`] owns only channel endpoints. `submit`
+//! pushes onto an unbounded sender and returns; `poll` drains a receiver with
+//! `try_iter` and returns whatever has arrived. Neither blocks.
+//!
+//! A thread per service is not sufficient on its own, because several services
+//! exist at once — the contract suite alone builds ten. `pdfium-render`'s
+//! `thread_safe` feature does not serialize anything in 0.9.3; it only makes
+//! the wrapper types `Send` and `Sync`. Every call into Pdfium, including the
+//! drops that close a document or a page, is therefore made while holding
+//! [`library::lock_pdfium`]. Without it, two threads loading a document at once
+//! corrupt Pdfium's global state permanently.
+//!
+//! # Backpressure
+//!
+//! The worker serves the newest queued request first, because a scrolling user
+//! cares about the tile under the viewport now. Above [`backlog::MAX_BACKLOG`]
+//! queued requests the oldest is superseded — and answered
+//! [`opdf_core::RenderResponse::Failed`], because the contract promises exactly
+//! one response per submitted request and a silently dropped request is a tile
+//! that never arrives.
+//!
+//! # Caching
+//!
+//! [`cache::TileCache`] keys on [`opdf_core::RenderRequest`] directly, so
+//! `revision` and the bitwise `scale` are part of the key and a tile from
+//! before an edit is unreachable after one. Eviction is least-recently-used
+//! and bounded by bytes, defaulting to [`cache::DEFAULT_CACHE_BYTES`].
+//!
+//! # Not implemented here
+//!
+//! Text extraction, text selection geometry, search, and printing are out of
+//! scope for this crate. It turns a [`opdf_core::RenderRequest`] into pixels.
 
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
