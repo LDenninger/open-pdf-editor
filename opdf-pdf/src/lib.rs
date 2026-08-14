@@ -11,3 +11,4 @@
 mod error;
 #[cfg(test)]
 mod fixture;
+mod page_map;
