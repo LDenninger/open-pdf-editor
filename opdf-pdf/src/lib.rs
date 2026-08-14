@@ -11,5 +11,6 @@
 mod error;
 #[cfg(test)]
 mod fixture;
+mod geometry;
 mod objects;
 mod page_map;
