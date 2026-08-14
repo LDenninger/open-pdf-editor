@@ -39,3 +39,7 @@ pub use delete_selection::delete_selection;
 pub mod rotate_selection;
 
 pub use rotate_selection::rotate_selection;
+
+pub mod merge;
+
+pub use merge::Merge;
