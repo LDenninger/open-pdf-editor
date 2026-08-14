@@ -19,6 +19,15 @@ pub fn extract_range<D: Document + 'static>(source: &D, target: &mut D, start_in
             page_count: page_ids.len(),
         });
     }
+    //--- Both ends are individually in range here, so an inverted range is
+    //--- still possible and would panic on the slice below rather than
+    //--- returning the Result this API promises.
+    if start_index > end_index {
+        return Err(Error::InvalidRange {
+            start: start_index,
+            end: end_index,
+        });
+    }
     let ids = &page_ids[start_index..end_index];
     let at_index = target.page_count();
     let new_ids = target.import_pages(source, ids, at_index)?;
@@ -65,6 +74,46 @@ mod tests {
 
         inverse.apply(&mut target).unwrap();
         assert_eq!(DocumentSnapshot::of(&target).unwrap().pages, before.pages);
+    }
+
+    /// A user-typed range such as `5-2` reaches this function with both ends
+    /// individually valid. Before the guard, the slice at the end of the
+    /// bounds check panicked and took the process down.
+    #[test]
+    fn an_inverted_range_is_rejected_rather_than_panicking() {
+        let source = VecDocument::with_pages(4, PageSize::A4);
+        let mut target = VecDocument::new();
+        let before = DocumentSnapshot::of(&target).unwrap();
+
+        let result = extract_range(&source, &mut target, 3, 1);
+
+        assert!(matches!(result, Err(Error::InvalidRange { start: 3, end: 1 })), "an inverted range must be a recoverable error");
+        assert_eq!(DocumentSnapshot::of(&target).unwrap().pages, before.pages);
+    }
+
+    /// The degenerate-but-legal case, pinned so the guard cannot be
+    /// tightened into `>=` and start rejecting an empty extraction.
+    #[test]
+    fn an_empty_range_extracts_nothing_and_succeeds() {
+        let source = VecDocument::with_pages(4, PageSize::A4);
+        let mut target = VecDocument::new();
+
+        extract_range(&source, &mut target, 2, 2).unwrap();
+
+        assert_eq!(target.page_count(), 0);
+    }
+
+    /// A start beyond the document is caught by the inverted-range guard
+    /// rather than by the bounds check, because `end_index` is clamped
+    /// first — verify it is caught at all, which is what matters.
+    #[test]
+    fn a_start_beyond_the_document_is_rejected_rather_than_panicking() {
+        let source = VecDocument::with_pages(2, PageSize::A4);
+        let mut target = VecDocument::new();
+
+        let result = extract_range(&source, &mut target, 9, 2);
+
+        assert!(result.is_err());
     }
 
     #[test]
