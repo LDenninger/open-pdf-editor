@@ -5,3 +5,9 @@
 //! `opdf_core::fakes::VecDocument` before a real parser exists.
 
 #![warn(missing_docs)]
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod remove_page;
+
+pub use remove_page::{RemovePage, RestorePage};
