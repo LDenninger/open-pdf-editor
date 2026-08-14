@@ -35,5 +35,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod geometry;
+pub mod library;
 
 pub use geometry::{MAX_TILE_EDGE, MAX_TILE_PIXELS, TileGeometry, compute_tile_geometry};
+pub use library::bind_pdfium;

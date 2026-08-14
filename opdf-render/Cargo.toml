@@ -9,6 +9,8 @@ description = "Rasterization backends and the render worker"
 
 [dependencies]
 opdf-core = { path = "../opdf-core" }
+crossbeam-channel.workspace = true
+pdfium-render = { version = "0.9.3", default-features = false, features = ["thread_safe", "pdfium_7881"] }
 
 [dev-dependencies]
 opdf-core = { path = "../opdf-core", features = ["contract-tests"] }

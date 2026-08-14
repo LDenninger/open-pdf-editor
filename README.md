@@ -205,6 +205,18 @@ merely compiled.
   [`bblanchon/pdfium-binaries`](https://github.com/bblanchon/pdfium-binaries) —
   building PDFium from source is not required
 
+### Building
+
+`opdf-render` binds at runtime to PDFium, which is not vendored into this
+repository. Fetch the prebuilt library once before running the test suite:
+
+    ./scripts/fetch-pdfium.sh
+
+It downloads `chromium/7881` from
+[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) into
+`vendor/pdfium/`, which is git-ignored. Set `OPDF_PDFIUM_LIB_DIR` to override
+the directory the library is loaded from. PDFium is BSD-3-Clause licensed.
+
 ## Usage
 
 Planned interfaces, for orientation only. Neither exists yet.
