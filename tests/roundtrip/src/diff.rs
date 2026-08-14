@@ -141,13 +141,9 @@ pub fn diff_bytes(before: &[u8], after: &[u8]) -> Result<StructuralDiff, DiffErr
 }
 
 fn ordered_page_geometry(document: &Document) -> Vec<PageGeometry> {
-    // get_pages() returns a BTreeMap<page_number, ObjectId>, so this
-    // iterates in page-number order, not object-id order.
-    document
-        .get_pages()
-        .into_iter()
-        .filter_map(|(_page_number, id)| page_geometry(document, id))
-        .collect()
+    // get_pages() returns a BTreeMap<page_number, ObjectId>, so draining its
+    // values yields page-number order, not object-id order.
+    document.get_pages().into_values().filter_map(|id| page_geometry(document, id)).collect()
 }
 
 fn page_geometry(document: &Document, page_id: ObjectId) -> Option<PageGeometry> {
