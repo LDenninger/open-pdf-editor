@@ -5,3 +5,53 @@
 //! `opdf_core::fakes::VecDocument` before a real parser exists.
 
 #![warn(missing_docs)]
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod remove_page;
+
+pub use remove_page::{RemovePage, RestorePage};
+
+pub mod move_page;
+
+pub use move_page::MovePage;
+
+pub mod set_rotation;
+
+pub use set_rotation::SetRotation;
+
+pub mod insert_blank_page;
+
+pub use insert_blank_page::InsertBlankPage;
+
+pub mod sequence;
+
+pub use sequence::Sequence;
+
+pub mod import_pages;
+
+pub use import_pages::ImportPages;
+
+pub mod delete_selection;
+
+pub use delete_selection::delete_selection;
+
+pub mod rotate_selection;
+
+pub use rotate_selection::rotate_selection;
+
+pub mod merge;
+
+pub use merge::Merge;
+
+pub mod extract;
+
+pub use extract::extract_range;
+
+pub mod split;
+
+pub use split::split_at;
+
+pub mod undo_stack;
+
+pub use undo_stack::UndoStack;
