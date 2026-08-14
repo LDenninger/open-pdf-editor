@@ -19,3 +19,7 @@ pub use move_page::MovePage;
 pub mod set_rotation;
 
 pub use set_rotation::SetRotation;
+
+pub mod insert_blank_page;
+
+pub use insert_blank_page::InsertBlankPage;
