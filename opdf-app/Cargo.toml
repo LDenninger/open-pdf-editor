@@ -7,8 +7,19 @@ license.workspace = true
 repository.workspace = true
 description = "Desktop application"
 
+[lib]
+name = "opdf_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "opdf"
+path = "src/main.rs"
+
 [dependencies]
 opdf-core = { path = "../opdf-core" }
+egui = "0.32"
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui-phosphor = "0.10"
 
 [dev-dependencies]
 opdf-core = { path = "../opdf-core", features = ["contract-tests"] }
