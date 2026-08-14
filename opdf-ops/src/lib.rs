@@ -43,3 +43,7 @@ pub use rotate_selection::rotate_selection;
 pub mod merge;
 
 pub use merge::Merge;
+
+pub mod extract;
+
+pub use extract::extract_range;
