@@ -174,8 +174,7 @@ content.
 
 **File:** `document.rs`
 **Implemented by:** `opdf-core::fakes::VecDocument` (in-memory fake, no
-content). `opdf-pdf` (Track A) implements it over a real PDF file; that
-implementation does not exist yet.
+content) and `opdf-pdf::PdfDocument` (Track A), over a real PDF file.
 
 ```rust
 pub trait Document {
@@ -420,14 +419,21 @@ rule here is narrower and applies within a single session — it is about
 compaction specifically discarding the trash, not about identity failing to
 survive a reopen.
 
+**In `opdf-pdf` the purge is not a policy choice.** `save_compacted` builds the
+rewritten document and calls `lopdf`'s `prune_objects`, which drops every object
+the new page tree does not reach — and a trashed page is exactly that. Its
+objects therefore leave the file whether or not the in-memory trash is cleared,
+so `save_compacted` clears the trash to match what it just wrote, and does so
+only after the file is written successfully. `save_incremental` never prunes and
+never purges.
+
 ---
 
 ## `DocumentIo`
 
 **File:** `document.rs`
-**Implemented by:** nobody yet. `opdf-pdf` (Track A) implements it; that
-implementation does not exist yet. No fake implements `DocumentIo` — see
-below.
+**Implemented by:** `opdf-pdf::PdfDocument` (Track A). No fake implements
+`DocumentIo` — see below.
 
 ```rust
 pub trait DocumentIo: Document + Sized {
@@ -443,7 +449,9 @@ separate trait from `Document` specifically so that in-memory fakes
 format — `VecDocument` implements `Document` but not `DocumentIo`.
 
 **Behavioural requirements (from the doc comments; no contract-suite function
-exists for this trait yet — Track A adds one alongside its implementation):**
+exists for this trait; `opdf-pdf` covers it with its own round-trip tests in
+`src/save.rs`, which assert byte-identical output for an unedited document and
+an append-only prefix after an edit):**
 
 - `save_incremental` is the default save path: it appends an incremental
   update to the original bytes rather than rewriting the file. It must be
