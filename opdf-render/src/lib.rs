@@ -37,5 +37,8 @@
 pub mod geometry;
 pub mod library;
 
+#[cfg(test)]
+mod fixture;
+
 pub use geometry::{MAX_TILE_EDGE, MAX_TILE_PIXELS, TileGeometry, compute_tile_geometry};
 pub use library::bind_pdfium;
