@@ -1,9 +1,5 @@
 //! Reading and copying `lopdf` objects across a merged previous/appended view.
 
-// The first non-test caller is `PdfDocument`, which lands later in the track.
-// Until then `-D warnings` would reject this module as dead code.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
