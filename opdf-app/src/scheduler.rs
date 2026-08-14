@@ -81,8 +81,15 @@ pub fn order_by_distance_from_focus(visible: Range<usize>, focus: usize) -> Vec<
 /// texture-size limit.
 ///
 /// `is_wanted` decides whether a request still needs submitting — in practice
-/// `|request| cache.mark_pending(*request)`, which returns `false` for anything
-/// already cached or already in flight, and records the submission as it goes.
+/// `|request| cache.wants(request)`, which is `false` for anything already
+/// cached or already in flight.
+///
+/// It is deliberately a `Fn`, not a `FnMut`: **planning must not record
+/// anything.** Marking a request as in flight while planning meant every
+/// request that then failed to fit `budget` was left recorded as in flight and
+/// never submitted, so nothing could ever clear it — a permanently blank page
+/// and a repaint loop that never settles. The caller marks pending for exactly
+/// the requests it goes on to submit.
 ///
 /// At most `budget` requests are returned; the rest are counted in
 /// [`RequestPlan::skipped`].
@@ -91,7 +98,7 @@ pub fn plan_render_requests(
     visible: Range<usize>,
     focus: usize,
     settings: RenderSettings,
-    is_wanted: &mut dyn FnMut(&RenderRequest) -> bool,
+    is_wanted: &dyn Fn(&RenderRequest) -> bool,
     budget: usize,
 ) -> RequestPlan {
     let mut plan = RequestPlan::default();
@@ -122,7 +129,7 @@ mod tests {
     use crate::synthetic::build_synthetic_snapshot;
     use std::collections::HashSet;
 
-    fn accept_everything() -> impl FnMut(&RenderRequest) -> bool {
+    fn accept_everything() -> impl Fn(&RenderRequest) -> bool {
         |_request: &RenderRequest| true
     }
 
@@ -153,8 +160,8 @@ mod tests {
     #[test]
     fn submits_the_focus_page_before_the_overscan_band() {
         let snapshot = build_synthetic_snapshot(20).unwrap();
-        let mut accept = accept_everything();
-        let plan = plan_render_requests(&snapshot, 4..12, 8, settings(Rotation::None), &mut accept, MAX_SUBMISSIONS_PER_FRAME);
+        let accept = accept_everything();
+        let plan = plan_render_requests(&snapshot, 4..12, 8, settings(Rotation::None), &accept, MAX_SUBMISSIONS_PER_FRAME);
         assert_eq!(
             plan.requests[0].page, snapshot.pages[8].id,
             "the page the user is looking at must be asked for first"
@@ -164,8 +171,8 @@ mod tests {
     #[test]
     fn caps_a_fling_scroll_at_the_frame_budget() {
         let snapshot = build_synthetic_snapshot(500).unwrap();
-        let mut accept = accept_everything();
-        let plan = plan_render_requests(&snapshot, 0..500, 250, settings(Rotation::None), &mut accept, MAX_SUBMISSIONS_PER_FRAME);
+        let accept = accept_everything();
+        let plan = plan_render_requests(&snapshot, 0..500, 250, settings(Rotation::None), &accept, MAX_SUBMISSIONS_PER_FRAME);
         assert_eq!(plan.requests.len(), MAX_SUBMISSIONS_PER_FRAME);
         assert_eq!(
             plan.skipped,
@@ -178,8 +185,8 @@ mod tests {
     fn skips_requests_the_cache_already_holds() {
         let snapshot = build_synthetic_snapshot(20).unwrap();
         let already_cached: HashSet<u64> = snapshot.pages[4..8].iter().map(|page| page.id.get()).collect();
-        let mut is_wanted = |request: &RenderRequest| !already_cached.contains(&request.page.get());
-        let plan = plan_render_requests(&snapshot, 0..12, 6, settings(Rotation::None), &mut is_wanted, 32);
+        let is_wanted = |request: &RenderRequest| !already_cached.contains(&request.page.get());
+        let plan = plan_render_requests(&snapshot, 0..12, 6, settings(Rotation::None), &is_wanted, 32);
         assert_eq!(plan.requests.len(), 8, "four of the twelve visible pages are cached");
         assert!(plan.requests.iter().all(|request| !already_cached.contains(&request.page.get())));
     }
@@ -188,8 +195,8 @@ mod tests {
     fn builds_every_request_at_the_snapshots_own_revision() {
         let mut snapshot = build_synthetic_snapshot(6).unwrap();
         snapshot.revision = 41;
-        let mut accept = accept_everything();
-        let plan = plan_render_requests(&snapshot, 0..6, 0, settings(Rotation::None), &mut accept, 32);
+        let accept = accept_everything();
+        let plan = plan_render_requests(&snapshot, 0..6, 0, settings(Rotation::None), &accept, 32);
         assert!(
             plan.requests.iter().all(|request| request.revision == 41),
             "a request must carry the revision of the snapshot it was planned from"
@@ -203,10 +210,10 @@ mod tests {
         let mut after = before.clone();
         after.revision = 2;
 
-        let mut accept = accept_everything();
-        let old_plan = plan_render_requests(&before, 0..4, 0, settings(Rotation::None), &mut accept, 32);
-        let mut accept = accept_everything();
-        let new_plan = plan_render_requests(&after, 0..4, 0, settings(Rotation::None), &mut accept, 32);
+        let accept = accept_everything();
+        let old_plan = plan_render_requests(&before, 0..4, 0, settings(Rotation::None), &accept, 32);
+        let accept = accept_everything();
+        let new_plan = plan_render_requests(&after, 0..4, 0, settings(Rotation::None), &accept, 32);
 
         for (old, new) in old_plan.requests.iter().zip(new_plan.requests.iter()) {
             assert_ne!(old, new, "after a revision change, no planned request may equal one planned before it");
@@ -216,8 +223,8 @@ mod tests {
     #[test]
     fn leaves_the_view_rotation_at_none_by_default_so_pages_are_not_rotated_twice() {
         let snapshot = build_synthetic_snapshot(4).unwrap();
-        let mut accept = accept_everything();
-        let plan = plan_render_requests(&snapshot, 0..4, 0, settings(Rotation::None), &mut accept, 32);
+        let accept = accept_everything();
+        let plan = plan_render_requests(&snapshot, 0..4, 0, settings(Rotation::None), &accept, 32);
         assert!(
             plan.requests.iter().all(|request| request.rotation == Rotation::None),
             "the page's stored rotation is applied by the renderer; repeating it in the request would rotate the tile twice"
@@ -227,22 +234,22 @@ mod tests {
     #[test]
     fn carries_a_user_applied_view_rotation_into_every_request() {
         let snapshot = build_synthetic_snapshot(4).unwrap();
-        let mut accept = accept_everything();
-        let plan = plan_render_requests(&snapshot, 0..4, 0, settings(Rotation::Quarter), &mut accept, 32);
+        let accept = accept_everything();
+        let plan = plan_render_requests(&snapshot, 0..4, 0, settings(Rotation::Quarter), &accept, 32);
         assert!(plan.requests.iter().all(|request| request.rotation == Rotation::Quarter));
     }
 
     #[test]
     fn never_asks_for_a_tile_the_backend_cannot_upload() {
         let snapshot = build_synthetic_snapshot(20).unwrap();
-        let mut accept = accept_everything();
+        let accept = accept_everything();
         //--- scale 4 against a 2048 limit: the 1200-point page would be 4800px tall ---
         let tight = RenderSettings {
             render_scale: 4.0,
             view_rotation: Rotation::None,
             max_texture_side: 2048,
         };
-        let plan = plan_render_requests(&snapshot, 0..20, 0, tight, &mut accept, 64);
+        let plan = plan_render_requests(&snapshot, 0..20, 0, tight, &accept, 64);
         assert!(!plan.requests.is_empty(), "capping must shrink requests, not drop them");
 
         for request in &plan.requests {
@@ -261,13 +268,13 @@ mod tests {
     #[test]
     fn caps_only_the_pages_that_need_it() {
         let snapshot = build_synthetic_snapshot(20).unwrap();
-        let mut accept = accept_everything();
+        let accept = accept_everything();
         let tight = RenderSettings {
             render_scale: 2.0,
             view_rotation: Rotation::None,
             max_texture_side: 2048,
         };
-        let plan = plan_render_requests(&snapshot, 0..20, 0, tight, &mut accept, 64);
+        let plan = plan_render_requests(&snapshot, 0..20, 0, tight, &accept, 64);
         let scales: HashSet<u32> = plan.requests.iter().map(|request| request.scale.to_bits()).collect();
         assert!(
             scales.len() > 1,
@@ -282,16 +289,16 @@ mod tests {
     #[test]
     fn plans_nothing_for_an_empty_document() {
         let snapshot = DocumentSnapshot::default();
-        let mut accept = accept_everything();
-        let plan = plan_render_requests(&snapshot, 0..0, 0, settings(Rotation::None), &mut accept, 32);
+        let accept = accept_everything();
+        let plan = plan_render_requests(&snapshot, 0..0, 0, settings(Rotation::None), &accept, 32);
         assert_eq!(plan, RequestPlan::default());
     }
 
     #[test]
     fn ignores_indices_past_the_end_of_the_snapshot() {
         let snapshot = build_synthetic_snapshot(3).unwrap();
-        let mut accept = accept_everything();
-        let plan = plan_render_requests(&snapshot, 0..99, 0, settings(Rotation::None), &mut accept, 32);
+        let accept = accept_everything();
+        let plan = plan_render_requests(&snapshot, 0..99, 0, settings(Rotation::None), &accept, 32);
         assert_eq!(plan.requests.len(), 3, "a stale visible range must not panic or invent pages");
     }
 }
