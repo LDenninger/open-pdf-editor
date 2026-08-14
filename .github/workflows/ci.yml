@@ -12,12 +12,16 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      OPDF_PDFIUM_LIB_DIR: ${{ github.workspace }}/vendor/pdfium/lib
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch Pdfium
+        run: ./scripts/fetch-pdfium.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
