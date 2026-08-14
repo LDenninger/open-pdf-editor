@@ -47,3 +47,7 @@ pub use merge::Merge;
 pub mod extract;
 
 pub use extract::extract_range;
+
+pub mod split;
+
+pub use split::split_at;
