@@ -23,3 +23,7 @@ pub use set_rotation::SetRotation;
 pub mod insert_blank_page;
 
 pub use insert_blank_page::InsertBlankPage;
+
+pub mod sequence;
+
+pub use sequence::Sequence;
