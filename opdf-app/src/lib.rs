@@ -16,6 +16,7 @@
 
 pub mod icons;
 pub mod layout;
+pub mod panels;
 pub mod scheduler;
 pub mod synthetic;
 pub mod theme;
