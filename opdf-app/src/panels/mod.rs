@@ -6,3 +6,4 @@
 //! [`crate::scheduler`], and [`crate::viewer`], which are tested headlessly.
 
 pub mod canvas;
+pub mod thumbnail_rail;
