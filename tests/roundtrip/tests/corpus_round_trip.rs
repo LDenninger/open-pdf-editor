@@ -66,8 +66,16 @@ fn every_well_formed_corpus_file_round_trips_unchanged() {
         }
     }
 
-    assert!(checked > 0, "the manifest listed no well-formed checked-in files; the corpus loader or the tags are wrong");
-    assert!(failures.is_empty(), "{checked} files checked, {} failed the round trip:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        checked > 0,
+        "the manifest listed no well-formed checked-in files; the corpus loader or the tags are wrong"
+    );
+    assert!(
+        failures.is_empty(),
+        "{checked} files checked, {} failed the round trip:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// A file that is broken on purpose must fail cleanly.
@@ -93,7 +101,10 @@ fn every_pathological_corpus_file_is_survived_rather_than_panicked_on() {
         let _ = PdfDocument::open(&path_of(entry));
     }
 
-    assert!(checked > 0, "no corpus file carries the pathological tag; this test would silently prove nothing");
+    assert!(
+        checked > 0,
+        "no corpus file carries the pathological tag; this test would silently prove nothing"
+    );
 }
 
 /// A zero-byte file is not a PDF and must be rejected rather than opened as

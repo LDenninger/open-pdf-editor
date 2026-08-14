@@ -505,7 +505,10 @@ mod tests {
                 })
             })
             .collect();
-        assert!(undrawn.is_empty(), "pages {undrawn:?} never got a tile and would stay grey placeholders for the session");
+        assert!(
+            undrawn.is_empty(),
+            "pages {undrawn:?} never got a tile and would stay grey placeholders for the session"
+        );
     }
 
     #[test]

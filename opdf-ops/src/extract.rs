@@ -87,7 +87,10 @@ mod tests {
 
         let result = extract_range(&source, &mut target, 3, 1);
 
-        assert!(matches!(result, Err(Error::InvalidRange { start: 3, end: 1 })), "an inverted range must be a recoverable error");
+        assert!(
+            matches!(result, Err(Error::InvalidRange { start: 3, end: 1 })),
+            "an inverted range must be a recoverable error"
+        );
         assert_eq!(DocumentSnapshot::of(&target).unwrap().pages, before.pages);
     }
 

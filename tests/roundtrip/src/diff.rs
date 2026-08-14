@@ -249,10 +249,7 @@ fn page_geometry(document: &Document, page_id: ObjectId) -> PageGeometry {
         // at are malformed by design: a short array yields a zero size rather
         // than panicking inside the harness whose purpose is to characterize
         // malformed input.
-        Some(values) if values.len() >= 4 => (
-            (as_f64(&values[2]) - as_f64(&values[0])).abs(),
-            (as_f64(&values[3]) - as_f64(&values[1])).abs(),
-        ),
+        Some(values) if values.len() >= 4 => ((as_f64(&values[2]) - as_f64(&values[0])).abs(), (as_f64(&values[3]) - as_f64(&values[1])).abs()),
         _ => (0.0, 0.0),
     };
 
@@ -479,10 +476,7 @@ fn reachable_object_ids(document: &Document) -> HashSet<ObjectId> {
 
 /// How many reachable references point at an object that does not exist.
 fn count_dangling_references(document: &Document) -> usize {
-    reachable_object_ids(document)
-        .iter()
-        .filter(|id| document.get_object(**id).is_err())
-        .count()
+    reachable_object_ids(document).iter().filter(|id| document.get_object(**id).is_err()).count()
 }
 
 fn collect_references(object: &Object, queue: &mut VecDeque<ObjectId>) {
@@ -677,10 +671,10 @@ mod tests {
         #[test]
         fn a_replaced_content_stream_is_not_identical() {
             let diff = diff_after(|fixture| {
-                fixture
-                    .document
-                    .objects
-                    .insert(fixture.content_a, Object::Stream(Stream::new(dictionary! {}, b"0 1 0 rg 0 0 10 10 re f".to_vec())));
+                fixture.document.objects.insert(
+                    fixture.content_a,
+                    Object::Stream(Stream::new(dictionary! {}, b"0 1 0 rg 0 0 10 10 re f".to_vec())),
+                );
             });
             assert!(!diff.is_empty(), "a page whose content stream was replaced is not structurally identical");
             assert_eq!(diff.pages_with_changed_content, vec![0], "the change must be localised to page one: {diff}");
@@ -723,7 +717,10 @@ mod tests {
                     annot.set("V", Object::string_literal(""));
                 }
             });
-            assert!(!diff.is_empty(), "silently emptying a form field is exactly the damage this project promises not to do");
+            assert!(
+                !diff.is_empty(),
+                "silently emptying a form field is exactly the damage this project promises not to do"
+            );
             assert_eq!(diff.pages_with_changed_content, vec![0], "the field is on page one, via /Annots: {diff}");
         }
 
@@ -735,7 +732,11 @@ mod tests {
                 }
             });
             assert!(!diff.is_empty(), "dropping an inherited /Rotate turns every page upright: {diff}");
-            assert_eq!(diff.page_geometry_changes.len(), 2, "both pages inherited the rotation, so both changed: {diff}");
+            assert_eq!(
+                diff.page_geometry_changes.len(),
+                2,
+                "both pages inherited the rotation, so both changed: {diff}"
+            );
             assert_eq!(diff.page_geometry_changes[0].before.rotation_degrees, 90);
             assert_eq!(diff.page_geometry_changes[0].after.rotation_degrees, 0);
         }
