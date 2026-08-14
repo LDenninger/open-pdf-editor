@@ -29,9 +29,16 @@ pub(crate) struct PageSlot {
 ///
 /// The vector's order **is** document order. The file's `/Kids` array is
 /// regenerated from this vector at save time, never read back into it.
+///
+/// A removed slot moves to `removed` rather than being dropped, so that
+/// [`PageMap::restore_slot`] can hand back the original page — same identity,
+/// same object, same geometry, same rotation — instead of an approximation.
+/// The trash holds slots, never object bytes: the PDF objects themselves were
+/// never deleted, only unlinked from the page tree.
 #[derive(Debug, Default)]
 pub(crate) struct PageMap {
     slots: Vec<PageSlot>,
+    removed: Vec<PageSlot>,
     allocator: PageIdAllocator,
 }
 
@@ -139,13 +146,38 @@ impl PageMap {
         Ok(id)
     }
 
-    /// Remove a page from document order.
+    /// Remove a page from document order, retaining its slot for restoration.
     ///
     /// Returns [`Error::PageNotFound`] if the identity is not mapped. The
-    /// identity is retired: the allocator never reissues it.
+    /// identity is retired from allocation — the allocator never reissues it —
+    /// but the slot stays in the trash until [`PageMap::purge_trash`] discards it.
     pub(crate) fn remove_slot(&mut self, id: PageId) -> Result<()> {
         let index = self.find_index(id)?;
-        self.slots.remove(index);
+        //--- the slot is retained, not dropped, so restore_slot can hand back the original page ---
+        let slot = self.slots.remove(index);
+        self.removed.push(slot);
+        Ok(())
+    }
+
+    /// Bring a removed page back at a position, with the slot it had when it left.
+    ///
+    /// Returns [`Error::Unsupported`] if the identity is currently present —
+    /// restoring a live page is a caller error, not a no-op and not a duplicate.
+    /// Returns [`Error::PageNotFound`] if the identity is neither present nor in
+    /// the trash, and [`Error::IndexOutOfBounds`] if the position exceeds the
+    /// page count. Every check runs before the trash is touched, so a rejected
+    /// restore leaves the page restorable by a later, valid call.
+    pub(crate) fn restore_slot(&mut self, id: PageId, at_index: usize) -> Result<()> {
+        if self.slots.iter().any(|slot| slot.id == id) {
+            return Err(Error::Unsupported(format!("{id} is currently present and cannot be restored")));
+        }
+        //--- resolve the identity before the index, matching relocate_slot's precedence ---
+        let trash_index = self.removed.iter().position(|slot| slot.id == id).ok_or(Error::PageNotFound(id))?;
+        self.check_insertion_index(at_index)?;
+
+        //--- both checks have passed, so nothing below can fail and leave the trash half-emptied ---
+        let slot = self.removed.remove(trash_index);
+        self.slots.insert(at_index, slot);
         Ok(())
     }
 
@@ -260,5 +292,67 @@ mod tests {
         map.remove_slot(inserted).unwrap();
         let reinserted = map.insert_slot(1, (10, 0), PageSize::A4, Rotation::None).unwrap();
         assert_ne!(reinserted, inserted, "an identity is never handed out twice, even after removal");
+    }
+
+    #[test]
+    fn hands_a_removed_slot_back_with_everything_it_had() {
+        let mut map = build_map(3);
+        let ids = map.collect_ids();
+        map.find_slot_mut(ids[1]).unwrap().rotation = Rotation::Quarter;
+        let before = *map.find_slot(ids[1]).unwrap();
+
+        map.remove_slot(ids[1]).unwrap();
+        map.restore_slot(ids[1], 0).unwrap();
+
+        let restored = map.find_slot(ids[1]).unwrap();
+        assert_eq!(restored.id, before.id, "a restored slot keeps its identity");
+        assert_eq!(restored.object_id, before.object_id, "a restored slot points at the same pdf object");
+        assert_eq!(restored.size, before.size, "a restored slot keeps its geometry");
+        assert_eq!(restored.rotation, before.rotation, "a restored slot keeps its rotation");
+        assert_eq!(map.find_index(ids[1]).unwrap(), 0, "a restored slot lands at the requested index");
+        assert_eq!(map.count_pages(), 3);
+    }
+
+    #[test]
+    fn accepts_a_restore_at_the_page_count_as_an_append() {
+        let mut map = build_map(2);
+        let ids = map.collect_ids();
+        map.remove_slot(ids[1]).unwrap();
+        let end = map.count_pages();
+        map.restore_slot(ids[1], end).unwrap();
+        assert_eq!(
+            map.find_index(ids[1]).unwrap(),
+            1,
+            "restoring at the page count must append, or a last-page deletion cannot be undone"
+        );
+    }
+
+    #[test]
+    fn rejects_a_restore_without_consuming_the_page() {
+        let mut map = build_map(3);
+        let ids = map.collect_ids();
+        map.remove_slot(ids[0]).unwrap();
+        let order = map.collect_ids();
+
+        assert!(matches!(map.restore_slot(ids[0], 99), Err(Error::IndexOutOfBounds { .. })));
+        assert_eq!(map.collect_ids(), order, "a rejected restore must leave the order untouched");
+        map.restore_slot(ids[0], 0)
+            .expect("a restore rejected for its index must not have discarded the page");
+    }
+
+    #[test]
+    fn distinguishes_an_unknown_identity_from_a_live_one() {
+        let mut map = build_map(2);
+        let ids = map.collect_ids();
+        let unknown = PageId::new(u64::MAX);
+        assert!(
+            matches!(map.restore_slot(unknown, 0), Err(Error::PageNotFound(_))),
+            "an identity the map never held is not restorable"
+        );
+        assert!(
+            matches!(map.restore_slot(ids[0], 0), Err(Error::Unsupported(_))),
+            "restoring a live page is a caller error, not a no-op and not a duplicate"
+        );
+        assert_eq!(map.collect_ids(), ids, "a rejected restore must leave the order untouched");
     }
 }

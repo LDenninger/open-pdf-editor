@@ -181,7 +181,11 @@ impl Document for PdfDocument {
     }
 
     fn restore_page(&mut self, id: PageId, at_index: usize) -> Result<()> {
-        Err(Error::Unsupported(format!("restore_page({id}, {at_index}) is not implemented yet")))
+        //--- no object work: the page's dictionary and streams were never deleted, only unlinked from the page tree ---
+        self.pages.restore_slot(id, at_index)?;
+        self.dirty.structure = true;
+        self.advance_revision();
+        Ok(())
     }
 
     fn move_page(&mut self, id: PageId, to_index: usize) -> Result<()> {
@@ -483,5 +487,99 @@ mod tests {
         let before = target.revision();
         target.import_pages(&source, &[], 0).unwrap();
         assert_ne!(before, target.revision(), "an empty import still advances the revision");
+    }
+
+    #[test]
+    fn restores_a_removed_page_with_its_original_identity_and_geometry() {
+        let mut document = PdfDocument::load_from_bytes(&fixture::build_flat_pages(&[
+            PageSize::new(100.0, 100.0),
+            PageSize::new(200.0, 200.0),
+            PageSize::A4,
+        ]))
+        .unwrap();
+        let ids = document.page_ids();
+        document.set_rotation(ids[1], Rotation::Quarter).unwrap();
+        let before = document.page(ids[1]).unwrap();
+
+        document.remove_page(ids[1]).unwrap();
+        document.restore_page(ids[1], 0).unwrap();
+
+        assert_eq!(
+            document.page_ids().first().copied(),
+            Some(ids[1]),
+            "a restored page keeps its original identity"
+        );
+        let restored = document.page(ids[1]).unwrap();
+        assert_eq!(restored.size, before.size, "a restored page keeps the geometry it had when it was removed");
+        assert_eq!(
+            restored.rotation, before.rotation,
+            "a restored page keeps the rotation it had when it was removed"
+        );
+        assert_eq!(document.index_of(ids[1]).unwrap(), 0);
+        assert_eq!(document.page_count(), 3);
+    }
+
+    #[test]
+    fn restores_a_removed_page_onto_the_same_pdf_object() {
+        let mut document = build_document(2);
+        let ids = document.page_ids();
+        let object_before = document.pages.find_slot(ids[0]).unwrap().object_id;
+
+        document.remove_page(ids[0]).unwrap();
+        document.restore_page(ids[0], 1).unwrap();
+
+        assert_eq!(
+            document.pages.find_slot(ids[0]).unwrap().object_id,
+            object_before,
+            "a restored page must point at the object it always pointed at, not a copy"
+        );
+    }
+
+    #[test]
+    fn restores_the_deletion_of_a_last_page() {
+        let mut document = build_document(2);
+        let ids = document.page_ids();
+        document.remove_page(ids[1]).unwrap();
+        let end = document.page_count();
+        document.restore_page(ids[1], end).unwrap();
+        assert_eq!(document.index_of(ids[1]).unwrap(), 1);
+    }
+
+    #[test]
+    fn distinguishes_the_three_ways_a_restore_can_be_rejected() {
+        let mut document = build_document(3);
+        let ids = document.page_ids();
+        document.remove_page(ids[0]).unwrap();
+        let order = document.page_ids();
+        let revision = document.revision();
+
+        let rejected = document.restore_page(ids[0], 99);
+        assert!(
+            matches!(rejected, Err(opdf_core::Error::IndexOutOfBounds { .. })),
+            "out of range, got: {rejected:?}"
+        );
+
+        let rejected = document.restore_page(opdf_core::PageId::new(u64::MAX), 0);
+        assert!(matches!(rejected, Err(opdf_core::Error::PageNotFound(_))), "never held, got: {rejected:?}");
+
+        let rejected = document.restore_page(ids[1], 0);
+        assert!(
+            matches!(rejected, Err(opdf_core::Error::Unsupported(_))),
+            "currently present, got: {rejected:?}"
+        );
+
+        assert_eq!(document.page_ids(), order, "a rejected restore must leave the document untouched");
+        assert_eq!(revision, document.revision(), "a failed restore_page must leave the revision untouched");
+        document.restore_page(ids[0], 0).expect("no rejection may consume the trashed page");
+    }
+
+    #[test]
+    fn advances_the_revision_when_a_restore_succeeds() {
+        let mut document = build_document(2);
+        let ids = document.page_ids();
+        document.remove_page(ids[0]).unwrap();
+        let before = document.revision();
+        document.restore_page(ids[0], 0).unwrap();
+        assert_ne!(before, document.revision(), "restore_page must advance the revision on success");
     }
 }
