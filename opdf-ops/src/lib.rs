@@ -31,3 +31,7 @@ pub use sequence::Sequence;
 pub mod import_pages;
 
 pub use import_pages::ImportPages;
+
+pub mod delete_selection;
+
+pub use delete_selection::delete_selection;
