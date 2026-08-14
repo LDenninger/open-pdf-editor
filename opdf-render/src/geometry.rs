@@ -19,6 +19,25 @@ pub struct TileGeometry {
     pub total_rotation: Rotation,
 }
 
+/// Largest tile edge this renderer will produce, in pixels.
+///
+/// Pdfium takes bitmap dimensions as `i32`. Bounding each edge well below that
+/// range keeps the conversion total and keeps a runaway zoom control from
+/// reaching the allocator at all.
+pub const MAX_TILE_EDGE: u32 = 32_768;
+
+/// Largest tile this renderer will produce, in pixels — 64 megapixels, or
+/// 256 MiB of RGBA.
+///
+/// Deliberately the same pixel budget [`opdf_core::fakes::FakeRenderService`]
+/// applies, so the user interface sees one area limit rather than two. The two
+/// renderers do not fail identically: [`MAX_TILE_EDGE`] is an additional
+/// constraint with no analogue in the fake. A single render transiently costs three
+/// buffers of this size — Pdfium's bitmap, the RGBA copy, and the cached tile —
+/// which is why the ceiling sits below the point where one page could exhaust
+/// a workstation's memory.
+pub const MAX_TILE_PIXELS: u64 = 64 * 1024 * 1024;
+
 /// Resolve a request against a page's geometry.
 ///
 /// Returns a human-readable reason, suitable for
@@ -34,6 +53,14 @@ pub fn compute_tile_geometry(page: PageInfo, request: &RenderRequest) -> Result<
     let width_px = scale_edge(display.width_pt, request.scale)?;
     let height_px = scale_edge(display.height_pt, request.scale)?;
 
+    let pixel_count = u64::from(width_px) * u64::from(height_px);
+    if pixel_count > MAX_TILE_PIXELS {
+        return Err(format!(
+            "requested tile of {width_px}x{height_px} pixels at scale {} exceeds the renderer's limit of {MAX_TILE_PIXELS} pixels",
+            request.scale
+        ));
+    }
+
     Ok(TileGeometry {
         width_px,
         height_px,
@@ -47,7 +74,13 @@ fn scale_edge(size_pt: f32, scale: f32) -> Result<u32, String> {
     if !scaled.is_finite() {
         return Err(format!("scale {scale} applied to {size_pt} points does not produce a finite pixel count"));
     }
-    Ok(scaled.round().max(1.0) as u32)
+    let rounded = scaled.round().max(1.0);
+    if rounded > f64::from(MAX_TILE_EDGE) {
+        return Err(format!(
+            "requested tile edge of {rounded} pixels at scale {scale} exceeds the renderer's limit of {MAX_TILE_EDGE} pixels"
+        ));
+    }
+    Ok(rounded as u32)
 }
 
 #[cfg(test)]
@@ -108,5 +141,28 @@ mod tests {
         let geometry = compute_tile_geometry(build_page(Rotation::Quarter), &request).unwrap();
         assert_eq!((geometry.width_px, geometry.height_px), (595, 842));
         assert_eq!(geometry.total_rotation, Rotation::Half);
+    }
+
+    #[test]
+    fn fails_an_absurd_scale_instead_of_allocating_or_overflowing() {
+        let reason = compute_tile_geometry(build_page(Rotation::None), &build_request(1e30)).unwrap_err();
+        assert!(reason.contains("exceeds"), "the failure must name the limit it exceeded, got: {reason}");
+    }
+
+    #[test]
+    fn fails_a_scale_whose_pixel_count_exceeds_the_budget_even_with_legal_edges() {
+        //--- 595 x 842 points at scale 12.0 is 7140 x 10104 = 72.1 megapixels: both edges are legal, the area is not ---
+        let reason = compute_tile_geometry(build_page(Rotation::None), &build_request(12.0)).unwrap_err();
+        assert!(
+            reason.contains(&MAX_TILE_PIXELS.to_string()),
+            "the failure must name the pixel limit, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn accepts_the_largest_scale_below_the_ceiling() {
+        //--- 595 x 842 at scale 11.0 is 6545 x 9262 = 60.6 megapixels, just under the 64 megapixel limit ---
+        let geometry = compute_tile_geometry(build_page(Rotation::None), &build_request(11.0)).unwrap();
+        assert_eq!((geometry.width_px, geometry.height_px), (6545, 9262));
     }
 }

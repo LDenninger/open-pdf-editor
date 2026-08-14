@@ -36,4 +36,4 @@
 
 pub mod geometry;
 
-pub use geometry::{TileGeometry, compute_tile_geometry};
+pub use geometry::{MAX_TILE_EDGE, MAX_TILE_PIXELS, TileGeometry, compute_tile_geometry};
