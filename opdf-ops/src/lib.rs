@@ -15,3 +15,7 @@ pub use remove_page::{RemovePage, RestorePage};
 pub mod move_page;
 
 pub use move_page::MovePage;
+
+pub mod set_rotation;
+
+pub use set_rotation::SetRotation;
