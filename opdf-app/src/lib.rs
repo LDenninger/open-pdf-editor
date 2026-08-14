@@ -18,6 +18,7 @@ pub mod icons;
 pub mod layout;
 pub mod synthetic;
 pub mod theme;
+pub mod tiles;
 pub mod zoom;
 
 pub use theme::{Theme, apply_theme};
