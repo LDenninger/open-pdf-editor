@@ -10,7 +10,7 @@ use opdf_core::{Document, Error, PageId, PageInfo, Result};
 
 use crate::error::convert_lopdf_error;
 use crate::geometry::{read_page_rotation, read_page_size};
-use crate::objects::ObjectSource;
+use crate::objects::{ObjectSource, build_blank_page, copy_page_into};
 use crate::page_map::PageMap;
 
 /// What a save still has to write out.
@@ -202,14 +202,41 @@ impl Document for PdfDocument {
     }
 
     fn insert_page(&mut self, at_index: usize, size: opdf_core::PageSize) -> Result<PageId> {
-        Err(Error::Unsupported(format!("insert_page({at_index}, {size:?}) is not implemented yet")))
+        //--- check before allocating, so a rejected insertion leaves no orphan object behind ---
+        self.pages.check_insertion_index(at_index)?;
+        let parent_id = self.root_pages_id;
+        let object_id = build_blank_page(&mut self.incremental.new_document, parent_id, size);
+        let id = self.pages.insert_slot(at_index, object_id, size, opdf_core::Rotation::None)?;
+        self.dirty.structure = true;
+        self.advance_revision();
+        Ok(id)
     }
 
-    fn import_pages(&mut self, _source: &Self, ids: &[PageId], at_index: usize) -> Result<Vec<PageId>> {
-        Err(Error::Unsupported(format!(
-            "import_pages({} ids, {at_index}) is not implemented yet",
-            ids.len()
-        )))
+    fn import_pages(&mut self, source: &Self, ids: &[PageId], at_index: usize) -> Result<Vec<PageId>> {
+        self.pages.check_insertion_index(at_index)?;
+
+        //--- resolve every source page before touching the target, so a failure leaves no partial import ---
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in ids {
+            let slot = source.pages.find_slot(*id)?;
+            resolved.push((slot.object_id, slot.size, slot.rotation));
+        }
+
+        let mut imported = Vec::with_capacity(resolved.len());
+        for (offset, (object_id, size, rotation)) in resolved.into_iter().enumerate() {
+            let copied = copy_page_into(source, object_id, &mut self.incremental.new_document)
+                .ok_or_else(|| Error::Malformed(format!("source page object {object_id:?} could not be copied")))?;
+            let id = self.pages.insert_slot(at_index + offset, copied, size, rotation)?;
+            imported.push(id);
+        }
+
+        //--- an empty import changes nothing on disk, so it must not force the page tree to be rewritten ---
+        if !imported.is_empty() {
+            self.dirty.structure = true;
+        }
+        //--- but it still advances the revision: a spurious cache miss is cheaper than a stale tile ---
+        self.advance_revision();
+        Ok(imported)
     }
 }
 
@@ -363,5 +390,98 @@ mod tests {
             matches!(document.move_page(unknown, 99), Err(opdf_core::Error::PageNotFound(_))),
             "identity is checked before position"
         );
+    }
+
+    #[test]
+    fn inserts_a_blank_page_with_a_fresh_identity() {
+        let mut document = build_document(2);
+        let before = document.page_ids();
+        let inserted = document.insert_page(1, PageSize::LETTER).unwrap();
+
+        assert!(!before.contains(&inserted), "insert_page must return an identity not already in use");
+        assert_eq!(document.index_of(inserted).unwrap(), 1);
+        assert_eq!(document.page_count(), 3);
+        assert_eq!(document.page(inserted).unwrap().size, PageSize::LETTER);
+    }
+
+    #[test]
+    fn accepts_an_insertion_at_the_page_count_and_rejects_one_beyond_it() {
+        let mut document = build_document(2);
+        let end = document.page_count();
+        let appended = document.insert_page(end, PageSize::A4).unwrap();
+        assert_eq!(document.index_of(appended).unwrap(), 2);
+
+        let before = document.revision();
+        assert!(matches!(document.insert_page(99, PageSize::A4), Err(opdf_core::Error::IndexOutOfBounds { .. })));
+        assert_eq!(before, document.revision(), "a rejected insertion must leave the revision untouched");
+        assert_eq!(document.page_count(), 3, "a rejected insertion must not add a page");
+    }
+
+    #[test]
+    fn imports_pages_in_the_requested_order_with_fresh_identities() {
+        let source = PdfDocument::load_from_bytes(&fixture::build_flat_pages(&[
+            PageSize::new(100.0, 100.0),
+            PageSize::new(200.0, 200.0),
+            PageSize::new(300.0, 300.0),
+        ]))
+        .unwrap();
+        let mut target = build_document(2);
+        let target_ids = target.page_ids();
+
+        let imported = target.import_pages(&source, &source.page_ids(), 1).unwrap();
+
+        assert_eq!(imported.len(), 3);
+        assert_eq!(target.page_count(), 5);
+        for (offset, id) in imported.iter().enumerate() {
+            assert_eq!(target.index_of(*id).unwrap(), 1 + offset, "import must preserve the requested order");
+            assert!(!target_ids.contains(id), "imported pages must receive identities not already in use");
+        }
+        assert_eq!(target.index_of(target_ids[1]).unwrap(), 4, "pages after the insertion point must shift");
+        let widths: Vec<f32> = imported.iter().map(|id| target.page(*id).unwrap().size.width_pt).collect();
+        assert_eq!(widths, vec![100.0, 200.0, 300.0], "imported geometry must survive the copy");
+    }
+
+    #[test]
+    fn rejects_an_import_naming_an_unknown_source_page() {
+        let source = build_document(1);
+        let mut target = build_document(2);
+        let before = target.page_ids();
+        let before_revision = target.revision();
+
+        let mut ids = source.page_ids();
+        ids.push(opdf_core::PageId::new(u64::MAX));
+
+        assert!(matches!(target.import_pages(&source, &ids, 0), Err(opdf_core::Error::PageNotFound(_))));
+        assert_eq!(target.page_ids(), before, "a rejected import must leave the document untouched");
+        assert_eq!(before_revision, target.revision());
+    }
+
+    #[test]
+    fn rejects_an_import_beyond_the_target_document() {
+        let source = build_document(1);
+        let mut target = build_document(2);
+        assert!(matches!(
+            target.import_pages(&source, &source.page_ids(), 99),
+            Err(opdf_core::Error::IndexOutOfBounds { .. })
+        ));
+        assert_eq!(target.page_count(), 2);
+    }
+
+    #[test]
+    fn advances_the_revision_on_insert_and_import_including_an_empty_import() {
+        let source = build_document(1);
+        let mut target = build_document(2);
+
+        let before = target.revision();
+        target.insert_page(1, PageSize::A4).unwrap();
+        assert_ne!(before, target.revision(), "insert_page must advance the revision");
+
+        let before = target.revision();
+        target.import_pages(&source, &source.page_ids(), 1).unwrap();
+        assert_ne!(before, target.revision(), "import_pages must advance the revision");
+
+        let before = target.revision();
+        target.import_pages(&source, &[], 0).unwrap();
+        assert_ne!(before, target.revision(), "an empty import still advances the revision");
     }
 }
