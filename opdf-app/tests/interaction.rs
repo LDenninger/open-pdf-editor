@@ -17,13 +17,15 @@
 //! frame actually emitted; see [`Harness::drawn_textures`].
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use egui::epaint::ClippedShape;
 use egui::{Context, Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Shape, TextureId, Vec2, pos2, vec2};
 use opdf_app::app::OpdfApp;
+use opdf_app::opener::{DocumentOpener, FakeOpener};
 use opdf_app::panels::menu_bar::MenuAction;
 use opdf_app::panels::thumbnail_rail::lay_out_thumbnails;
-use opdf_app::synthetic::build_synthetic_snapshot;
+use opdf_app::synthetic::open_synthetic_document;
 use opdf_app::theme::Theme;
 
 const WINDOW_SIZE: Vec2 = vec2(1440.0, 900.0);
@@ -82,7 +84,7 @@ impl Harness {
     /// the real application goes through before anything is on screen.
     fn build(page_count: usize) -> Self {
         let ctx = Context::default();
-        let app = OpdfApp::new(&ctx, build_synthetic_snapshot(page_count).unwrap());
+        let app = OpdfApp::new(&ctx, open_synthetic_document(page_count).unwrap());
         let mut harness = Self {
             app,
             ctx,
@@ -265,7 +267,7 @@ fn keeps_the_scroll_extent_fixed_while_tiles_arrive() {
 fn draws_a_page_for_every_visible_slot_from_the_very_first_frame() {
     //--- the first frame has nothing cached; the canvas must still place pages ---
     let ctx = Context::default();
-    let mut app = OpdfApp::new(&ctx, build_synthetic_snapshot(200).unwrap());
+    let mut app = OpdfApp::new(&ctx, open_synthetic_document(200).unwrap());
     let input = RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE)),
         ..Default::default()
@@ -581,7 +583,7 @@ fn gives_the_canvas_the_rails_width_when_the_rail_is_hidden() {
 #[test]
 fn draws_an_empty_document_without_panicking() {
     let ctx = Context::default();
-    let mut app = OpdfApp::new(&ctx, opdf_core::document::DocumentSnapshot::default());
+    let mut app = OpdfApp::new(&ctx, open_synthetic_document(0).unwrap());
     for _ in 0..5 {
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE)),
@@ -663,4 +665,17 @@ fn replaces_a_document_mid_frame_without_serving_a_stale_tile() {
         None,
         "a tile from the previous document survived the replacement"
     );
+}
+
+//---------------------------------------------------------------------
+// The opener seam
+//---------------------------------------------------------------------
+
+#[test]
+fn the_app_draws_the_document_it_was_given_rather_than_one_it_built() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(7).open(Path::new("x.pdf")).unwrap();
+    let app = OpdfApp::new(&ctx, opened);
+    assert_eq!(app.state().page_count(), 7);
+    assert_eq!(app.document().map(|document| document.page_count()), Some(7));
 }
