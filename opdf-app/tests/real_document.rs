@@ -19,8 +19,10 @@ use std::time::{Duration, Instant};
 
 use egui::epaint::ImageData;
 use egui::{ColorImage, Context, Pos2, RawInput, Rect, TextureId, Vec2, vec2};
-use opdf_app::app::OpdfApp;
+use opdf_app::app::{OpdfApp, SaveMode};
 use opdf_app::opener::{DocumentOpener, PdfiumDocumentOpener};
+use opdf_app::panels::menu_bar::MenuAction;
+use opdf_core::page::Rotation;
 
 /// A window large enough that the first page is visible without scrolling.
 const WINDOW_SIZE: Vec2 = vec2(1440.0_f32, 900.0_f32);
@@ -112,5 +114,55 @@ fn a_real_pdf_rasterizes_to_a_tile_that_is_not_blank() {
     assert!(
         differs,
         "every sampled pixel of the tile for {request:?} was {first:?} — the page rendered blank"
+    );
+}
+
+/// The save path, end to end, against a real file and the real PDF writer.
+///
+/// Every other save test in this crate runs against `VecDocument`, whose "save"
+/// writes a marker file — enough to prove the call reaches the object, and
+/// nothing at all about whether a PDF comes back. This one edits a corpus file
+/// through the shell, writes it with `opdf-pdf`, and **reopens the written
+/// file** to check the edit survived the round trip. A save that writes bytes
+/// no parser accepts passes every other test here.
+#[test]
+fn an_edit_saved_through_the_shell_survives_a_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let out = directory.path().join("rotated.pdf");
+
+    let ctx = Context::default();
+    let opened = PdfiumDocumentOpener.open(&corpus_path("irs_f1040.pdf")).unwrap();
+    let before = opened.snapshot.pages[0].rotation;
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    //--- a frame settles the viewport so the shell knows which page is current ---
+    let mut uploaded: HashMap<TextureId, ColorImage> = HashMap::new();
+    run_frame(&ctx, &mut app, &mut uploaded);
+    assert_eq!(app.state().current_page(), Some(0), "the first page must be current before it can be rotated");
+
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    let expected = before.rotated_by(Rotation::Quarter);
+    assert_eq!(app.state().snapshot().pages[0].rotation, expected, "the rotation must land in memory first");
+    assert!(app.has_unsaved_changes(), "an edit that is not yet written is unsaved");
+
+    assert!(
+        app.save_to(&out, SaveMode::Incremental),
+        "saving a real document must succeed: {:?}",
+        app.last_error()
+    );
+    assert!(!app.has_unsaved_changes(), "a saved document has nothing outstanding");
+
+    //--- the real assertion: parse the bytes that were written, from scratch ---
+    let reopened = PdfiumDocumentOpener
+        .open(&out)
+        .unwrap_or_else(|error| panic!("the file the shell wrote could not be reopened: {error}"));
+    assert_eq!(
+        reopened.snapshot.pages[0].rotation, expected,
+        "the rotation did not survive the round trip through the file"
+    );
+    assert_eq!(
+        reopened.snapshot.page_count(),
+        app.state().page_count(),
+        "the saved file must have the same pages as the document that was saved"
     );
 }

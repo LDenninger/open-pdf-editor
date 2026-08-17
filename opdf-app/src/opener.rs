@@ -13,6 +13,56 @@ use opdf_core::page::{PageId, PageSize};
 use opdf_core::render::{RenderRequest, RenderResponse, RenderService};
 use opdf_core::{Error, Result};
 
+/// A document the shell can save.
+///
+/// [`opdf_core::DocumentIo`] is `Sized`, so its save methods cannot be reached
+/// through the `Box<dyn Document>` the shell owns. This trait is the object-safe
+/// subset the shell actually needs: no `open`, because opening produces the
+/// document rather than acting on one, and that is [`DocumentOpener`]'s job.
+pub trait EditableDocument: Document {
+    /// Write changes as an incremental update appended to the original bytes.
+    ///
+    /// The shell's default save path: it appends rather than rewrites, so every
+    /// structure the implementation does not model survives, and it does not
+    /// purge the trash, so undo of a deletion survives it too.
+    fn save_incremental(&mut self, path: &Path) -> Result<()>;
+
+    /// Write a freshly serialized document, discarding unreferenced objects.
+    ///
+    /// Destructive to undo of a deletion — a trashed page is an unreferenced
+    /// object — so the shell only ever reaches this on an explicit, confirmed
+    /// request, and clears its undo stack afterwards.
+    fn save_compacted(&mut self, path: &Path) -> Result<()>;
+}
+
+impl EditableDocument for opdf_pdf::PdfDocument {
+    fn save_incremental(&mut self, path: &Path) -> Result<()> {
+        DocumentIo::save_incremental(self, path)
+    }
+
+    fn save_compacted(&mut self, path: &Path) -> Result<()> {
+        DocumentIo::save_compacted(self, path)
+    }
+}
+
+/// Saving a [`VecDocument`] writes a marker file recording what was asked for.
+///
+/// [`VecDocument`] has no file format, and inventing a PDF writer for it would
+/// be testing a fake against a fake — serializing PDF is `opdf-pdf`'s job. The
+/// marker is enough to prove the call reached the object through the trait, and
+/// which of the two save paths it took.
+impl EditableDocument for VecDocument {
+    fn save_incremental(&mut self, path: &Path) -> Result<()> {
+        std::fs::write(path, format!("incremental {} pages\n", self.page_count()))?;
+        Ok(())
+    }
+
+    fn save_compacted(&mut self, path: &Path) -> Result<()> {
+        std::fs::write(path, format!("compacted {} pages\n", self.page_count()))?;
+        Ok(())
+    }
+}
+
 /// A document the shell has opened, together with the service that renders it.
 ///
 /// The snapshot is taken at open time and handed over with the document so the
@@ -21,11 +71,19 @@ use opdf_core::{Error, Result};
 /// describe.
 pub struct OpenedDocument {
     /// The document itself, kept so later edits and saves have something to act on.
-    pub document: Box<dyn Document>,
+    pub document: Box<dyn EditableDocument>,
     /// The service that rasterizes this document, and only this document.
     pub service: Box<dyn RenderService>,
     /// The snapshot both of the above were built from.
     pub snapshot: DocumentSnapshot,
+    /// Where the document was opened from, if it came from a file.
+    ///
+    /// Carried with the document rather than threaded separately, for the same
+    /// reason the snapshot is: Save writes to this path, and a path that arrived
+    /// by a different route than the document could point at a different file
+    /// than the one the shell believes is open. A synthetic document has no
+    /// origin, so Save has to ask.
+    pub path: Option<PathBuf>,
 }
 
 /// Opening a document from disk.
@@ -51,6 +109,14 @@ pub trait PathChooser {
     /// Show a picker for PDF files, returning the chosen path, or `None` if the
     /// user cancelled.
     fn choose_pdf(&self) -> Option<PathBuf>;
+
+    /// Show a save dialog, returning the path to write to, or `None` if the user
+    /// cancelled.
+    ///
+    /// Separate from [`PathChooser::choose_pdf`] because the two dialogs differ
+    /// in more than their title: a save dialog accepts a name that does not
+    /// exist yet, and confirms overwriting one that does.
+    fn choose_save_path(&self) -> Option<PathBuf>;
 }
 
 /// The production chooser: the platform's own file dialog.
@@ -59,6 +125,10 @@ pub struct NativePathChooser;
 impl PathChooser for NativePathChooser {
     fn choose_pdf(&self) -> Option<PathBuf> {
         rfd::FileDialog::new().add_filter("PDF document", &["pdf"]).pick_file()
+    }
+
+    fn choose_save_path(&self) -> Option<PathBuf> {
+        rfd::FileDialog::new().add_filter("PDF document", &["pdf"]).save_file()
     }
 }
 
@@ -83,6 +153,10 @@ impl PathChooser for FakeChooser {
     fn choose_pdf(&self) -> Option<PathBuf> {
         self.path.clone()
     }
+
+    fn choose_save_path(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
 }
 
 //---------------------------------------------------------------------
@@ -104,6 +178,7 @@ impl DocumentOpener for PdfiumDocumentOpener {
             document: Box::new(document),
             service: Box::new(service),
             snapshot,
+            path: Some(path.to_owned()),
         })
     }
 }
@@ -154,7 +229,7 @@ impl FakeOpener {
 }
 
 impl DocumentOpener for FakeOpener {
-    fn open(&self, _path: &Path) -> Result<OpenedDocument> {
+    fn open(&self, path: &Path) -> Result<OpenedDocument> {
         let Some(page_count) = self.page_count else {
             return Err(Error::Unsupported("this opener is configured to fail".to_owned()));
         };
@@ -169,6 +244,9 @@ impl DocumentOpener for FakeOpener {
             document: Box::new(document),
             service,
             snapshot,
+            //--- the fake ignores the path when reading, but the shell saves back
+            //--- to it, so a test can drive the whole save path through the fake ---
+            path: Some(path.to_owned()),
         })
     }
 }
@@ -238,6 +316,18 @@ mod tests {
     fn the_fake_opener_reports_a_configured_failure() {
         let opener = FakeOpener::failing();
         assert!(opener.open(Path::new("broken.pdf")).is_err());
+    }
+
+    #[test]
+    fn an_opened_document_can_be_saved_through_the_trait_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let out = directory.path().join("out.pdf");
+
+        let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+        let mut document = opened.document;
+        document.save_incremental(&out).unwrap();
+
+        assert!(out.exists(), "saving through the trait object must write a file");
     }
 
     #[test]

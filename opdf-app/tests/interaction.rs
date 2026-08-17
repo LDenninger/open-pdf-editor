@@ -21,12 +21,13 @@ use std::path::Path;
 
 use egui::epaint::ClippedShape;
 use egui::{Context, Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Shape, TextureId, Vec2, pos2, vec2};
-use opdf_app::app::OpdfApp;
+use opdf_app::app::{ExitIntent, OpdfApp};
 use opdf_app::opener::{DocumentOpener, FakeChooser, FakeOpener};
 use opdf_app::panels::menu_bar::MenuAction;
 use opdf_app::panels::thumbnail_rail::lay_out_thumbnails;
 use opdf_app::synthetic::open_synthetic_document;
 use opdf_app::theme::Theme;
+use opdf_core::page::Rotation;
 
 const WINDOW_SIZE: Vec2 = vec2(1440.0, 900.0);
 
@@ -838,4 +839,448 @@ fn a_file_menu_open_that_fails_keeps_the_document_and_says_why() {
     assert_eq!(app.state().page_count(), 3);
     let message = app.last_error().unwrap_or_default();
     assert!(message.contains("broken.pdf"), "the failure must name the file the user picked, got: {message}");
+}
+
+//---------------------------------------------------------------------
+// Saving
+//---------------------------------------------------------------------
+
+/// A shell over a fake document opened from a real, writable path.
+fn app_opened_from(path: &Path) -> (OpdfApp, Context) {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(path).unwrap();
+    (OpdfApp::new(&ctx, opened), ctx)
+}
+
+#[test]
+fn saving_with_no_document_open_is_inert_and_reports_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, ctx) = app_opened_from(&directory.path().join("orig.pdf"));
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(
+        !directory.path().join("orig.pdf").exists(),
+        "saving with nothing open must not write the document that was closed"
+    );
+    assert!(
+        app.last_error().is_none(),
+        "saving with nothing open is a no-op, not a failure the user must be told about"
+    );
+}
+
+#[test]
+fn saving_writes_to_the_path_the_document_was_opened_from() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(origin.exists(), "Save must write back to the file the document came from");
+    assert!(app.last_error().is_none(), "a save that succeeded must not report an error");
+}
+
+#[test]
+fn save_as_writes_elsewhere_and_later_saves_follow_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let elsewhere = directory.path().join("elsewhere.pdf");
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(&origin).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing(elsewhere.clone())), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::SaveAs, &ctx);
+
+    assert!(elsewhere.exists(), "Save As must write to the path the dialog returned");
+    assert!(!origin.exists(), "Save As must not also write the file the document came from");
+
+    //--- a plain Save now has to follow the document to its new home ---
+    std::fs::remove_file(&elsewhere).unwrap();
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(elsewhere.exists(), "after Save As, a plain Save must write to the new path");
+    assert!(!origin.exists(), "after Save As, a plain Save must not go back to the original path");
+}
+
+#[test]
+fn saving_a_document_with_no_origin_asks_where_to_put_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let chosen = directory.path().join("named.pdf");
+    let ctx = Context::default();
+    //--- a synthetic document was never opened from a file, so Save has no path to reuse ---
+    let mut app = OpdfApp::new(&ctx, open_synthetic_document(4).unwrap())
+        .with_open_route(Box::new(FakeChooser::choosing(chosen.clone())), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(chosen.exists(), "Save on a document with no origin must fall back to asking, not fail silently");
+    assert!(app.last_error().is_none());
+}
+
+#[test]
+fn a_cancelled_save_dialog_writes_nothing_and_reports_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(&origin).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::cancelling()), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::SaveAs, &ctx);
+
+    assert!(!origin.exists(), "cancelling Save As must not fall back to writing the original file");
+    assert!(app.last_error().is_none(), "changing your mind is not a failure");
+}
+
+#[test]
+fn a_failed_save_leaves_the_document_open_and_says_why() {
+    let directory = tempfile::tempdir().unwrap();
+    //--- a directory that does not exist: the write fails for an ordinary, real reason ---
+    let unwritable = directory.path().join("no-such-directory").join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&unwritable);
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert_eq!(app.state().page_count(), 3, "a failed save must not close or disturb the document");
+    let message = app.last_error().unwrap_or_default();
+    assert!(
+        message.contains("orig.pdf"),
+        "the failure must name the file it could not write, got: {message}"
+    );
+}
+
+//---------------------------------------------------------------------
+// Editing, undo and redo
+//---------------------------------------------------------------------
+
+/// The rotation the document actually reports for the page at `index`.
+fn rotation_at(app: &OpdfApp, index: usize) -> Rotation {
+    app.state().snapshot().pages[index].rotation
+}
+
+#[test]
+fn rotating_a_page_is_undoable_and_redoable() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    let before = rotation_at(&app, 0);
+    assert_eq!(app.undo_depth(), 0, "a freshly opened document has nothing to undo");
+
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+    let rotated = rotation_at(&app, 0);
+    assert_eq!(rotated, before.rotated_by(Rotation::Quarter), "the page must actually turn");
+    assert_eq!(app.undo_depth(), 1, "an edit must be recorded on the undo stack");
+
+    app.apply_action(MenuAction::Undo, &ctx);
+
+    assert_eq!(rotation_at(&app, 0), before, "undo must put the page back");
+    assert_eq!(app.undo_depth(), 0);
+    assert_eq!(app.redo_depth(), 1);
+
+    app.apply_action(MenuAction::Redo, &ctx);
+
+    assert_eq!(rotation_at(&app, 0), rotated, "redo must turn the page again");
+    assert_eq!(app.undo_depth(), 1);
+    assert_eq!(app.redo_depth(), 0);
+}
+
+#[test]
+fn an_edit_reaches_the_document_and_not_only_the_snapshot() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    let revision = app.document().map(|document| document.revision());
+
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+    assert_ne!(
+        app.document().map(|document| document.revision()),
+        revision,
+        "the edit must be applied to the document itself; a snapshot the document does not back is a lie"
+    );
+    assert_eq!(
+        app.state().snapshot().revision,
+        app.document().map(|document| document.revision()).unwrap_or_default(),
+        "the snapshot the shell draws must be the one the document is at"
+    );
+}
+
+#[test]
+fn undo_and_redo_are_inert_with_nothing_to_undo() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    app.apply_action(MenuAction::Undo, &ctx);
+    app.apply_action(MenuAction::Redo, &ctx);
+
+    assert_eq!(app.undo_depth(), 0);
+    assert_eq!(app.redo_depth(), 0);
+    assert!(app.last_error().is_none(), "pressing undo with an empty history is not a failure");
+}
+
+#[test]
+fn opening_another_document_starts_a_fresh_history() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    assert_eq!(app.undo_depth(), 1);
+
+    app.open_path(&FakeOpener::with_pages(5), Path::new("b.pdf"));
+
+    assert_eq!(
+        app.undo_depth(),
+        0,
+        "an entry addresses pages of the document it was recorded against; applying it to another document would address the wrong pages"
+    );
+    assert_eq!(app.redo_depth(), 0);
+}
+
+//---------------------------------------------------------------------
+// Compaction — F16
+//---------------------------------------------------------------------
+//
+// A compacting save purges unreferenced objects, and a page deleted in this
+// session is exactly that: it sits in the trash, referenced only by the undo
+// entry that would restore it. After a compaction that entry cannot succeed —
+// since Track A's fix the compacted bytes become the document's base, so a
+// queued RestorePage is unambiguously dead. The user must therefore be asked
+// first, and on confirming, the history must be discarded rather than left to
+// fail when they press undo.
+
+/// A shell over a fake document, opened from a real path, with one page deleted.
+///
+/// The deletion is what puts a page in the trash, which is what makes a
+/// compaction destructive. Without it these tests would prove nothing.
+fn app_with_a_deleted_page(path: &Path) -> (OpdfApp, Context) {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(path).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::DeletePage, &ctx);
+    assert_eq!(app.state().page_count(), 2, "the deletion must land before the test means anything");
+    assert_eq!(app.undo_depth(), 1, "the deletion must be undoable before the test means anything");
+    (app, ctx)
+}
+
+#[test]
+fn compacting_asks_before_it_destroys_undo_of_a_deletion() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&origin);
+
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    assert!(app.compaction_pending(), "Compact must ask before it discards the user's history");
+    assert!(!origin.exists(), "Compact must write nothing until the user has confirmed");
+    assert_eq!(app.undo_depth(), 1, "merely asking must not cost the history");
+}
+
+/// The F16 regression test.
+///
+/// Verified to fail against a build of this same code with the `clear()` call
+/// removed — a test that passes either way would prove nothing.
+#[test]
+fn confirming_a_compaction_clears_the_undo_stack() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&origin);
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    app.confirm_compaction();
+
+    assert!(origin.exists(), "confirming must actually write the compacted document");
+    assert!(!app.compaction_pending(), "the dialog must close once it has been answered");
+    assert_eq!(
+        app.undo_depth(),
+        0,
+        "compaction purged the trashed page, so the queued RestorePage is dead; leaving it on the stack \
+         hands the user an undo that fails instead of an undo that is honestly gone"
+    );
+    assert_eq!(app.redo_depth(), 0, "a redo entry can resolve to RestorePage just as an undo entry can");
+}
+
+#[test]
+fn cancelling_a_compaction_writes_nothing_and_keeps_the_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&origin);
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    app.cancel_compaction();
+
+    assert!(!origin.exists(), "cancelling must write nothing at all");
+    assert!(!app.compaction_pending());
+    assert_eq!(app.undo_depth(), 1, "cancelling must leave the history exactly as it was");
+
+    //--- and the history must still work, not merely still be counted ---
+    app.apply_action(MenuAction::Undo, &ctx);
+    assert_eq!(app.state().page_count(), 3, "the deleted page must come back");
+    assert!(app.last_error().is_none());
+}
+
+/// A compaction that fails must leave the history intact, mirroring `opdf-pdf`,
+/// where a failed compaction leaves the trash intact. Clearing the stack after a
+/// write that never happened would discard history for nothing.
+#[test]
+fn a_failed_compaction_keeps_the_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let unwritable = directory.path().join("no-such-directory").join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&unwritable);
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    app.confirm_compaction();
+
+    assert_eq!(app.undo_depth(), 1, "the compaction failed, so nothing was purged and nothing may be discarded");
+    let message = app.last_error().unwrap_or_default();
+    assert!(message.contains("orig.pdf"), "the failure must name the file, got: {message}");
+}
+
+#[test]
+fn a_compaction_the_user_never_confirmed_cannot_be_confirmed_into_a_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, _ctx) = app_with_a_deleted_page(&origin);
+
+    //--- no Compact action was raised, so there is nothing to confirm ---
+    app.confirm_compaction();
+
+    assert!(!origin.exists(), "confirming a dialog that was never raised must not write the document");
+    assert_eq!(app.undo_depth(), 1, "nor may it cost the history");
+}
+
+//---------------------------------------------------------------------
+// Unsaved changes
+//---------------------------------------------------------------------
+
+#[test]
+fn a_freshly_opened_document_has_nothing_unsaved() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let app = OpdfApp::new(&ctx, opened);
+    assert!(!app.has_unsaved_changes(), "opening a file does not modify it");
+}
+
+#[test]
+fn closing_with_unsaved_edits_asks_before_discarding_them() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    assert!(app.has_unsaved_changes());
+
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    assert_eq!(app.discard_prompt(), Some(ExitIntent::Close), "closing must ask rather than discard silently");
+    assert_eq!(app.state().page_count(), 3, "the document must still be open while the question stands");
+}
+
+#[test]
+fn closing_a_clean_document_does_not_ask() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    assert_eq!(app.discard_prompt(), None, "there is nothing to lose, so there is nothing to ask about");
+    assert_eq!(app.state().page_count(), 0, "a clean document must close immediately");
+}
+
+#[test]
+fn quitting_and_opening_with_unsaved_edits_both_ask_first() {
+    for (action, expected) in [(MenuAction::Quit, ExitIntent::Quit), (MenuAction::OpenDocument, ExitIntent::Open)] {
+        let ctx = Context::default();
+        let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+        let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing("other.pdf")), Box::new(FakeOpener::with_pages(9)));
+        app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+        app.apply_action(action, &ctx);
+
+        assert_eq!(app.discard_prompt(), Some(expected), "{action:?} must ask before it abandons unsaved edits");
+        assert_eq!(app.state().page_count(), 3, "{action:?} must not have gone through yet");
+    }
+}
+
+#[test]
+fn confirming_the_discard_goes_through_with_it() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    app.confirm_discard(&ctx);
+
+    assert_eq!(app.state().page_count(), 0, "confirming must actually close the document");
+    assert_eq!(app.discard_prompt(), None);
+}
+
+#[test]
+fn cancelling_the_discard_keeps_the_document_and_its_edits() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    app.cancel_discard();
+
+    assert_eq!(app.state().page_count(), 3, "cancelling must leave the document exactly where it was");
+    assert_eq!(app.discard_prompt(), None);
+    assert!(app.has_unsaved_changes(), "cancelling does not save; the edits are still unsaved");
+    assert_eq!(app.undo_depth(), 1);
+}
+
+#[test]
+fn saving_makes_the_document_clean_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    assert!(app.has_unsaved_changes());
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(!app.has_unsaved_changes(), "a saved document has nothing outstanding");
+
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+    assert_eq!(app.discard_prompt(), None, "a saved document must close without a question");
+    assert_eq!(app.state().page_count(), 0);
+}
+
+#[test]
+fn editing_after_a_save_makes_the_document_dirty_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::Save, &ctx);
+
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+    assert!(app.has_unsaved_changes(), "an edit after a save is unsaved work like any other");
+}
+
+/// Undoing back to the state that was saved is genuinely clean again — the
+/// comparison is against a revision, and undo advances the revision rather than
+/// rewinding it, so this is the case a naive "dirty flag" gets wrong in the
+/// opposite direction. Being asked about work that no longer differs is a
+/// nuisance, not a data-loss risk, so erring here is acceptable; what matters is
+/// that the shell never *fails* to ask.
+#[test]
+fn undoing_back_to_the_saved_state_still_errs_toward_asking() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+    app.apply_action(MenuAction::Save, &ctx);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::Undo, &ctx);
+
+    assert!(
+        app.has_unsaved_changes(),
+        "the revision moved on, so the shell asks; asking needlessly is safe, failing to ask is not"
+    );
 }

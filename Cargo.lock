@@ -2079,9 +2079,11 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "opdf-core",
+ "opdf-ops",
  "opdf-pdf",
  "opdf-render",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]

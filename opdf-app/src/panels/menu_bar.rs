@@ -9,8 +9,26 @@
 pub enum MenuAction {
     /// Open a document from disk. Not implemented until Track A lands.
     OpenDocument,
+    /// Write the document back to where it was opened from, as an incremental update.
+    Save,
+    /// Write the document to a path the user picks, as an incremental update.
+    SaveAs,
     /// Close the open document and show the empty state.
     CloseDocument,
+    /// Reverse the most recent edit.
+    Undo,
+    /// Reapply the most recently undone edit.
+    Redo,
+    /// Turn the current page a quarter turn clockwise. A document edit, unlike
+    /// [`MenuAction::RotateViewClockwise`].
+    RotatePageClockwise,
+    /// Delete the current page. Undoable until a compaction purges the trash.
+    DeletePage,
+    /// Rewrite the document without its unreferenced objects.
+    ///
+    /// Destroys undo of every deletion in this session, so the shell asks before
+    /// it happens rather than performing it directly.
+    Compact,
     /// Exit the application.
     Quit,
     /// Replace the document with a freshly generated synthetic one of this many pages.
@@ -48,7 +66,14 @@ impl MenuAction {
     pub fn label(&self) -> String {
         match self {
             Self::OpenDocument => "Open document".to_owned(),
+            Self::Save => "Save".to_owned(),
+            Self::SaveAs => "Save as…".to_owned(),
             Self::CloseDocument => "Close document".to_owned(),
+            Self::Undo => "Undo".to_owned(),
+            Self::Redo => "Redo".to_owned(),
+            Self::RotatePageClockwise => "Rotate page clockwise".to_owned(),
+            Self::DeletePage => "Delete page".to_owned(),
+            Self::Compact => "Save compacted…".to_owned(),
             Self::Quit => "Quit".to_owned(),
             Self::GenerateSynthetic(page_count) => format!("Generate {page_count} synthetic pages"),
             Self::ZoomIn => "Zoom in".to_owned(),
@@ -85,6 +110,13 @@ pub fn show_menu_bar(ui: &mut egui::Ui) -> Option<MenuAction> {
                 ui.close();
             }
             ui.separator();
+            for action in [MenuAction::Save, MenuAction::SaveAs, MenuAction::Compact] {
+                if ui.button(action.label()).clicked() {
+                    chosen = Some(action);
+                    ui.close();
+                }
+            }
+            ui.separator();
             for page_count in [12_usize, 120, 1_200] {
                 let action = MenuAction::GenerateSynthetic(page_count);
                 if ui.button(action.label()).clicked() {
@@ -100,6 +132,22 @@ pub fn show_menu_bar(ui: &mut egui::Ui) -> Option<MenuAction> {
             if ui.button(MenuAction::Quit.label()).clicked() {
                 chosen = Some(MenuAction::Quit);
                 ui.close();
+            }
+        });
+
+        ui.menu_button("Edit", |ui| {
+            for action in [MenuAction::Undo, MenuAction::Redo] {
+                if ui.button(action.label()).clicked() {
+                    chosen = Some(action);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            for action in [MenuAction::RotatePageClockwise, MenuAction::DeletePage] {
+                if ui.button(action.label()).clicked() {
+                    chosen = Some(action);
+                    ui.close();
+                }
             }
         });
 
@@ -149,9 +197,16 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const EVERY_ACTION: [MenuAction; 17] = [
+    const EVERY_ACTION: [MenuAction; 24] = [
         MenuAction::OpenDocument,
+        MenuAction::Save,
+        MenuAction::SaveAs,
         MenuAction::CloseDocument,
+        MenuAction::Undo,
+        MenuAction::Redo,
+        MenuAction::RotatePageClockwise,
+        MenuAction::DeletePage,
+        MenuAction::Compact,
         MenuAction::Quit,
         MenuAction::GenerateSynthetic(12),
         MenuAction::ZoomIn,

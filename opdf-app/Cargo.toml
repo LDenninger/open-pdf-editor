@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 opdf-core = { path = "../opdf-core" }
+opdf-ops = { path = "../opdf-ops" }
 opdf-pdf = { path = "../opdf-pdf" }
 opdf-render = { path = "../opdf-render" }
 egui = "0.32"
@@ -26,3 +27,4 @@ rfd = "0.17"
 
 [dev-dependencies]
 opdf-core = { path = "../opdf-core", features = ["contract-tests"] }
+tempfile = "3"

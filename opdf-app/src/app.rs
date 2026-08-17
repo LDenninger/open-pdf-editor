@@ -4,14 +4,16 @@
 //! This module routes; it does not compute. Everything it decides was decided by
 //! [`crate::layout`], [`crate::zoom`], [`crate::scheduler`], and [`crate::viewer`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use opdf_core::command::Command;
 use opdf_core::document::{Document, DocumentSnapshot};
 use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
+use opdf_ops::{RemovePage, SetRotation, UndoStack};
 
-use crate::opener::{DocumentOpener, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
+use crate::opener::{DocumentOpener, EditableDocument, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
 use crate::panels::menu_bar::MenuAction;
 use crate::panels::status_bar::RenderStatus;
 use crate::panels::toolbar::ToolbarOutcome;
@@ -27,11 +29,64 @@ pub const CANVAS_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// keep its own working set even while the canvas churns.
 pub const RAIL_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
+/// Which of the two save paths a write takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaveMode {
+    /// Append the changes to the original bytes, preserving everything else.
+    Incremental,
+    /// Serialize the document afresh, discarding unreferenced objects.
+    ///
+    /// Discards trashed pages along with them, which is why reaching this
+    /// requires a confirmation and costs the undo history.
+    Compacted,
+}
+
+/// What the user asked for that would abandon the open document.
+///
+/// Each of these ends the document's life on screen, so each has to be held back
+/// until the user has answered for the edits they have not saved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExitIntent {
+    /// Close the document and show the empty state.
+    Close,
+    /// Exit the application.
+    Quit,
+    /// Open a different document in its place.
+    Open,
+}
+
 /// The application.
 pub struct OpdfApp {
     theme: Theme,
     state: ViewerState,
-    document: Option<Box<dyn Document>>,
+    document: Option<Box<dyn EditableDocument>>,
+    document_path: Option<PathBuf>,
+    /// The edit history for the document currently open, and only that one.
+    ///
+    /// A queued entry names pages by [`opdf_core::PageId`], which is meaningful
+    /// within one document, so the stack is emptied whenever the document is
+    /// replaced. It is typed over the trait object rather than a concrete
+    /// document because that is what the shell owns; `Command` and `UndoStack`
+    /// accept a `?Sized` document precisely so this is possible.
+    undo: UndoStack<dyn EditableDocument>,
+    /// Whether the shell is waiting for the user to confirm a compacting save.
+    ///
+    /// Raised by [`MenuAction::Compact`] and answered by
+    /// [`OpdfApp::confirm_compaction`] or [`OpdfApp::cancel_compaction`]. Nothing
+    /// is written while this is set: the write is what the user is being asked
+    /// about.
+    compaction_pending: bool,
+    /// The revision the document was at when it was last written to disk.
+    ///
+    /// Compared against [`Document::revision`] to tell whether there is anything
+    /// to lose. The contract requires every mutation to advance the revision and
+    /// every failure and read-only call to leave it alone, which is exactly the
+    /// property a dirty flag needs and exactly what a hand-maintained one gets
+    /// wrong. `None` for a document that has never been written, whose every
+    /// edit is therefore unsaved.
+    saved_revision: Option<u64>,
+    /// The exit the user asked for and has not yet answered for.
+    exit_pending: Option<ExitIntent>,
     service: Box<dyn RenderService>,
     canvas_cache: TextureCache,
     rail_cache: TextureCache,
@@ -53,10 +108,18 @@ impl OpdfApp {
     pub fn new(ctx: &egui::Context, opened: OpenedDocument) -> Self {
         let theme = Theme::dark();
         crate::theme::apply_theme(ctx, &theme);
+        //--- opening a file does not modify it, so it starts clean at whatever
+        //--- revision it was parsed at ---
+        let saved_revision = Some(opened.document.revision());
         Self {
             state: ViewerState::new(opened.snapshot, &theme),
             theme,
             document: Some(opened.document),
+            document_path: opened.path,
+            undo: UndoStack::new(),
+            compaction_pending: false,
+            saved_revision,
+            exit_pending: None,
             service: opened.service,
             canvas_cache: TextureCache::new(CANVAS_CACHE_BUDGET_BYTES),
             rail_cache: TextureCache::new(RAIL_CACHE_BUDGET_BYTES),
@@ -92,7 +155,7 @@ impl OpdfApp {
     /// later edit or save has something to act on, and so a test can check that
     /// the shell is holding the document it was handed.
     pub fn document(&self) -> Option<&dyn Document> {
-        self.document.as_deref()
+        self.document.as_deref().map(|document| document as &dyn Document)
     }
 
     /// The canvas's texture cache, for the status bar and for tests.
@@ -119,7 +182,7 @@ impl OpdfApp {
     /// service is likewise kept for its own reasons: the rasterizer resolves page
     /// positions against the file it opened, which is a different file now.
     pub fn open_document(&mut self, opened: OpenedDocument) {
-        self.install_document(Some(opened.document), opened.service, opened.snapshot);
+        self.install_document(Some(opened.document), opened.path, opened.service, opened.snapshot);
     }
 
     /// Open `path` through `opener`, replacing whatever is currently open.
@@ -169,13 +232,27 @@ impl OpdfApp {
     /// closing cannot forget a step opening remembers.
     fn close_document(&mut self) {
         let snapshot = DocumentSnapshot::default();
-        self.install_document(None, Box::new(FakeRenderService::new(snapshot.clone())), snapshot);
+        self.install_document(None, None, Box::new(FakeRenderService::new(snapshot.clone())), snapshot);
     }
 
-    /// The one place a document, its service, and its snapshot are installed
-    /// together.
-    fn install_document(&mut self, document: Option<Box<dyn Document>>, service: Box<dyn RenderService>, snapshot: DocumentSnapshot) {
+    /// The one place a document, its origin, its service, and its snapshot are
+    /// installed together.
+    fn install_document(
+        &mut self,
+        document: Option<Box<dyn EditableDocument>>,
+        path: Option<PathBuf>,
+        service: Box<dyn RenderService>,
+        snapshot: DocumentSnapshot,
+    ) {
         self.document = document;
+        //--- the path travels with the document, so closing or replacing one
+        //--- cannot leave Save aimed at the previous document's file ---
+        self.document_path = path;
+        //--- a queued entry addresses pages of the document it was recorded
+        //--- against; against this one those ids mean nothing, or worse, something ---
+        self.undo.clear();
+        //--- whatever arrives here arrives as it is on disk, so it starts clean ---
+        self.saved_revision = self.document.as_deref().map(Document::revision);
         //--- the previous service is dropped here, which is what keeps a late
         //--- response from the old document out of the new one's cache ---
         self.service = service;
@@ -183,6 +260,285 @@ impl OpdfApp {
             .open_document(snapshot, &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]);
         self.state.scroll_to_page(0, 0.0);
         self.page_entry = "1".to_owned();
+    }
+
+    /// Where the open document will be written by Save, if it has an origin.
+    pub fn document_path(&self) -> Option<&Path> {
+        self.document_path.as_deref()
+    }
+
+    /// Write the open document to `path`, remembering it as the document's home.
+    ///
+    /// Does nothing at all when no document is open: Save with an empty window is
+    /// a no-op, not an error worth interrupting anyone over. A failed write is
+    /// reported through `last_error` and leaves the document exactly as it was —
+    /// the file on disk may be damaged, but the copy the user is editing is not,
+    /// and that is the copy they can still save elsewhere.
+    ///
+    /// Returns whether the document was written.
+    pub fn save_to(&mut self, path: &Path, mode: SaveMode) -> bool {
+        let Some(document) = self.document.as_mut() else {
+            return false;
+        };
+        let result = match mode {
+            SaveMode::Incremental => document.save_incremental(path),
+            SaveMode::Compacted => document.save_compacted(path),
+        };
+        match result {
+            Ok(()) => {
+                let revision = document.revision();
+                self.document_path = Some(path.to_owned());
+                //--- what is on disk is now what is in memory, up to this revision ---
+                self.saved_revision = Some(revision);
+                self.last_error = None;
+                true
+            }
+            Err(error) => {
+                self.last_error = Some(format!("could not save {}: {error}", path.display()));
+                false
+            }
+        }
+    }
+
+    /// Save to the document's own path, asking for one if it has none.
+    ///
+    /// Incremental is the default path for a reason worth restating here: it
+    /// appends to the original bytes, so every structure the implementation does
+    /// not model survives, and it does not purge the trash, so undo of a deletion
+    /// survives it too. Compaction does neither, which is why it is a separate,
+    /// confirmed action rather than a faster default.
+    fn save_in_place(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+        match self.document_path.clone() {
+            Some(path) => {
+                self.save_to(&path, SaveMode::Incremental);
+            }
+            None => self.save_to_chosen_path(),
+        }
+    }
+
+    /// Ask where to write the document, then write it, doing nothing if the user
+    /// cancels.
+    ///
+    /// The check for an open document comes *before* the dialog, not after it:
+    /// asking someone to name a file and then writing nothing to it is worse than
+    /// doing nothing at all, and with no document open there is nothing to name.
+    fn save_to_chosen_path(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+        let Some(path) = self.chooser.choose_save_path() else {
+            return;
+        };
+        self.save_to(&path, SaveMode::Incremental);
+    }
+
+    /// How many edits can currently be undone.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.undo_depth()
+    }
+
+    /// How many undone edits can currently be redone.
+    pub fn redo_depth(&self) -> usize {
+        self.undo.redo_depth()
+    }
+
+    /// Apply `command` to the open document through the undo stack, then show the
+    /// result.
+    ///
+    /// Every document edit goes through here, so that no edit can reach the
+    /// document without being recorded, and none can be recorded without the
+    /// canvas being told to redraw the revision it produced.
+    fn apply_command(&mut self, command: Box<dyn Command<dyn EditableDocument>>) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if let Err(error) = self.undo.apply(document.as_mut(), command) {
+            self.last_error = Some(format!("could not apply the edit: {error}"));
+            return;
+        }
+        self.resnapshot();
+    }
+
+    /// Undo the most recent edit, if there is one.
+    fn undo_edit(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        match self.undo.undo(document.as_mut()) {
+            Ok(true) => self.resnapshot(),
+            //--- nothing to undo is not a failure; it is an empty history ---
+            Ok(false) => {}
+            Err(error) => self.last_error = Some(format!("could not undo: {error}")),
+        }
+    }
+
+    /// Redo the most recently undone edit, if there is one.
+    fn redo_edit(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        match self.undo.redo(document.as_mut()) {
+            Ok(true) => self.resnapshot(),
+            Ok(false) => {}
+            Err(error) => self.last_error = Some(format!("could not redo: {error}")),
+        }
+    }
+
+    /// Re-derive the snapshot from the document after an edit and hand it to the
+    /// viewer.
+    ///
+    /// This is [`ViewerState::replace_snapshot`], not `open_document`: the
+    /// document is the same one, so tiles still valid at the new revision must
+    /// survive, which is what stops an undo from blanking the canvas.
+    fn resnapshot(&mut self) {
+        let Some(document) = self.document.as_deref() else {
+            return;
+        };
+        match DocumentSnapshot::of(document) {
+            Ok(snapshot) => self
+                .state
+                .replace_snapshot(snapshot, &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]),
+            Err(error) => self.last_error = Some(format!("could not read the edited document: {error}")),
+        }
+    }
+
+    //---------------------------------------------------------------------
+    // Unsaved changes
+    //---------------------------------------------------------------------
+
+    /// Whether the document has been edited since it was last written to disk.
+    ///
+    /// Read from [`Document::revision`] rather than from a flag the shell
+    /// maintains: the contract requires every mutation to advance it and every
+    /// failed or read-only call to leave it alone, so it cannot drift out of step
+    /// with the document the way a hand-set flag does. Undo advances the revision
+    /// too, so undoing back to the saved state still reports unsaved changes —
+    /// the safe direction to be wrong in.
+    pub fn has_unsaved_changes(&self) -> bool {
+        match self.document.as_deref() {
+            Some(document) => self.saved_revision != Some(document.revision()),
+            None => false,
+        }
+    }
+
+    /// The exit the shell is holding back until the user answers for their
+    /// unsaved edits.
+    pub fn discard_prompt(&self) -> Option<ExitIntent> {
+        self.exit_pending
+    }
+
+    /// Whether `intent` may go ahead immediately, raising the prompt if not.
+    ///
+    /// Returns `true` when there is nothing to lose. Every route out of a
+    /// document goes through here, so none of them can forget to ask.
+    fn may_abandon_document(&mut self, intent: ExitIntent) -> bool {
+        if !self.has_unsaved_changes() {
+            return true;
+        }
+        self.exit_pending = Some(intent);
+        false
+    }
+
+    /// Go ahead with the exit the user was asked about, abandoning the edits.
+    pub fn confirm_discard(&mut self, ctx: &egui::Context) {
+        let Some(intent) = self.exit_pending.take() else {
+            return;
+        };
+        match intent {
+            ExitIntent::Close => self.close_document(),
+            ExitIntent::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            //--- the file dialog comes after the question, not before it: there is
+            //--- no point naming a file for an open the user may still call off ---
+            ExitIntent::Open => self.open_chosen_path(),
+        }
+    }
+
+    /// Think better of the exit, keeping the document and its edits.
+    pub fn cancel_discard(&mut self) {
+        self.exit_pending = None;
+    }
+
+    //---------------------------------------------------------------------
+    // Compaction, and the history it costs — F16
+    //---------------------------------------------------------------------
+
+    /// Whether the shell is waiting for an answer about a compacting save.
+    pub fn compaction_pending(&self) -> bool {
+        self.compaction_pending
+    }
+
+    /// Ask the user whether to compact, writing nothing yet.
+    ///
+    /// Compaction is the one save that cannot be silently offered. It purges
+    /// unreferenced objects, and a page deleted in this session is exactly that:
+    /// it sits in the trash, referenced only by the undo entry that would put it
+    /// back. Since the compacted bytes become the document's base, that entry is
+    /// dead afterwards — so the user is told what it costs before it happens.
+    fn ask_to_compact(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+        self.compaction_pending = true;
+    }
+
+    /// Go ahead with the compacting save the user was asked about.
+    ///
+    /// The history is cleared **only after** `save_compacted` reports success, so
+    /// a compaction that failed costs nothing — mirroring `opdf-pdf`, where a
+    /// failed compaction leaves the trash intact. Both stacks go: a redo entry
+    /// produced by undoing an insertion resolves to `RestorePage` just as an undo
+    /// entry produced by a deletion does, and a queued command is opaque, so
+    /// there is no way to keep only the survivors.
+    pub fn confirm_compaction(&mut self) {
+        if !self.compaction_pending {
+            return;
+        }
+        self.compaction_pending = false;
+        let path = match self.document_path.clone() {
+            Some(path) => Some(path),
+            None => self.chooser.choose_save_path(),
+        };
+        let Some(path) = path else {
+            return;
+        };
+        if self.save_to(&path, SaveMode::Compacted) {
+            self.undo.clear();
+        }
+    }
+
+    /// Think better of the compacting save, writing nothing and keeping the
+    /// history.
+    pub fn cancel_compaction(&mut self) {
+        self.compaction_pending = false;
+    }
+
+    /// Delete the page the user is looking at.
+    fn delete_current_page(&mut self) {
+        let Some(index) = self.state.current_page() else {
+            return;
+        };
+        let Some(page) = self.state.snapshot().pages.get(index) else {
+            return;
+        };
+        self.apply_command(Box::new(RemovePage { page: page.id }));
+    }
+
+    /// Turn the page the user is looking at a quarter turn clockwise.
+    fn rotate_current_page(&mut self) {
+        let Some(index) = self.state.current_page() else {
+            return;
+        };
+        let Some(page) = self.state.snapshot().pages.get(index) else {
+            return;
+        };
+        let command = SetRotation {
+            page: page.id,
+            rotation: page.rotation.rotated_by(Rotation::Quarter),
+        };
+        self.apply_command(Box::new(command));
     }
 
     /// Replace the document with a freshly generated synthetic one.
@@ -205,9 +561,28 @@ impl OpdfApp {
         let last_page = self.state.page_count().saturating_sub(1);
         let current = self.state.current_page().unwrap_or(0);
         match action {
-            MenuAction::OpenDocument => self.open_chosen_path(),
-            MenuAction::CloseDocument => self.close_document(),
-            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuAction::OpenDocument => {
+                if self.may_abandon_document(ExitIntent::Open) {
+                    self.open_chosen_path();
+                }
+            }
+            MenuAction::Save => self.save_in_place(),
+            MenuAction::SaveAs => self.save_to_chosen_path(),
+            MenuAction::CloseDocument => {
+                if self.may_abandon_document(ExitIntent::Close) {
+                    self.close_document();
+                }
+            }
+            MenuAction::Undo => self.undo_edit(),
+            MenuAction::Redo => self.redo_edit(),
+            MenuAction::RotatePageClockwise => self.rotate_current_page(),
+            MenuAction::DeletePage => self.delete_current_page(),
+            MenuAction::Compact => self.ask_to_compact(),
+            MenuAction::Quit => {
+                if self.may_abandon_document(ExitIntent::Quit) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
             MenuAction::ZoomIn => {
                 self.state.fit_mode = FitMode::Free;
@@ -364,6 +739,83 @@ impl OpdfApp {
         if self.state.sync_fit_to_viewport() {
             //--- the refit lands after this frame's shapes, so ask for the frame that draws it ---
             ctx.request_repaint();
+        }
+
+        //--- unsaved edits are not discarded without a word ---
+        if let Some(intent) = self.exit_pending {
+            let mut confirmed = false;
+            let mut cancelled = false;
+            let mut save_first = false;
+            egui::Modal::new(egui::Id::new("opdf_unsaved_changes")).show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Save your changes?");
+                ui.add_space(8.0);
+                let what = match intent {
+                    ExitIntent::Close => "closing this document",
+                    ExitIntent::Quit => "quitting",
+                    ExitIntent::Open => "opening another document",
+                };
+                ui.label(format!("You have edits that have not been saved. {what} will discard them."));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        save_first = true;
+                    }
+                });
+            });
+            if save_first {
+                self.save_in_place();
+                //--- only go through with the exit if the save actually worked ---
+                if self.has_unsaved_changes() {
+                    self.cancel_discard();
+                } else {
+                    self.confirm_discard(ctx);
+                }
+            } else if confirmed {
+                self.confirm_discard(ctx);
+            } else if cancelled {
+                self.cancel_discard();
+            }
+        }
+
+        //--- the compaction warning: what it costs, in the user's terms, before it costs it ---
+        if self.compaction_pending {
+            let mut confirmed = false;
+            let mut cancelled = false;
+            egui::Modal::new(egui::Id::new("opdf_compaction_warning")).show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Save compacted?");
+                ui.add_space(8.0);
+                ui.label(
+                    "Compacting rewrites the file without the parts nothing refers to any more. \
+                     Pages you deleted in this session are among them, so they become permanently \
+                     unrecoverable.",
+                );
+                ui.add_space(4.0);
+                ui.label("Your undo history will be discarded. This cannot be undone.");
+                ui.add_space(4.0);
+                ui.colored_label(self.theme.text_muted, "Save (incremental) keeps both your deleted pages and your undo history.");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                    if ui.button("Compact and discard history").clicked() {
+                        confirmed = true;
+                    }
+                });
+            });
+            if confirmed {
+                self.confirm_compaction();
+            } else if cancelled {
+                self.cancel_compaction();
+            }
         }
 
         if self.show_about {
