@@ -2,12 +2,14 @@
 //! filing it in the cache — or throwing it away because the document has moved on.
 //!
 //! This is where the **stale-tile guard** lives. A response carries the request it
-//! answers, and that request carries the revision it was built at. A response whose
-//! revision is not the one currently being drawn is discarded here rather than
-//! cached, so a tile rasterized before a structural change can never reach the
-//! screen after one.
+//! answers, and that request names both the document and the revision it was built
+//! against. A response that answers either a superseded revision or a *different
+//! document* is discarded here rather than cached, so neither a tile rasterized
+//! before a structural change nor a tile belonging to a document the user has
+//! closed can reach the screen.
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
+use opdf_core::document::DocumentSnapshot;
 use opdf_core::render::{RenderRequest, RenderResponse, Tile};
 
 use crate::tiles::cache::TileCache;
@@ -48,32 +50,39 @@ pub fn build_color_image(tile: &Tile) -> ColorImage {
 
 /// A stable debug name for a texture, shown in egui's texture inspector.
 pub fn name_texture(request: &RenderRequest) -> String {
-    format!("tile:{}:r{}:s{}", request.page, request.revision, request.scale)
+    format!("tile:{}:{}:r{}:s{}", request.document, request.page, request.revision, request.scale)
 }
 
 //---------------------------------------------------------------------
 // Draining the render service
 //---------------------------------------------------------------------
 
-/// File every response into `cache`, discarding any that answers a revision other
-/// than `revision`, then evict down to budget.
+/// File every response into `cache`, discarding any that answers a different
+/// document or a superseded revision, then evict down to budget.
 ///
-/// `revision` must come from the [`opdf_core::document::DocumentSnapshot`] the
-/// caller is about to draw — not from a separately tracked field, which can drift
-/// from the snapshot and reintroduce the stale-tile bug the revision exists to
-/// prevent.
+/// `drawn` is the [`DocumentSnapshot`] the caller is about to draw. It is passed
+/// whole rather than as a loose document-and-revision pair so that the two cannot
+/// drift apart, and so that neither can drift from the structure being drawn —
+/// which is the stale-tile bug both fields exist to prevent.
 ///
 /// A `Failed` response is not an error the caller must handle: rasterization can
 /// fail per page without that being fatal to the document. The request is
 /// recorded as refused rather than merely cleared — a refusal is an answer, and
 /// asking again every frame is a loop that never settles — and the canvas draws
 /// that page as refused rather than as still loading.
-pub fn absorb_responses(cache: &mut TextureCache, ctx: &Context, revision: u64, responses: Vec<RenderResponse>, protected_since: u64) -> AbsorbReport {
-    absorb_responses_routed(&mut [cache], ctx, revision, responses, protected_since)
+pub fn absorb_responses(
+    cache: &mut TextureCache,
+    ctx: &Context,
+    drawn: &DocumentSnapshot,
+    responses: Vec<RenderResponse>,
+    protected_since: u64,
+) -> AbsorbReport {
+    absorb_responses_routed(&mut [cache], ctx, drawn, responses, protected_since)
 }
 
 /// File every response into **whichever cache asked for it**, discarding any that
-/// answers a revision other than `revision`, then evict every cache to budget.
+/// answers a different document or a superseded revision, then evict every cache
+/// to budget.
 ///
 /// A [`opdf_core::render::RenderService`] is a single worker owning a single
 /// document — the rasterizer is not thread-safe, so there can be only one — and
@@ -85,10 +94,22 @@ pub fn absorb_responses(cache: &mut TextureCache, ctx: &Context, revision: u64, 
 /// Filing everything into one cache instead is the bug this function exists to
 /// prevent: the unclaimed cache's requests stay pending forever and its surface
 /// draws placeholders that never resolve.
+///
+/// # The unclaimed response, and why `caches[0]` is now safe
+///
+/// A response nobody is pending on falls to the canvas. That fallback used to be
+/// the last hole in the stale-tile guard: a late answer from a *previous*
+/// document was unclaimed, and both documents started at revision zero with page
+/// ids from zero, so it passed the revision check and was stored as a tile of the
+/// document now open. It was safe only while "a new document means a new service,
+/// and the old one is dropped" held — a convention, enforced by nothing.
+///
+/// The document identity closes it: such a response names a document `drawn` does
+/// not, so it is discarded before it reaches any cache, whoever it falls to.
 pub fn absorb_responses_routed(
     caches: &mut [&mut TextureCache],
     ctx: &Context,
-    revision: u64,
+    drawn: &DocumentSnapshot,
     responses: Vec<RenderResponse>,
     protected_since: u64,
 ) -> AbsorbReport {
@@ -101,7 +122,7 @@ pub fn absorb_responses_routed(
             continue;
         };
 
-        if request.revision != revision {
+        if request.document != drawn.document || request.revision != drawn.revision {
             cache.clear_pending(&request);
             report.discarded += 1;
             continue;
@@ -132,14 +153,33 @@ pub fn absorb_responses_routed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opdf_core::document::DocumentId;
     use opdf_core::page::PageId;
 
     fn build_tile(width: u32, height: u32, fill: u8) -> Tile {
         Tile::new(width, height, vec![fill; (width * height * 4) as usize]).unwrap()
     }
 
+    /// The document identity every request in this module names, unless a test
+    /// deliberately builds a second document.
+    fn test_document() -> DocumentId {
+        static DOCUMENT: std::sync::OnceLock<DocumentId> = std::sync::OnceLock::new();
+        *DOCUMENT.get_or_init(DocumentId::new_unique)
+    }
+
     fn build_request(page: u64, revision: u64, scale: f32) -> RenderRequest {
-        RenderRequest::new(PageId::new(page), revision, scale).unwrap()
+        RenderRequest::new(test_document(), PageId::new(page), revision, scale).unwrap()
+    }
+
+    /// A snapshot naming the module's document at `revision`, for the `drawn`
+    /// argument. The page list is irrelevant here: absorbing files responses by
+    /// the request they answer, never by looking a page up.
+    fn drawn_at(revision: u64) -> DocumentSnapshot {
+        DocumentSnapshot {
+            document: test_document(),
+            pages: Vec::new(),
+            revision,
+        }
     }
 
     #[test]
@@ -171,7 +211,7 @@ mod tests {
         let report = absorb_responses(
             &mut cache,
             &ctx,
-            7,
+            &drawn_at(7),
             vec![RenderResponse::Ready {
                 request,
                 tile: build_tile(8, 8, 255),
@@ -193,7 +233,7 @@ mod tests {
         let report = absorb_responses(
             &mut cache,
             &ctx,
-            7,
+            &drawn_at(7),
             vec![RenderResponse::Ready {
                 request: stale,
                 tile: build_tile(8, 8, 255),
@@ -226,7 +266,7 @@ mod tests {
         let report = absorb_responses(
             &mut cache,
             &ctx,
-            7,
+            &drawn_at(7),
             vec![RenderResponse::Failed {
                 request,
                 reason: "damaged page".to_owned(),
@@ -255,7 +295,7 @@ mod tests {
             absorb_responses(
                 &mut cache,
                 &ctx,
-                7,
+                &drawn_at(7),
                 vec![RenderResponse::Ready {
                     request: build_request(ii, 7, 1.0),
                     tile: build_tile(16, 16, 255),
@@ -285,7 +325,7 @@ mod tests {
         let report = absorb_responses_routed(
             &mut [&mut canvas, &mut rail],
             &ctx,
-            7,
+            &drawn_at(7),
             vec![
                 RenderResponse::Ready {
                     request: page_request,
@@ -320,7 +360,7 @@ mod tests {
         let report = absorb_responses_routed(
             &mut [&mut canvas, &mut rail],
             &ctx,
-            7,
+            &drawn_at(7),
             vec![RenderResponse::Ready {
                 request: orphan,
                 tile: build_tile(8, 8, 255),
@@ -333,12 +373,61 @@ mod tests {
         assert!(rail.is_empty());
     }
 
+    /// F14, as it actually reached the screen.
+    ///
+    /// A response arrives from the document the user just closed. Nobody is
+    /// pending on it, so the routing falls back to `caches[0]` — and because both
+    /// documents allocate page ids from zero and start at revision zero, its
+    /// request is indistinguishable from one the *current* document would build.
+    /// It was stored, and the new document's page one was drawn from the old
+    /// document's pixels.
+    ///
+    /// The only thing that told the two apart was the document identity, which
+    /// the request did not carry.
+    #[test]
+    fn discards_an_unclaimed_response_from_a_document_that_is_no_longer_open() {
+        let ctx = Context::default();
+        let mut canvas = TextureCache::new(1 << 20);
+        let mut rail = TextureCache::new(1 << 20);
+
+        //--- the previous document: same page id, same revision, different document ---
+        let previous = DocumentId::new_unique();
+        assert_ne!(previous, test_document(), "the two documents must differ only in identity");
+        let late = RenderRequest::new(previous, PageId::new(1), 7, 1.0).unwrap();
+        let current = build_request(1, 7, 1.0);
+        assert_eq!(
+            (late.page, late.revision, late.scale),
+            (current.page, current.revision, current.scale),
+            "the two requests must agree on every field but the document, or this test proves nothing"
+        );
+
+        let frame = canvas.begin_frame();
+        let report = absorb_responses_routed(
+            &mut [&mut canvas, &mut rail],
+            &ctx,
+            &drawn_at(7),
+            vec![RenderResponse::Ready {
+                request: late,
+                tile: build_tile(8, 8, 255),
+            }],
+            frame,
+        );
+
+        assert_eq!(report.stored, 0, "a tile of a document that is no longer open must not be stored");
+        assert_eq!(report.discarded, 1, "it must be counted as discarded, not silently accepted");
+        assert!(
+            !canvas.contains(&current),
+            "the closed document's tile must not answer the open document's request for the same page"
+        );
+        assert!(canvas.is_empty(), "the unclaimed fallback to caches[0] must not launder a foreign tile");
+    }
+
     #[test]
     fn absorbs_an_empty_batch_without_touching_the_cache() {
         let ctx = Context::default();
         let mut cache = TextureCache::new(1 << 20);
         let frame = cache.begin_frame();
-        let report = absorb_responses(&mut cache, &ctx, 7, Vec::new(), frame);
+        let report = absorb_responses(&mut cache, &ctx, &drawn_at(7), Vec::new(), frame);
         assert_eq!(report, AbsorbReport::default(), "polling an idle service every frame must be free");
     }
 }
