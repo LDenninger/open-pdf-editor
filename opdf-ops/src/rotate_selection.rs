@@ -6,12 +6,22 @@ use crate::sequence::Sequence;
 use crate::set_rotation::SetRotation;
 
 /// Build a command that sets every page in `ids` to `rotation`, atomically.
+///
+/// An empty selection yields a command that changes nothing, on the same
+/// terms as [`crate::delete_selection`].
 pub fn rotate_selection<D: Document + 'static>(ids: &[PageId], rotation: Rotation) -> Box<dyn Command<D>> {
     let commands: Vec<Box<dyn Command<D>>> = ids
         .iter()
         .map(|&page| Box::new(SetRotation { page, rotation }) as Box<dyn Command<D>>)
         .collect();
-    Box::new(Sequence::new(format!("Rotate {} pages to {} degrees", ids.len(), rotation.degrees()), commands))
+    //--- the label goes into the undo menu, so it has to agree in number ---
+    let degrees = rotation.degrees();
+    let label = match ids.len() {
+        0 => format!("Rotate no pages to {degrees} degrees"),
+        1 => format!("Rotate 1 page to {degrees} degrees"),
+        count => format!("Rotate {count} pages to {degrees} degrees"),
+    };
+    Box::new(Sequence::new(label, commands))
 }
 
 #[cfg(test)]
@@ -45,6 +55,18 @@ mod tests {
         inverse.apply(&mut document).unwrap();
 
         assert_eq!(DocumentSnapshot::of(&document).unwrap().pages, before.pages);
+    }
+
+    #[test]
+    fn the_label_agrees_in_number_with_the_selection() {
+        let one: Box<dyn Command<VecDocument>> = rotate_selection(&[PageId::new(0)], Rotation::Quarter);
+        assert_eq!(one.label(), "Rotate 1 page to 90 degrees");
+
+        let several: Box<dyn Command<VecDocument>> = rotate_selection(&[PageId::new(0), PageId::new(1)], Rotation::Half);
+        assert_eq!(several.label(), "Rotate 2 pages to 180 degrees");
+
+        let none: Box<dyn Command<VecDocument>> = rotate_selection(&[], Rotation::None);
+        assert_eq!(none.label(), "Rotate no pages to 0 degrees");
     }
 
     #[test]
