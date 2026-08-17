@@ -7,7 +7,12 @@
 
 /// Smallest zoom the viewer allows. Below this a page is unreadable and the
 /// tiles are too small to be worth caching.
-pub const MIN_ZOOM: f32 = 0.1;
+///
+/// This is the bottom of [`ZOOM_STEPS`] on purpose. An off-ladder minimum is a
+/// stop the ladder cannot reach but [`step_zoom_out`] lands on anyway, so the last
+/// click of zoom-out jumps further than every click before it — at 0.1 it put
+/// eighteen pages on screen against a frame budget of eight.
+pub const MIN_ZOOM: f32 = ZOOM_STEPS[0];
 
 /// Largest zoom the viewer allows.
 ///
@@ -183,6 +188,17 @@ mod tests {
         assert_eq!(step_zoom_out(1.0), 0.75);
         assert_eq!(step_zoom_in(MAX_ZOOM), MAX_ZOOM, "stepping in at the top must stay put, not wrap");
         assert_eq!(step_zoom_out(MIN_ZOOM), MIN_ZOOM, "stepping out at the bottom must stay put");
+    }
+
+    #[test]
+    fn bounds_the_ladder_at_both_ends_with_a_ladder_stop() {
+        assert_eq!(
+            ZOOM_STEPS[0], MIN_ZOOM,
+            "an off-ladder minimum makes the last zoom-out click jump further than the rest"
+        );
+        assert_eq!(ZOOM_STEPS[ZOOM_STEPS.len() - 1], MAX_ZOOM);
+        let bottom = ZOOM_STEPS.iter().fold(1.0_f32, |zoom, _| step_zoom_out(zoom));
+        assert_eq!(bottom, MIN_ZOOM, "walking the ladder down must settle exactly on the minimum");
     }
 
     #[test]
