@@ -11,6 +11,11 @@
 //! Layout, zoom, scheduling, and caching are plain functions in their own modules
 //! so that they are testable without a display; the widget modules under
 //! `panels` are a thin drawing layer over them.
+//!
+//! The shell also owns the edit history: an [`opdf_ops::UndoStack`] over the same
+//! document it holds. That is where the warning before a compacting save lives,
+//! because the shell is the only layer that both drives a save and owns the
+//! history that save invalidates — see [`crate::app::OpdfApp::confirm_compaction`].
 
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
@@ -36,7 +41,10 @@ pub const APPLICATION_NAME: &str = "opdf";
 
 /// A one-line description of this build, for the status bar and `--version`.
 pub fn describe_build() -> String {
-    format!("{APPLICATION_NAME} {} (viewer only: no editing, no text selection)", env!("CARGO_PKG_VERSION"))
+    format!(
+        "{APPLICATION_NAME} {} (rotate, delete, undo and save; no text selection, no search)",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 #[cfg(test)]
@@ -51,8 +59,12 @@ mod tests {
             "the description must lead with the binary name, got: {description}"
         );
         assert!(
-            description.contains("viewer only"),
-            "this build cannot edit or select text and must say so rather than imply otherwise, got: {description}"
+            !description.contains("viewer only"),
+            "this build edits and saves; calling itself a viewer understates it, got: {description}"
+        );
+        assert!(
+            description.contains("no text selection"),
+            "text selection and search are still missing and must be named rather than implied, got: {description}"
         );
     }
 }
