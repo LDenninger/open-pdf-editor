@@ -16,7 +16,7 @@ use crate::sequence::Sequence;
 /// error — the selection simply had nothing in it — and `UndoStack` declines
 /// to record a command that changes nothing, so it costs the user neither an
 /// undo step nor their redo branch.
-pub fn delete_selection<D: Document + 'static>(ids: &[PageId]) -> Box<dyn Command<D>> {
+pub fn delete_selection<D: Document + ?Sized + 'static>(ids: &[PageId]) -> Box<dyn Command<D>> {
     let commands: Vec<Box<dyn Command<D>>> = ids.iter().map(|&page| Box::new(RemovePage { page }) as Box<dyn Command<D>>).collect();
     //--- the label goes into the undo menu, so it has to agree in number ---
     let label = match ids.len() {
