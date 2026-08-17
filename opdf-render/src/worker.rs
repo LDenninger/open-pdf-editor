@@ -46,6 +46,17 @@ pub(crate) enum WorkerMessage {
 }
 
 /// Own Pdfium and the document, and answer requests until told to stop.
+///
+/// `ready` reports the outcome of opening the document exactly once. Nobody may
+/// be listening — [`crate::service::PdfiumRenderService::open_deferred`] drops
+/// the receiver immediately — so the send is fire-and-forget and the worker
+/// serves regardless. The channel is bounded at one, so the send never blocks.
+///
+/// A document that cannot be opened does *not* end the worker: it would close
+/// the request channel, and every later request would be answered with a
+/// generic "the worker is no longer running" instead of the reason the file
+/// failed. The worker stays and answers each request with the real reason,
+/// until it is shut down or its handle is dropped.
 pub(crate) fn run_worker(
     pdf_path: PathBuf,
     snapshot: DocumentSnapshot,
@@ -57,17 +68,22 @@ pub(crate) fn run_worker(
     let pdfium = match bind_pdfium() {
         Ok(pdfium) => pdfium,
         Err(reason) => {
-            let _ = ready.send(Err(reason));
+            let _ = ready.send(Err(reason.clone()));
+            fail_every_request(&requests, &responses, &reason);
             return;
         }
     };
 
     let document = {
+        //--- declared before the document, so the document's own closing call is still covered ---
         let _guard = lock_pdfium();
         match pdfium.load_pdf_from_file(&pdf_path, None) {
             Ok(document) => document,
             Err(error) => {
-                let _ = ready.send(Err(format!("could not open {}: {error}", pdf_path.display())));
+                let reason = format!("could not open {}: {error}", pdf_path.display());
+                let _ = ready.send(Err(reason.clone()));
+                drop(_guard);
+                fail_every_request(&requests, &responses, &reason);
                 return;
             }
         }
@@ -77,11 +93,35 @@ pub(crate) fn run_worker(
     //--- moment the snapshot's order and the file's order are the same ---
     let file_indices = map_file_indices(&snapshot);
 
-    if ready.send(Ok(())).is_ok() {
-        serve_requests(&document, snapshot, &file_indices, &requests, &responses, &rasterizations);
-    }
+    let _ = ready.send(Ok(()));
+    serve_requests(&document, snapshot, &file_indices, &requests, &responses, &rasterizations);
 
     close_document(document);
+}
+
+/// Answer every request with `reason`, for a worker whose document never opened.
+///
+/// Keeps the contract's one-response-per-request promise, and keeps the reason
+/// the caller actually needs — the open error — rather than the shape of the
+/// failure that followed from it.
+fn fail_every_request(requests: &Receiver<WorkerMessage>, responses: &Sender<RenderResponse>, reason: &str) {
+    while let Ok(message) = requests.recv() {
+        match message {
+            WorkerMessage::Render(request) => {
+                if responses
+                    .send(RenderResponse::Failed {
+                        request,
+                        reason: reason.to_string(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            WorkerMessage::Rebind(_) => {}
+            WorkerMessage::Shutdown => return,
+        }
+    }
 }
 
 /// Where each page sits in the file Pdfium has open.
