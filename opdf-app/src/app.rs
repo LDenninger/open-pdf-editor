@@ -41,6 +41,20 @@ pub enum SaveMode {
     Compacted,
 }
 
+/// What the user asked for that would abandon the open document.
+///
+/// Each of these ends the document's life on screen, so each has to be held back
+/// until the user has answered for the edits they have not saved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExitIntent {
+    /// Close the document and show the empty state.
+    Close,
+    /// Exit the application.
+    Quit,
+    /// Open a different document in its place.
+    Open,
+}
+
 /// The application.
 pub struct OpdfApp {
     theme: Theme,
@@ -62,6 +76,17 @@ pub struct OpdfApp {
     /// is written while this is set: the write is what the user is being asked
     /// about.
     compaction_pending: bool,
+    /// The revision the document was at when it was last written to disk.
+    ///
+    /// Compared against [`Document::revision`] to tell whether there is anything
+    /// to lose. The contract requires every mutation to advance the revision and
+    /// every failure and read-only call to leave it alone, which is exactly the
+    /// property a dirty flag needs and exactly what a hand-maintained one gets
+    /// wrong. `None` for a document that has never been written, whose every
+    /// edit is therefore unsaved.
+    saved_revision: Option<u64>,
+    /// The exit the user asked for and has not yet answered for.
+    exit_pending: Option<ExitIntent>,
     service: Box<dyn RenderService>,
     canvas_cache: TextureCache,
     rail_cache: TextureCache,
@@ -83,6 +108,9 @@ impl OpdfApp {
     pub fn new(ctx: &egui::Context, opened: OpenedDocument) -> Self {
         let theme = Theme::dark();
         crate::theme::apply_theme(ctx, &theme);
+        //--- opening a file does not modify it, so it starts clean at whatever
+        //--- revision it was parsed at ---
+        let saved_revision = Some(opened.document.revision());
         Self {
             state: ViewerState::new(opened.snapshot, &theme),
             theme,
@@ -90,6 +118,8 @@ impl OpdfApp {
             document_path: opened.path,
             undo: UndoStack::new(),
             compaction_pending: false,
+            saved_revision,
+            exit_pending: None,
             service: opened.service,
             canvas_cache: TextureCache::new(CANVAS_CACHE_BUDGET_BYTES),
             rail_cache: TextureCache::new(RAIL_CACHE_BUDGET_BYTES),
@@ -221,6 +251,8 @@ impl OpdfApp {
         //--- a queued entry addresses pages of the document it was recorded
         //--- against; against this one those ids mean nothing, or worse, something ---
         self.undo.clear();
+        //--- whatever arrives here arrives as it is on disk, so it starts clean ---
+        self.saved_revision = self.document.as_deref().map(Document::revision);
         //--- the previous service is dropped here, which is what keeps a late
         //--- response from the old document out of the new one's cache ---
         self.service = service;
@@ -254,7 +286,10 @@ impl OpdfApp {
         };
         match result {
             Ok(()) => {
+                let revision = document.revision();
                 self.document_path = Some(path.to_owned());
+                //--- what is on disk is now what is in memory, up to this revision ---
+                self.saved_revision = Some(revision);
                 self.last_error = None;
                 true
             }
@@ -371,6 +406,62 @@ impl OpdfApp {
     }
 
     //---------------------------------------------------------------------
+    // Unsaved changes
+    //---------------------------------------------------------------------
+
+    /// Whether the document has been edited since it was last written to disk.
+    ///
+    /// Read from [`Document::revision`] rather than from a flag the shell
+    /// maintains: the contract requires every mutation to advance it and every
+    /// failed or read-only call to leave it alone, so it cannot drift out of step
+    /// with the document the way a hand-set flag does. Undo advances the revision
+    /// too, so undoing back to the saved state still reports unsaved changes —
+    /// the safe direction to be wrong in.
+    pub fn has_unsaved_changes(&self) -> bool {
+        match self.document.as_deref() {
+            Some(document) => self.saved_revision != Some(document.revision()),
+            None => false,
+        }
+    }
+
+    /// The exit the shell is holding back until the user answers for their
+    /// unsaved edits.
+    pub fn discard_prompt(&self) -> Option<ExitIntent> {
+        self.exit_pending
+    }
+
+    /// Whether `intent` may go ahead immediately, raising the prompt if not.
+    ///
+    /// Returns `true` when there is nothing to lose. Every route out of a
+    /// document goes through here, so none of them can forget to ask.
+    fn may_abandon_document(&mut self, intent: ExitIntent) -> bool {
+        if !self.has_unsaved_changes() {
+            return true;
+        }
+        self.exit_pending = Some(intent);
+        false
+    }
+
+    /// Go ahead with the exit the user was asked about, abandoning the edits.
+    pub fn confirm_discard(&mut self, ctx: &egui::Context) {
+        let Some(intent) = self.exit_pending.take() else {
+            return;
+        };
+        match intent {
+            ExitIntent::Close => self.close_document(),
+            ExitIntent::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            //--- the file dialog comes after the question, not before it: there is
+            //--- no point naming a file for an open the user may still call off ---
+            ExitIntent::Open => self.open_chosen_path(),
+        }
+    }
+
+    /// Think better of the exit, keeping the document and its edits.
+    pub fn cancel_discard(&mut self) {
+        self.exit_pending = None;
+    }
+
+    //---------------------------------------------------------------------
     // Compaction, and the history it costs — F16
     //---------------------------------------------------------------------
 
@@ -470,16 +561,28 @@ impl OpdfApp {
         let last_page = self.state.page_count().saturating_sub(1);
         let current = self.state.current_page().unwrap_or(0);
         match action {
-            MenuAction::OpenDocument => self.open_chosen_path(),
+            MenuAction::OpenDocument => {
+                if self.may_abandon_document(ExitIntent::Open) {
+                    self.open_chosen_path();
+                }
+            }
             MenuAction::Save => self.save_in_place(),
             MenuAction::SaveAs => self.save_to_chosen_path(),
-            MenuAction::CloseDocument => self.close_document(),
+            MenuAction::CloseDocument => {
+                if self.may_abandon_document(ExitIntent::Close) {
+                    self.close_document();
+                }
+            }
             MenuAction::Undo => self.undo_edit(),
             MenuAction::Redo => self.redo_edit(),
             MenuAction::RotatePageClockwise => self.rotate_current_page(),
             MenuAction::DeletePage => self.delete_current_page(),
             MenuAction::Compact => self.ask_to_compact(),
-            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuAction::Quit => {
+                if self.may_abandon_document(ExitIntent::Quit) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
             MenuAction::ZoomIn => {
                 self.state.fit_mode = FitMode::Free;
@@ -636,6 +739,49 @@ impl OpdfApp {
         if self.state.sync_fit_to_viewport() {
             //--- the refit lands after this frame's shapes, so ask for the frame that draws it ---
             ctx.request_repaint();
+        }
+
+        //--- unsaved edits are not discarded without a word ---
+        if let Some(intent) = self.exit_pending {
+            let mut confirmed = false;
+            let mut cancelled = false;
+            let mut save_first = false;
+            egui::Modal::new(egui::Id::new("opdf_unsaved_changes")).show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Save your changes?");
+                ui.add_space(8.0);
+                let what = match intent {
+                    ExitIntent::Close => "closing this document",
+                    ExitIntent::Quit => "quitting",
+                    ExitIntent::Open => "opening another document",
+                };
+                ui.label(format!("You have edits that have not been saved. {what} will discard them."));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        save_first = true;
+                    }
+                });
+            });
+            if save_first {
+                self.save_in_place();
+                //--- only go through with the exit if the save actually worked ---
+                if self.has_unsaved_changes() {
+                    self.cancel_discard();
+                } else {
+                    self.confirm_discard(ctx);
+                }
+            } else if confirmed {
+                self.confirm_discard(ctx);
+            } else if cancelled {
+                self.cancel_discard();
+            }
         }
 
         //--- the compaction warning: what it costs, in the user's terms, before it costs it ---
