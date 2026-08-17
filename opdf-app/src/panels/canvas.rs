@@ -40,7 +40,7 @@ pub fn draw_page_placeholder(painter: &Painter, rect: Rect, page_number: usize, 
     let radius = CornerRadius::same(theme.corner_radius);
     painter.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), radius, theme.page_shadow);
     painter.rect_filled(rect, radius, theme.page_placeholder);
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, theme.page_border), StrokeKind::Inside);
+    painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, theme.page_border), StrokeKind::Inside);
     if rect.height() > 28.0 && rect.width() > 28.0 {
         painter.text(
             rect.center(),
@@ -59,7 +59,7 @@ pub fn draw_page_tile(painter: &Painter, rect: Rect, texture: &TextureHandle, th
     painter.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), radius, theme.page_shadow);
     painter.rect_filled(rect, radius, theme.page_paper);
     painter.image(texture.id(), rect, FULL_TEXTURE_UV, Color32::WHITE);
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, theme.page_border), StrokeKind::Inside);
+    painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, theme.page_border), StrokeKind::Inside);
 }
 
 //---------------------------------------------------------------------
