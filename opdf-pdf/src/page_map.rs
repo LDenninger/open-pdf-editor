@@ -197,6 +197,35 @@ impl PageMap {
         Ok(())
     }
 
+    /// Point every slot at the object backing it in a freshly written file.
+    ///
+    /// A compacting save renumbers the objects it keeps, so the identifiers the
+    /// slots were holding name nothing afterwards. `object_ids` is the rewritten
+    /// file's page tree in document order, which is the order the slots are in —
+    /// the save wrote that order out. Identity, geometry and rotation are
+    /// untouched: only the pointer into the file moves.
+    ///
+    /// The rotations are also written out by that save, so no slot is still
+    /// carrying an override the file does not record.
+    ///
+    /// Returns [`Error::Malformed`] if the rewritten file holds a different
+    /// number of pages than the map does, which would mean the save did not
+    /// write what the map describes. Nothing is changed in that case.
+    pub(crate) fn rebind_objects(&mut self, object_ids: &[ObjectId]) -> Result<()> {
+        if object_ids.len() != self.slots.len() {
+            return Err(Error::Malformed(format!(
+                "the written file holds {} pages, the document {}",
+                object_ids.len(),
+                self.slots.len()
+            )));
+        }
+        for (slot, object_id) in self.slots.iter_mut().zip(object_ids) {
+            slot.object_id = *object_id;
+            slot.rotation_changed = false;
+        }
+        Ok(())
+    }
+
     /// Discard every removed page, making its identity unrestorable.
     ///
     /// Called only by a compacting save, which is the one path that actually
