@@ -709,3 +709,81 @@ fn a_failed_open_leaves_the_current_document_untouched_and_reports_why() {
     let message = app.last_error().unwrap_or_default();
     assert!(message.contains("broken.pdf"), "the message must name the file that failed, got: {message}");
 }
+
+//---------------------------------------------------------------------
+// Pages the rasterizer cannot resolve
+//---------------------------------------------------------------------
+
+/// Every page-border stroke colour this frame's shapes used.
+///
+/// The unrenderable placeholder is told apart from the ordinary one by the colour
+/// of its border, which is the only part of it that survives into the shape list
+/// as something a headless test can name.
+fn collect_rect_stroke_colours(shapes: &[ClippedShape]) -> HashSet<[u8; 4]> {
+    let mut colours = HashSet::new();
+    for clipped in shapes {
+        collect_strokes_from_shape(&clipped.shape, &mut colours);
+    }
+    colours
+}
+
+fn collect_strokes_from_shape(shape: &Shape, into: &mut HashSet<[u8; 4]>) {
+    match shape {
+        Shape::Rect(rect) => {
+            into.insert(rect.stroke.color.to_array());
+        }
+        Shape::Vec(inner) => {
+            for shape in inner {
+                collect_strokes_from_shape(shape, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A page the rasterizer refuses is a permanent condition, not a slow one.
+///
+/// The F5 fix froze the page-to-file index map at open, so a page inserted since
+/// then has no position in the file and fails by design. Clearing the pending slot
+/// and nothing else makes the scheduler ask again on the very next frame: the page
+/// stays a grey rectangle, the status bar reads "Rendering 1 page" for the life of
+/// the session, and the event loop never sleeps. That is the F3 shape exactly.
+#[test]
+fn an_unrenderable_page_shows_that_it_failed_and_stops_being_requested() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_unrenderable_page(3, 0).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    let mut last: Option<egui::FullOutput> = None;
+    for _ in 0..12 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE)),
+            ..Default::default()
+        };
+        last = Some(ctx.run(input, |ctx| app.draw(ctx)));
+    }
+    let output = last.unwrap();
+
+    assert_eq!(
+        app.canvas_cache().pending_count(),
+        0,
+        "a request that was answered — with a failure — must not stay in flight"
+    );
+
+    let theme = Theme::dark();
+    let colours = collect_rect_stroke_colours(&output.shapes);
+    assert!(
+        colours.contains(&theme.error_text.to_array()),
+        "the page the rasterizer refused must be drawn as refused, not as still loading"
+    );
+
+    let repaint_delay = output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|viewport| viewport.repaint_delay)
+        .unwrap_or_default();
+    assert!(
+        repaint_delay > std::time::Duration::ZERO,
+        "the shell must settle once every page has an answer, but it asked to be repainted immediately"
+    );
+}
