@@ -1,8 +1,9 @@
 //! Behavioural contract that every [`Document`] implementation must satisfy.
 
-use crate::document::Document;
+use crate::Result;
+use crate::document::{Document, DocumentId, PortablePages};
 use crate::error::Error;
-use crate::page::{PageId, PageSize, Rotation};
+use crate::page::{PageId, PageInfo, PageSize, Rotation};
 
 /// Assert that an implementation honours the [`Document`] contract.
 ///
@@ -35,6 +36,221 @@ where
     assert_failed_mutations_leave_the_revision_untouched(&make_document);
     assert_read_only_calls_never_advance_the_revision(&make_document);
     assert_document_identity_is_stable_and_unique(&make_document);
+    assert_pages_round_trip_through_a_portable_carrier(&make_document);
+    assert_a_foreign_carrier_is_refused_rather_than_guessed_at(&make_document);
+}
+
+//---------------------------------------------------------------------
+// Portable pages
+//---------------------------------------------------------------------
+
+/// [`Document::export_pages`] and [`Document::import_portable`] must move pages
+/// between two documents of the same implementation, in order.
+///
+/// This is the object-safe route that [`Document::import_pages`] cannot offer: a
+/// caller holding two `&dyn Document` can express it, which is what a
+/// cross-document drag needs. It costs a copy; `import_pages` remains the fast
+/// path for a caller that knows both concrete types.
+fn assert_pages_round_trip_through_a_portable_carrier<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let source = make_document(2);
+    let source_ids = source.page_ids();
+    let mut target = make_document(1);
+    let target_ids = target.page_ids();
+    let before = target.revision();
+
+    let carrier = source.export_pages(&source_ids).expect("exporting a document's own pages must succeed");
+    let imported = target
+        .import_portable(carrier, 1)
+        .expect("importing a carrier from the same implementation must succeed");
+
+    assert_eq!(imported.len(), 2, "import_portable must return one identity per page carried");
+    assert_eq!(target.page_count(), 3, "import_portable must add one page per page carried");
+    for (offset, id) in imported.iter().enumerate() {
+        assert_eq!(
+            target.index_of(*id).expect("an imported page must resolve"),
+            1 + offset,
+            "import_portable must preserve the order the pages were exported in"
+        );
+        assert!(
+            !target_ids.contains(id),
+            "imported pages must receive identities not already in use in the target"
+        );
+    }
+    assert_ne!(before, target.revision(), "import_portable is a mutation and must advance the revision");
+    assert_eq!(source.page_count(), 2, "exporting must not mutate the document exported from");
+
+    //--- exporting is a read, so it must not advance the revision either ---
+    let source = make_document(1);
+    let before = source.revision();
+    let _ = source.export_pages(&source.page_ids()).expect("exporting must succeed");
+    assert_eq!(before, source.revision(), "export_pages is a read and must not advance the revision");
+
+    //--- an unknown source page is refused at export time, before a carrier exists ---
+    let rejected = source.export_pages(&[PageId::new(u64::MAX)]);
+    assert!(
+        matches!(rejected, Err(Error::PageNotFound(_))),
+        "export_pages must reject an unknown identity with Error::PageNotFound, got: {rejected:?}"
+    );
+
+    //--- a position beyond the target is a position error, not a payload error ---
+    let mut target = make_document(1);
+    let order = target.page_ids();
+    let revision = target.revision();
+    let carrier = source.export_pages(&source.page_ids()).expect("exporting must succeed");
+    let rejected = target.import_portable(carrier, 99);
+    assert!(
+        matches!(rejected, Err(Error::IndexOutOfBounds { .. })),
+        "import_portable must reject a position beyond the document with Error::IndexOutOfBounds, got: {rejected:?}"
+    );
+    assert_eq!(target.page_ids(), order, "a rejected import must leave the document untouched");
+    assert_eq!(revision, target.revision(), "a failed import_portable must leave the revision untouched");
+}
+
+/// A carrier built by one implementation and handed to another must be refused
+/// cleanly, in both directions.
+///
+/// [`PortablePages`] is an opaque owned carrier: what is inside it is
+/// deliberately not part of the contract, so a target that does not recognise
+/// the payload has nothing to fall back on and must say so — never guess, never
+/// import part of it.
+///
+/// This is asserted here rather than left to each implementation to discover,
+/// because "what happens when the carrier is foreign" is exactly the question an
+/// implementer does not think to ask. It cannot be asserted with two instances of
+/// the type under test — they recognise each other's payloads by construction —
+/// so the suite carries an implementation of its own for the purpose.
+fn assert_a_foreign_carrier_is_refused_rather_than_guessed_at<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    //--- foreign carrier into the implementation under test ---
+    let foreign = ForeignDocument::default();
+    let alien = foreign.export_pages(&foreign.page_ids()).expect("the foreign document must export");
+    let mut target = make_document(2);
+    let order = target.page_ids();
+    let revision = target.revision();
+
+    let refused = target.import_portable(alien, 1);
+    assert!(
+        matches!(refused, Err(Error::Unsupported(_))),
+        "a carrier from a different implementation must be refused with Error::Unsupported, never guessed at, got: {refused:?}"
+    );
+    assert_eq!(target.page_ids(), order, "a refused import must leave the document untouched");
+    assert_eq!(revision, target.revision(), "a refused import must leave the revision untouched");
+
+    //--- and the other way round, so neither implementation is the privileged one ---
+    let source = make_document(1);
+    let carrier = source.export_pages(&source.page_ids()).expect("exporting must succeed");
+    let mut foreign = ForeignDocument::default();
+    let refused = foreign.import_portable(carrier, 0);
+    assert!(
+        matches!(refused, Err(Error::Unsupported(_))),
+        "the implementation under test must not produce a carrier a foreign document silently accepts, got: {refused:?}"
+    );
+}
+
+/// The payload [`ForeignDocument`] carries.
+///
+/// Private to this module and named by no other, so no other implementation can
+/// construct or recognise it — which is the whole point.
+#[derive(Debug)]
+struct ForeignPayload {
+    pages: Vec<PageInfo>,
+}
+
+/// A [`Document`] implementation that exists only to be a *different* one.
+///
+/// It holds a fixed pair of pages and supports no mutation: every method beyond
+/// identity, inspection, and the portable pair answers an error, which is all
+/// [`assert_a_foreign_carrier_is_refused_rather_than_guessed_at`] asks of it.
+#[derive(Debug)]
+struct ForeignDocument {
+    id: DocumentId,
+    pages: Vec<PageInfo>,
+}
+
+impl Default for ForeignDocument {
+    fn default() -> Self {
+        Self {
+            id: DocumentId::new_unique(),
+            pages: vec![PageInfo {
+                id: PageId::new(0),
+                size: PageSize::A4,
+                rotation: Rotation::None,
+            }],
+        }
+    }
+}
+
+impl ForeignDocument {
+    fn reject(&self) -> Error {
+        Error::Unsupported(format!("{} is the contract suite's foreign document and supports no mutation", self.id))
+    }
+}
+
+impl Document for ForeignDocument {
+    fn id(&self) -> DocumentId {
+        self.id
+    }
+
+    fn revision(&self) -> u64 {
+        0
+    }
+
+    fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn page_ids(&self) -> Vec<PageId> {
+        self.pages.iter().map(|page| page.id).collect()
+    }
+
+    fn page(&self, id: PageId) -> Result<PageInfo> {
+        self.pages.iter().find(|page| page.id == id).copied().ok_or(Error::PageNotFound(id))
+    }
+
+    fn index_of(&self, id: PageId) -> Result<usize> {
+        self.pages.iter().position(|page| page.id == id).ok_or(Error::PageNotFound(id))
+    }
+
+    fn remove_page(&mut self, _id: PageId) -> Result<()> {
+        Err(self.reject())
+    }
+
+    fn restore_page(&mut self, _id: PageId, _at_index: usize) -> Result<()> {
+        Err(self.reject())
+    }
+
+    fn move_page(&mut self, _id: PageId, _to_index: usize) -> Result<()> {
+        Err(self.reject())
+    }
+
+    fn set_rotation(&mut self, _id: PageId, _rotation: Rotation) -> Result<()> {
+        Err(self.reject())
+    }
+
+    fn insert_page(&mut self, _at_index: usize, _size: PageSize) -> Result<PageId> {
+        Err(self.reject())
+    }
+
+    fn import_pages(&mut self, _source: &Self, _ids: &[PageId], _at_index: usize) -> Result<Vec<PageId>> {
+        Err(self.reject())
+    }
+
+    fn export_pages(&self, ids: &[PageId]) -> Result<PortablePages> {
+        let mut pages = Vec::with_capacity(ids.len());
+        for id in ids {
+            pages.push(self.page(*id)?);
+        }
+        Ok(PortablePages::new(ForeignPayload { pages }))
+    }
+
+    fn import_portable(&mut self, pages: PortablePages, _at_index: usize) -> Result<Vec<PageId>> {
+        //--- the type check is the refusal: a payload this document did not write is not recognised ---
+        let payload: ForeignPayload = pages.take()?;
+        Err(Error::Unsupported(format!(
+            "{} recognised the carrier's {} pages but is the contract suite's foreign document and supports no mutation",
+            self.id,
+            payload.pages.len()
+        )))
+    }
 }
 
 //---------------------------------------------------------------------
