@@ -69,9 +69,19 @@ impl PdfiumRenderService {
     /// Point the worker at a new snapshot, after a structural edit.
     ///
     /// Tiles rasterized at the previous revision are dropped: their requests
-    /// can never match again, so keeping them only costs memory. Requests
-    /// already queued are unaffected — the renderer never validates a
-    /// revision, it only carries it.
+    /// can never match again, so keeping them only costs memory.
+    ///
+    /// Requests still queued when the rebind is applied are **superseded**, and
+    /// answered [`RenderResponse::Failed`] with a reason naming the rebind. The
+    /// renderer resolves geometry against the snapshot it holds at the moment it
+    /// renders, so answering a request queued under the old snapshot would
+    /// return the new snapshot's geometry under the old snapshot's revision —
+    /// and cache it there. Resubmit anything that matters at the new revision.
+    ///
+    /// A request submitted *after* this call is unaffected. A request naming a
+    /// revision the service does not hold is still rasterized against the
+    /// current snapshot and echoed back unchanged; the renderer validates the
+    /// ordering of a rebind, not the revision number a caller writes down.
     pub fn rebind(&self, snapshot: DocumentSnapshot) {
         let _ = self.requests.send(WorkerMessage::Rebind(Box::new(snapshot)));
     }
@@ -444,8 +454,69 @@ mod tests {
 
         //--- and the pre-rebind tile is gone rather than lingering in memory ---
         service.submit(before);
-        assert_eq!(drain(&service, 1).len(), 1);
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1);
         assert_eq!(service.rasterizations(), 3, "tiles from a superseded revision must have been pruned");
+
+        //--- the dimensions, not just the counter: this request names revision 7, and a stale 595x842
+        //--- tile answering it would be indistinguishable from a correct answer if only counts were checked ---
+        match &responses[0] {
+            RenderResponse::Ready { tile, .. } => assert_eq!(
+                (tile.width(), tile.height()),
+                (842, 595),
+                "a request submitted after the rebind is answered against the snapshot the service now holds, whatever revision the request names; 595x842 here would mean the pruned revision 7 tile was served"
+            ),
+            RenderResponse::Failed { reason, .. } => panic!("a request submitted after the rebind must succeed, got: {reason}"),
+        }
+    }
+
+    /// The end-to-end shape of the backlog/rebind race, driven through the real
+    /// worker rather than through [`crate::worker`]'s own unit test.
+    ///
+    /// A slow render is put in flight first so the request that follows it is
+    /// certain to be sitting in the backlog when the rebind is applied. Against
+    /// the unfixed worker this returned a 842x595 tile — revision 8's geometry —
+    /// for a request that named revision 7, and cached it under revision 7.
+    #[test]
+    fn a_request_queued_across_a_rebind_is_never_answered_with_the_new_geometry() {
+        let service = build_service();
+
+        //--- 595 x 842 at scale 8.0 is 4760 x 6736, about 32 megapixels: long enough to hold the worker ---
+        let slow = RenderRequest::new(PageId::new(1), 7, 8.0).unwrap();
+        service.submit(slow);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        //--- queued while revision 7 is still current, and still queued when the rebind lands ---
+        let queued = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        service.submit(queued);
+        let mut rotated = build_snapshot();
+        rotated.revision = 8;
+        rotated.pages[0].rotation = Rotation::Quarter;
+        service.rebind(rotated);
+
+        let responses = drain(&service, 2);
+        assert_eq!(responses.len(), 2, "both submitted requests must be answered exactly once");
+        let answer = responses
+            .iter()
+            .find(|response| *response.request() == queued)
+            .expect("the request queued across the rebind must be answered");
+        match answer {
+            RenderResponse::Ready { tile, .. } => assert_eq!(
+                (tile.width(), tile.height()),
+                (595, 842),
+                "a revision 7 request must never be answered with revision 8's swapped axes"
+            ),
+            RenderResponse::Failed { reason, .. } => assert!(reason.contains("rebind"), "the reason must name the cause, got: {reason}"),
+        }
+
+        //--- and nothing may have been cached under the superseded revision ---
+        let before_resubmission = service.rasterizations();
+        service.submit(queued);
+        assert_eq!(drain(&service, 1).len(), 1);
+        assert!(
+            service.rasterizations() > before_resubmission,
+            "a resubmitted revision 7 request must be rasterized afresh; serving it from the cache means a tile with revision 8 geometry was stored under revision 7"
+        );
     }
 
     #[test]
