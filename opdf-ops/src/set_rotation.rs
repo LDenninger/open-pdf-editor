@@ -10,7 +10,7 @@ pub struct SetRotation {
     pub rotation: Rotation,
 }
 
-impl<D: Document> Command<D> for SetRotation {
+impl<D: Document + ?Sized> Command<D> for SetRotation {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         let previous = document.page(self.page)?.rotation;
         document.set_rotation(self.page, self.rotation)?;
