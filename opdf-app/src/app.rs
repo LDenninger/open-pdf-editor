@@ -11,7 +11,7 @@ use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
 
-use crate::opener::{DocumentOpener, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
+use crate::opener::{DocumentOpener, EditableDocument, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
 use crate::panels::menu_bar::MenuAction;
 use crate::panels::status_bar::RenderStatus;
 use crate::panels::toolbar::ToolbarOutcome;
@@ -31,7 +31,7 @@ pub const RAIL_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 pub struct OpdfApp {
     theme: Theme,
     state: ViewerState,
-    document: Option<Box<dyn Document>>,
+    document: Option<Box<dyn EditableDocument>>,
     service: Box<dyn RenderService>,
     canvas_cache: TextureCache,
     rail_cache: TextureCache,
@@ -92,7 +92,7 @@ impl OpdfApp {
     /// later edit or save has something to act on, and so a test can check that
     /// the shell is holding the document it was handed.
     pub fn document(&self) -> Option<&dyn Document> {
-        self.document.as_deref()
+        self.document.as_deref().map(|document| document as &dyn Document)
     }
 
     /// The canvas's texture cache, for the status bar and for tests.
@@ -174,7 +174,7 @@ impl OpdfApp {
 
     /// The one place a document, its service, and its snapshot are installed
     /// together.
-    fn install_document(&mut self, document: Option<Box<dyn Document>>, service: Box<dyn RenderService>, snapshot: DocumentSnapshot) {
+    fn install_document(&mut self, document: Option<Box<dyn EditableDocument>>, service: Box<dyn RenderService>, snapshot: DocumentSnapshot) {
         self.document = document;
         //--- the previous service is dropped here, which is what keeps a late
         //--- response from the old document out of the new one's cache ---
