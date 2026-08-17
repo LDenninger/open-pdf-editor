@@ -11,7 +11,7 @@ use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
 
-use crate::opener::{DocumentOpener, OpenedDocument};
+use crate::opener::{DocumentOpener, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
 use crate::panels::menu_bar::MenuAction;
 use crate::panels::status_bar::RenderStatus;
 use crate::panels::toolbar::ToolbarOutcome;
@@ -38,6 +38,8 @@ pub struct OpdfApp {
     page_entry: String,
     show_about: bool,
     last_error: Option<String>,
+    chooser: Box<dyn PathChooser>,
+    opener: Box<dyn DocumentOpener>,
 }
 
 impl OpdfApp {
@@ -61,7 +63,21 @@ impl OpdfApp {
             page_entry: "1".to_owned(),
             show_about: false,
             last_error: None,
+            chooser: Box::new(NativePathChooser),
+            opener: Box::new(PdfiumDocumentOpener),
         }
+    }
+
+    /// Replace the route File ▸ Open takes: which dialog asks the user, and what
+    /// opens the answer.
+    ///
+    /// Production uses the platform dialog and PDFium. A test injects both,
+    /// because a native file dialog cannot be driven headlessly — and what the
+    /// shell does with the dialog's answer is the part worth testing anyway.
+    pub fn with_open_route(mut self, chooser: Box<dyn PathChooser>, opener: Box<dyn DocumentOpener>) -> Self {
+        self.chooser = chooser;
+        self.opener = opener;
+        self
     }
 
     /// The viewer state this frame will draw: zoom, scroll offset, current page,
@@ -112,7 +128,27 @@ impl OpdfApp {
     /// they picked was malformed would be the worst possible response to an error
     /// this API is guaranteed to produce.
     pub fn open_path(&mut self, opener: &dyn DocumentOpener, path: &Path) {
-        match opener.open(path) {
+        let result = opener.open(path);
+        self.absorb_open(result, path);
+    }
+
+    /// Ask the configured chooser for a file and open it, doing nothing at all if
+    /// the user cancels.
+    ///
+    /// A cancelled dialog is not a failure and must not be reported as one.
+    fn open_chosen_path(&mut self) {
+        let Some(path) = self.chooser.choose_pdf() else {
+            return;
+        };
+        //--- the borrow of `self.opener` ends with the call, so the result can be
+        //--- absorbed through `&mut self` on the next line ---
+        let result = self.opener.open(&path);
+        self.absorb_open(result, &path);
+    }
+
+    /// Install an opened document, or record why it could not be opened.
+    fn absorb_open(&mut self, result: opdf_core::Result<OpenedDocument>, path: &Path) {
+        match result {
             Ok(opened) => {
                 self.open_document(opened);
                 self.last_error = None;
@@ -168,8 +204,7 @@ impl OpdfApp {
         let last_page = self.state.page_count().saturating_sub(1);
         let current = self.state.current_page().unwrap_or(0);
         match action {
-            //--- opening a real document belongs to Track A; say so rather than doing nothing ---
-            MenuAction::OpenDocument => self.show_about = true,
+            MenuAction::OpenDocument => self.open_chosen_path(),
             MenuAction::CloseDocument => self.close_document(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
@@ -334,7 +369,7 @@ impl OpdfApp {
             let mut open = true;
             egui::Window::new("About opdf").open(&mut open).resizable(false).show(ctx, |ui| {
                 ui.label(crate::describe_build());
-                ui.label("Track D shell. Opening real PDF files needs Track A; real rasterization needs Track B.");
+                ui.label("Documents are parsed by lopdf and rasterized by PDFium. Text selection and search are not implemented.");
                 ui.label("Icons: Phosphor (MIT). No Adobe assets are used.");
             });
             self.show_about = open;
