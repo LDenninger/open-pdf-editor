@@ -13,7 +13,7 @@
 
 pub mod corpus;
 
-pub use corpus::{CorpusEntry, CorpusError, CorpusManifest};
+pub use corpus::{CorpusEntry, CorpusError, CorpusManifest, sha256_hex};
 
 pub mod diff;
 

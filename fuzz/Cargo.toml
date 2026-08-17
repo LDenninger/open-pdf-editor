@@ -11,11 +11,15 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.4", features = ["derive"] }
 opdf-core = { path = "../opdf-core" }
+opdf-pdf = { path = "../opdf-pdf" }
+tempfile = "3"
 
-# This crate is intentionally not part of the parent workspace — cargo-fuzz
-# builds it with nightly-only sanitizer flags that must never leak into
-# `cargo build --all` on stable.
-[workspace]
+# This crate is a member of the parent workspace so that the fast PR gate
+# compiles the fuzz targets: before it was, a change to `opdf-core` or
+# `opdf-pdf` that broke a target merged green and only surfaced on the nightly
+# fuzz job. `cargo-fuzz`'s nightly sanitizer flags come from `cargo fuzz`'s own
+# invocation, not from anything here, so they do not leak into a stable
+# `cargo build --all` -- verified by building every target on stable.
 
 [[bin]]
 name = "tile_new"
@@ -34,6 +38,13 @@ bench = false
 [[bin]]
 name = "rotation_from_degrees"
 path = "fuzz_targets/rotation_from_degrees.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pdf_open"
+path = "fuzz_targets/pdf_open.rs"
 test = false
 doc = false
 bench = false

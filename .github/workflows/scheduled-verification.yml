@@ -14,19 +14,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [tile_new, render_request_new, rotation_from_degrees]
-        # pdf_open joins this matrix once Task 10 lands it (Track A / I1).
+        # pdf_open is the parser target: it is the only one fed bytes a
+        # stranger chose, so it gets a longer budget than the opdf-core
+        # constructors below.
+        target: [tile_new, render_request_new, rotation_from_degrees, pdf_open]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: fuzz -> target
+          workspaces: |
+            . -> target
+            fuzz -> target
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: Fuzz ${{ matrix.target }} for 2 minutes
+      # fuzz/corpus/ is gitignored, so a CI run starts from nothing. Seeding
+      # pdf_open with the real corpus reaches PDF structure in seconds that
+      # random mutation would take hours to rediscover.
+      - name: Seed the pdf_open corpus from the checked-in corpus
+        if: matrix.target == 'pdf_open'
+        run: |
+          mkdir -p fuzz/corpus/pdf_open
+          cp tests/corpus/files/*.pdf fuzz/corpus/pdf_open/
+      - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=120
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ matrix.target == 'pdf_open' && 600 || 120 }}
       - name: Upload crash artifacts, if any
         if: failure()
         uses: actions/upload-artifact@v4
@@ -57,13 +69,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # An unreachable upstream is reported as a warning annotation and leaves
+      # the specimen uncovered; it does not fail this job, because taking the
+      # whole nightly red for someone else's outage hides every other result in
+      # it. A specimen that downloads but hashes wrong still fails hard -- that
+      # is a provenance break, not an outage. Pass --strict to invert this.
       - name: Fetch the large-specimen corpus tier
         run: python3 tests/corpus/fetch_corpus.py
-      - name: Round-trip the full corpus
-        # A no-op until Track A lands DocumentIo (Task 6) and this env var
-        # is read by the integration test to include tests/corpus/.cache/
-        # alongside tests/corpus/files/. Until then this step only proves
-        # fetch_corpus.py still runs against live upstream sources.
+      # --release because the fetched tier is ~274MB per specimen and a debug
+      # lopdf parse of it is minutes rather than seconds. --nocapture so the
+      # "FULL CORPUS: n of m fetched specimens round-tripped" summary lands in
+      # the log: this job's whole point is that the number is visible and
+      # non-zero, and a run that covered nothing must be readable as such.
+      - name: Round-trip the fetched corpus tier
         env:
           OPDF_CORPUS_FULL: "1"
-        run: cargo test -p opdf-roundtrip --all-features
+        run: cargo test --release -p opdf-roundtrip --all-features -- --nocapture

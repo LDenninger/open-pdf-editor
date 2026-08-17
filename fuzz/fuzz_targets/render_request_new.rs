@@ -27,7 +27,10 @@ fuzz_target!(|input: RenderRequestInput| {
         }
         Err(_) => {
             // Rejected -- must be because the scale was non-finite or <= 0.
-            assert!(!scale.is_finite() || scale <= 0.0, "RenderRequest::new rejected a finite, positive scale of {scale}");
+            assert!(
+                !scale.is_finite() || scale <= 0.0,
+                "RenderRequest::new rejected a finite, positive scale of {scale}"
+            );
         }
     }
 });

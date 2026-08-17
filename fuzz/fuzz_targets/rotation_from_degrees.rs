@@ -8,7 +8,10 @@ fuzz_target!(|degrees: i32| {
 
     match result {
         Ok(rotation) => {
-            assert!(rotation.degrees() % 90 == 0, "a successfully constructed Rotation must be a multiple of 90 degrees");
+            assert!(
+                rotation.degrees() % 90 == 0,
+                "a successfully constructed Rotation must be a multiple of 90 degrees"
+            );
             // rotated_by must never panic, for any composition -- exercise it here too.
             let _ = rotation.rotated_by(Rotation::Quarter);
             let _ = rotation.rotated_by(rotation);
