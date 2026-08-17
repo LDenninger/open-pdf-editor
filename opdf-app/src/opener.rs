@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use opdf_core::document::{Document, DocumentSnapshot};
+use opdf_core::document::{Document, DocumentIo, DocumentSnapshot};
 use opdf_core::fakes::{FakeRenderService, VecDocument};
 use opdf_core::page::PageSize;
 use opdf_core::render::RenderService;
@@ -34,6 +34,29 @@ pub trait DocumentOpener {
     /// Returns whatever error the underlying implementation produces; the shell
     /// surfaces it to the user rather than interpreting it.
     fn open(&self, path: &Path) -> Result<OpenedDocument>;
+}
+
+//---------------------------------------------------------------------
+// The production opener
+//---------------------------------------------------------------------
+
+/// The production opener: a real parser and a real rasterizer.
+pub struct PdfiumDocumentOpener;
+
+impl DocumentOpener for PdfiumDocumentOpener {
+    fn open(&self, path: &Path) -> Result<OpenedDocument> {
+        let document = opdf_pdf::PdfDocument::open(path)?;
+        let snapshot = DocumentSnapshot::of(&document)?;
+        //--- the service is built from the same snapshot the shell will draw:
+        //--- the rasterizer maps the nth PageId in the snapshot to PDFium page n,
+        //--- so a service opened from any other snapshot resolves the wrong page ---
+        let service = opdf_render::PdfiumRenderService::open(path, snapshot.clone())?;
+        Ok(OpenedDocument {
+            document: Box::new(document),
+            service: Box::new(service),
+            snapshot,
+        })
+    }
 }
 
 //---------------------------------------------------------------------
@@ -93,5 +116,13 @@ mod tests {
     fn the_fake_opener_reports_a_configured_failure() {
         let opener = FakeOpener::failing();
         assert!(opener.open(Path::new("broken.pdf")).is_err());
+    }
+
+    #[test]
+    fn the_real_opener_opens_a_corpus_file_and_reports_its_page_count() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/corpus/files/irs_f1040.pdf");
+        let opened = PdfiumDocumentOpener.open(&path).unwrap();
+        assert!(opened.document.page_count() > 0);
+        assert_eq!(opened.snapshot.page_count(), opened.document.page_count());
     }
 }
