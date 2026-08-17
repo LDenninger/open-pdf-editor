@@ -6,10 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
+use opdf_core::command::Command;
 use opdf_core::document::{Document, DocumentSnapshot};
 use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
+use opdf_ops::{SetRotation, UndoStack};
 
 use crate::opener::{DocumentOpener, EditableDocument, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
 use crate::panels::menu_bar::MenuAction;
@@ -45,6 +47,14 @@ pub struct OpdfApp {
     state: ViewerState,
     document: Option<Box<dyn EditableDocument>>,
     document_path: Option<PathBuf>,
+    /// The edit history for the document currently open, and only that one.
+    ///
+    /// A queued entry names pages by [`opdf_core::PageId`], which is meaningful
+    /// within one document, so the stack is emptied whenever the document is
+    /// replaced. It is typed over the trait object rather than a concrete
+    /// document because that is what the shell owns; `Command` and `UndoStack`
+    /// accept a `?Sized` document precisely so this is possible.
+    undo: UndoStack<dyn EditableDocument>,
     service: Box<dyn RenderService>,
     canvas_cache: TextureCache,
     rail_cache: TextureCache,
@@ -71,6 +81,7 @@ impl OpdfApp {
             theme,
             document: Some(opened.document),
             document_path: opened.path,
+            undo: UndoStack::new(),
             service: opened.service,
             canvas_cache: TextureCache::new(CANVAS_CACHE_BUDGET_BYTES),
             rail_cache: TextureCache::new(RAIL_CACHE_BUDGET_BYTES),
@@ -199,6 +210,9 @@ impl OpdfApp {
         //--- the path travels with the document, so closing or replacing one
         //--- cannot leave Save aimed at the previous document's file ---
         self.document_path = path;
+        //--- a queued entry addresses pages of the document it was recorded
+        //--- against; against this one those ids mean nothing, or worse, something ---
+        self.undo.clear();
         //--- the previous service is dropped here, which is what keeps a late
         //--- response from the old document out of the new one's cache ---
         self.service = service;
@@ -278,6 +292,91 @@ impl OpdfApp {
         self.save_to(&path, SaveMode::Incremental);
     }
 
+    /// How many edits can currently be undone.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.undo_depth()
+    }
+
+    /// How many undone edits can currently be redone.
+    pub fn redo_depth(&self) -> usize {
+        self.undo.redo_depth()
+    }
+
+    /// Apply `command` to the open document through the undo stack, then show the
+    /// result.
+    ///
+    /// Every document edit goes through here, so that no edit can reach the
+    /// document without being recorded, and none can be recorded without the
+    /// canvas being told to redraw the revision it produced.
+    fn apply_command(&mut self, command: Box<dyn Command<dyn EditableDocument>>) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if let Err(error) = self.undo.apply(document.as_mut(), command) {
+            self.last_error = Some(format!("could not apply the edit: {error}"));
+            return;
+        }
+        self.resnapshot();
+    }
+
+    /// Undo the most recent edit, if there is one.
+    fn undo_edit(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        match self.undo.undo(document.as_mut()) {
+            Ok(true) => self.resnapshot(),
+            //--- nothing to undo is not a failure; it is an empty history ---
+            Ok(false) => {}
+            Err(error) => self.last_error = Some(format!("could not undo: {error}")),
+        }
+    }
+
+    /// Redo the most recently undone edit, if there is one.
+    fn redo_edit(&mut self) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        match self.undo.redo(document.as_mut()) {
+            Ok(true) => self.resnapshot(),
+            Ok(false) => {}
+            Err(error) => self.last_error = Some(format!("could not redo: {error}")),
+        }
+    }
+
+    /// Re-derive the snapshot from the document after an edit and hand it to the
+    /// viewer.
+    ///
+    /// This is [`ViewerState::replace_snapshot`], not `open_document`: the
+    /// document is the same one, so tiles still valid at the new revision must
+    /// survive, which is what stops an undo from blanking the canvas.
+    fn resnapshot(&mut self) {
+        let Some(document) = self.document.as_deref() else {
+            return;
+        };
+        match DocumentSnapshot::of(document) {
+            Ok(snapshot) => self
+                .state
+                .replace_snapshot(snapshot, &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]),
+            Err(error) => self.last_error = Some(format!("could not read the edited document: {error}")),
+        }
+    }
+
+    /// Turn the page the user is looking at a quarter turn clockwise.
+    fn rotate_current_page(&mut self) {
+        let Some(index) = self.state.current_page() else {
+            return;
+        };
+        let Some(page) = self.state.snapshot().pages.get(index) else {
+            return;
+        };
+        let command = SetRotation {
+            page: page.id,
+            rotation: page.rotation.rotated_by(Rotation::Quarter),
+        };
+        self.apply_command(Box::new(command));
+    }
+
     /// Replace the document with a freshly generated synthetic one.
     fn load_synthetic(&mut self, page_count: usize) {
         let Ok(opened) = crate::synthetic::open_synthetic_document(page_count) else {
@@ -302,6 +401,9 @@ impl OpdfApp {
             MenuAction::Save => self.save_in_place(),
             MenuAction::SaveAs => self.save_to_chosen_path(),
             MenuAction::CloseDocument => self.close_document(),
+            MenuAction::Undo => self.undo_edit(),
+            MenuAction::Redo => self.redo_edit(),
+            MenuAction::RotatePageClockwise => self.rotate_current_page(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
             MenuAction::ZoomIn => {
