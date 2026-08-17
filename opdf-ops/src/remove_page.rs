@@ -12,7 +12,7 @@ pub struct RemovePage {
     pub page: PageId,
 }
 
-impl<D: Document> Command<D> for RemovePage {
+impl<D: Document + ?Sized> Command<D> for RemovePage {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         let index = document.index_of(self.page)?;
         document.remove_page(self.page)?;
@@ -42,7 +42,7 @@ pub struct RestorePage {
     pub at_index: usize,
 }
 
-impl<D: Document> Command<D> for RestorePage {
+impl<D: Document + ?Sized> Command<D> for RestorePage {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         document.restore_page(self.id, self.at_index)?;
         Ok(Box::new(RemovePage { page: self.id }))
