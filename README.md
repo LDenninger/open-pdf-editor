@@ -25,31 +25,37 @@ of hundreds of megabytes.
 
 ## Status
 
-**Phase 0 (contracts) complete.** The design is settled. `opdf-core` defines
-the `Document`, `DocumentIo`, `Command`, and `RenderService` contracts, their
-value types, in-memory fakes (`VecDocument`, `FakeRenderService`), and the
-contract test suites every implementation must pass — see
+**M0 complete. M1 substantially complete. Not yet released.**
+
+`opdf DOCUMENT.pdf` opens a real file, renders it through PDFium with
+continuous scroll, zoom, fit modes and a thumbnail rail, and saves it back.
+Pages can be rotated and deleted, with undo/redo. Saving appends an incremental
+update by default; a compacting rewrite is offered separately and warns first,
+because it purges the trashed pages that make undo of a deletion exact.
+
+`opdf-cli merge|split|rotate|extract` performs the same page operations
+headlessly on real files.
+
+What is **not** built: text selection, search, drag-and-drop page reordering,
+and cross-document drag. The first two are named in M1 and the last two in M2,
+so **v0.1 is not complete**. Annotations, forms, content editing, OCR and
+redaction (M3–M6) have not been started.
+
+`opdf-core` holds the `Document`, `DocumentIo`, `Command` and `RenderService`
+contracts, their value types, in-memory fakes, and the contract suites every
+implementation must pass — see
 [`docs/architecture/contracts.md`](docs/architecture/contracts.md) for the
-normative reference. The workspace compiles and its tests pass. The
-`opdf-cli` and `opdf` binaries do nothing yet; no PDF can be opened, rendered,
-or edited.
+normative reference and
+[`docs/architecture/contract-changes.md`](docs/architecture/contract-changes.md)
+for the log of breaking changes.
 
-The next step is five parallel implementation tracks — Document, Rendering,
-Ops & CLI, Shell, and Verification — working against these contracts
-concurrently. See [`docs/architecture/ownership.md`](docs/architecture/ownership.md)
-for the track map and the protocol for changing a contract once tracks are
-underway.
+The five implementation tracks that built this ran concurrently against those
+contracts; `opdf-core` did not change once while they did. See
+[`docs/architecture/ownership.md`](docs/architecture/ownership.md) for the track
+map and the protocol for changing a contract.
 
-**Track B (rendering) is complete.** `opdf-render` implements `RenderService`
-over PDFium and passes `assert_render_service_contract` unmodified: one worker
-thread per service owns the document, a bounded newest-first backlog absorbs
-fast scrolling, and a byte-budgeted LRU tile cache keyed on the request drops
-tiles from superseded revisions on rebind. Every call into PDFium is
-serialized process-wide, because PDFium is not thread-safe and
-`pdfium-render`'s `thread_safe` feature does not sequence calls. The library
-itself is fetched by `scripts/fetch-pdfium.sh` rather than vendored. Text
-extraction, text selection geometry, search, and printing are deliberately not
-implemented — the crate turns a `RenderRequest` into pixels and nothing else.
+PDFium is fetched by `scripts/fetch-pdfium.sh` rather than vendored. Every call
+into it is serialized process-wide through a scoped `with_pdfium`.
 
 ## Background
 
@@ -120,8 +126,9 @@ feature, the most immediately useful, and the easiest to prove correct.
 
 ## Architecture
 
-A Cargo workspace of four crates. All PDF logic is UI-agnostic; the GUI is a
-thin shell over the core.
+A Cargo workspace of six crates, plus the round-trip harness, the benchmarks and
+the fuzz targets. All PDF logic is UI-agnostic; the GUI is a thin shell over the
+core.
 
 ```
 .
