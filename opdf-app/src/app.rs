@@ -72,16 +72,29 @@ impl OpdfApp {
         &self.rail_cache
     }
 
+    /// Show `snapshot` as a newly opened document: a render service built from it,
+    /// a fresh document identity, both caches emptied, and the view back at page 1.
+    ///
+    /// Every way a document arrives goes through here — opening a file, closing
+    /// one, generating a synthetic one — because this is the single place that
+    /// guarantees no pixel of the previous document survives into the new one.
+    /// Emptying the caches is not an optimisation: two documents' render requests
+    /// collide (see [`crate::viewer::DocumentId`]), so a surviving tile would be
+    /// served for the wrong document.
+    pub fn open_document(&mut self, snapshot: DocumentSnapshot) {
+        self.service = Box::new(FakeRenderService::new(snapshot.clone()));
+        self.state
+            .open_document(snapshot, &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]);
+        self.state.scroll_to_page(0, 0.0);
+        self.page_entry = "1".to_owned();
+    }
+
     /// Replace the document with a freshly generated synthetic one.
     fn load_synthetic(&mut self, page_count: usize) {
         let Ok(snapshot) = crate::synthetic::build_synthetic_snapshot(page_count) else {
             return;
         };
-        self.service = Box::new(FakeRenderService::new(snapshot.clone()));
-        self.state
-            .replace_snapshot(snapshot, &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]);
-        self.state.scroll_to_page(0, 0.0);
-        self.page_entry = "1".to_owned();
+        self.open_document(snapshot);
     }
 }
 
@@ -98,11 +111,7 @@ impl OpdfApp {
         match action {
             //--- opening a real document belongs to Track A; say so rather than doing nothing ---
             MenuAction::OpenDocument => self.show_about = true,
-            MenuAction::CloseDocument => {
-                self.service = Box::new(FakeRenderService::new(DocumentSnapshot::default()));
-                self.state
-                    .replace_snapshot(DocumentSnapshot::default(), &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]);
-            }
+            MenuAction::CloseDocument => self.open_document(DocumentSnapshot::default()),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
             MenuAction::ZoomIn => {
@@ -255,6 +264,13 @@ impl OpdfApp {
                 crate::panels::canvas::show_canvas(ui, &mut self.state, &mut self.canvas_cache, &self.theme, pixels_per_point);
             });
 
+        //--- the canvas has just written back the viewport it really got; a fit mode
+        //--- is a standing promise and has to follow that viewport, resize or not ---
+        if self.state.sync_fit_to_viewport() {
+            //--- the refit lands after this frame's shapes, so ask for the frame that draws it ---
+            ctx.request_repaint();
+        }
+
         if self.show_about {
             let mut open = true;
             egui::Window::new("About opdf").open(&mut open).resizable(false).show(ctx, |ui| {
@@ -371,6 +387,33 @@ mod tests {
         );
         assert!(app.rail_cache.is_empty());
         assert_eq!(app.state.current_page(), Some(0));
+    }
+
+    /// The dangerous case the previous test misses: two documents of the same
+    /// length share a revision, so nothing about the *snapshot* says the cache
+    /// must be emptied — only the fact that a document was opened does.
+    #[test]
+    fn generating_the_same_document_again_still_releases_its_textures() {
+        let (mut app, ctx) = build_app(10);
+        for _ in 0..2 {
+            step_render_service(&app.state, app.service.as_ref(), &mut [&mut app.canvas_cache], &ctx, 1.0);
+        }
+        assert!(!app.canvas_cache.is_empty(), "the canvas cache must warm before this test means anything");
+        let revision = app.state.snapshot().revision;
+        let document = app.state.document_id();
+
+        app.apply_action(MenuAction::GenerateSynthetic(10), &ctx);
+
+        assert_eq!(
+            app.state.snapshot().revision,
+            revision,
+            "the two documents collide on revision; that is the case that matters"
+        );
+        assert_ne!(document, app.state.document_id(), "a document the user opened must carry a new identity");
+        assert!(
+            app.canvas_cache.is_empty(),
+            "the previous document's textures would be served for the new one, whose requests are keyed identically"
+        );
     }
 
     #[test]
