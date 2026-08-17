@@ -76,6 +76,14 @@ pub struct OpenedDocument {
     pub service: Box<dyn RenderService>,
     /// The snapshot both of the above were built from.
     pub snapshot: DocumentSnapshot,
+    /// Where the document was opened from, if it came from a file.
+    ///
+    /// Carried with the document rather than threaded separately, for the same
+    /// reason the snapshot is: Save writes to this path, and a path that arrived
+    /// by a different route than the document could point at a different file
+    /// than the one the shell believes is open. A synthetic document has no
+    /// origin, so Save has to ask.
+    pub path: Option<PathBuf>,
 }
 
 /// Opening a document from disk.
@@ -101,6 +109,14 @@ pub trait PathChooser {
     /// Show a picker for PDF files, returning the chosen path, or `None` if the
     /// user cancelled.
     fn choose_pdf(&self) -> Option<PathBuf>;
+
+    /// Show a save dialog, returning the path to write to, or `None` if the user
+    /// cancelled.
+    ///
+    /// Separate from [`PathChooser::choose_pdf`] because the two dialogs differ
+    /// in more than their title: a save dialog accepts a name that does not
+    /// exist yet, and confirms overwriting one that does.
+    fn choose_save_path(&self) -> Option<PathBuf>;
 }
 
 /// The production chooser: the platform's own file dialog.
@@ -109,6 +125,10 @@ pub struct NativePathChooser;
 impl PathChooser for NativePathChooser {
     fn choose_pdf(&self) -> Option<PathBuf> {
         rfd::FileDialog::new().add_filter("PDF document", &["pdf"]).pick_file()
+    }
+
+    fn choose_save_path(&self) -> Option<PathBuf> {
+        rfd::FileDialog::new().add_filter("PDF document", &["pdf"]).save_file()
     }
 }
 
@@ -133,6 +153,10 @@ impl PathChooser for FakeChooser {
     fn choose_pdf(&self) -> Option<PathBuf> {
         self.path.clone()
     }
+
+    fn choose_save_path(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
 }
 
 //---------------------------------------------------------------------
@@ -154,6 +178,7 @@ impl DocumentOpener for PdfiumDocumentOpener {
             document: Box::new(document),
             service: Box::new(service),
             snapshot,
+            path: Some(path.to_owned()),
         })
     }
 }
@@ -204,7 +229,7 @@ impl FakeOpener {
 }
 
 impl DocumentOpener for FakeOpener {
-    fn open(&self, _path: &Path) -> Result<OpenedDocument> {
+    fn open(&self, path: &Path) -> Result<OpenedDocument> {
         let Some(page_count) = self.page_count else {
             return Err(Error::Unsupported("this opener is configured to fail".to_owned()));
         };
@@ -219,6 +244,9 @@ impl DocumentOpener for FakeOpener {
             document: Box::new(document),
             service,
             snapshot,
+            //--- the fake ignores the path when reading, but the shell saves back
+            //--- to it, so a test can drive the whole save path through the fake ---
+            path: Some(path.to_owned()),
         })
     }
 }
