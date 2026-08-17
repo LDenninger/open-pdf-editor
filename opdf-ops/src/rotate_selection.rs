@@ -9,7 +9,7 @@ use crate::set_rotation::SetRotation;
 ///
 /// An empty selection yields a command that changes nothing, on the same
 /// terms as [`crate::delete_selection`].
-pub fn rotate_selection<D: Document + 'static>(ids: &[PageId], rotation: Rotation) -> Box<dyn Command<D>> {
+pub fn rotate_selection<D: Document + ?Sized + 'static>(ids: &[PageId], rotation: Rotation) -> Box<dyn Command<D>> {
     let commands: Vec<Box<dyn Command<D>>> = ids
         .iter()
         .map(|&page| Box::new(SetRotation { page, rotation }) as Box<dyn Command<D>>)
