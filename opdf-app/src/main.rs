@@ -1,8 +1,8 @@
 //! Binary entry point for the open-pdf-editor desktop shell.
 //!
-//! Owned by **Track D**. Built against `opdf_core::fakes::FakeRenderService` and a
-//! synthetic document until Track A lands real document loading and Track B a real
-//! rasterizer.
+//! A document named on the command line is parsed by `opdf-pdf` and rasterized by
+//! `opdf-render`. With no document named, the shell shows a synthetic one so the
+//! viewer can still be exercised.
 
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
@@ -10,11 +10,15 @@
 use std::path::PathBuf;
 
 use opdf_app::app::OpdfApp;
+use opdf_app::opener::{DocumentOpener, PdfiumDocumentOpener};
+
+/// Exit status for a document the user asked for and the parser could not read.
+const EXIT_OPEN_FAILED: i32 = 1;
 
 /// Command-line arguments.
 #[derive(Debug)]
 struct AppArgs {
-    /// A document to open. Rejected for now: Track A owns real document loading.
+    /// A document to open. When absent, a synthetic document is generated instead.
     open_path: Option<PathBuf>,
     /// Number of synthetic pages to generate when no document is given.
     pages: usize,
@@ -22,20 +26,23 @@ struct AppArgs {
 
 /// Open a window showing either the requested document or a synthetic one.
 fn run_opdf(open_path: Option<PathBuf>, pages: usize) -> eframe::Result {
-    if let Some(path) = open_path {
-        eprintln!(
-            "opdf: opening {} is not implemented yet — real document loading is Track A's work",
-            path.display()
-        );
-        eprintln!("opdf: showing a synthetic document of {pages} pages instead");
-    }
-
-    let snapshot = match opdf_app::synthetic::build_synthetic_snapshot(pages) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!("opdf: could not build a synthetic document: {error}");
-            opdf_core::document::DocumentSnapshot::default()
-        }
+    //--- a user who asked for a file and got a fake one has been lied to, so a
+    //--- failed open exits rather than falling back to the synthetic document ---
+    let opened = match open_path {
+        Some(path) => match PdfiumDocumentOpener.open(&path) {
+            Ok(opened) => opened,
+            Err(error) => {
+                eprintln!("opdf: could not open {}: {error}", path.display());
+                std::process::exit(EXIT_OPEN_FAILED);
+            }
+        },
+        None => match opdf_app::synthetic::open_synthetic_document(pages) {
+            Ok(opened) => opened,
+            Err(error) => {
+                eprintln!("opdf: could not build a synthetic document: {error}");
+                std::process::exit(EXIT_OPEN_FAILED);
+            }
+        },
     };
 
     let options = eframe::NativeOptions {
@@ -49,7 +56,7 @@ fn run_opdf(open_path: Option<PathBuf>, pages: usize) -> eframe::Result {
     eframe::run_native(
         opdf_app::APPLICATION_NAME,
         options,
-        Box::new(move |creation| Ok(Box::new(OpdfApp::new(&creation.egui_ctx, snapshot)))),
+        Box::new(move |creation| Ok(Box::new(OpdfApp::new(&creation.egui_ctx, opened)))),
     )
 }
 

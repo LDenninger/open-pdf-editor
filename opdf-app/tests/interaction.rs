@@ -17,13 +17,15 @@
 //! frame actually emitted; see [`Harness::drawn_textures`].
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use egui::epaint::ClippedShape;
 use egui::{Context, Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Shape, TextureId, Vec2, pos2, vec2};
 use opdf_app::app::OpdfApp;
+use opdf_app::opener::{DocumentOpener, FakeChooser, FakeOpener};
 use opdf_app::panels::menu_bar::MenuAction;
 use opdf_app::panels::thumbnail_rail::lay_out_thumbnails;
-use opdf_app::synthetic::build_synthetic_snapshot;
+use opdf_app::synthetic::open_synthetic_document;
 use opdf_app::theme::Theme;
 
 const WINDOW_SIZE: Vec2 = vec2(1440.0, 900.0);
@@ -82,7 +84,7 @@ impl Harness {
     /// the real application goes through before anything is on screen.
     fn build(page_count: usize) -> Self {
         let ctx = Context::default();
-        let app = OpdfApp::new(&ctx, build_synthetic_snapshot(page_count).unwrap());
+        let app = OpdfApp::new(&ctx, open_synthetic_document(page_count).unwrap());
         let mut harness = Self {
             app,
             ctx,
@@ -265,7 +267,7 @@ fn keeps_the_scroll_extent_fixed_while_tiles_arrive() {
 fn draws_a_page_for_every_visible_slot_from_the_very_first_frame() {
     //--- the first frame has nothing cached; the canvas must still place pages ---
     let ctx = Context::default();
-    let mut app = OpdfApp::new(&ctx, build_synthetic_snapshot(200).unwrap());
+    let mut app = OpdfApp::new(&ctx, open_synthetic_document(200).unwrap());
     let input = RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE)),
         ..Default::default()
@@ -581,7 +583,7 @@ fn gives_the_canvas_the_rails_width_when_the_rail_is_hidden() {
 #[test]
 fn draws_an_empty_document_without_panicking() {
     let ctx = Context::default();
-    let mut app = OpdfApp::new(&ctx, opdf_core::document::DocumentSnapshot::default());
+    let mut app = OpdfApp::new(&ctx, open_synthetic_document(0).unwrap());
     for _ in 0..5 {
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE)),
@@ -663,4 +665,170 @@ fn replaces_a_document_mid_frame_without_serving_a_stale_tile() {
         None,
         "a tile from the previous document survived the replacement"
     );
+}
+
+//---------------------------------------------------------------------
+// The opener seam
+//---------------------------------------------------------------------
+
+#[test]
+fn the_app_draws_the_document_it_was_given_rather_than_one_it_built() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(7).open(Path::new("x.pdf")).unwrap();
+    let app = OpdfApp::new(&ctx, opened);
+    assert_eq!(app.state().page_count(), 7);
+    assert_eq!(app.document().map(|document| document.page_count()), Some(7));
+}
+
+#[test]
+fn opening_a_second_document_replaces_the_first() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    assert_eq!(app.state().page_count(), 3);
+
+    app.open_path(&FakeOpener::with_pages(11), Path::new("b.pdf"));
+
+    assert_eq!(app.state().page_count(), 11);
+    assert_eq!(app.document().map(|document| document.page_count()), Some(11));
+    //--- F14: the previous document's tiles must not survive into the new one ---
+    assert!(app.canvas_cache().is_empty());
+    assert!(app.last_error().is_none(), "a successful open must clear whatever failed before it");
+}
+
+#[test]
+fn a_failed_open_leaves_the_current_document_untouched_and_reports_why() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    app.open_path(&FakeOpener::failing(), Path::new("broken.pdf"));
+
+    assert_eq!(app.state().page_count(), 3, "a failed open must not close the open document");
+    assert!(app.last_error().is_some(), "a failed open must be surfaced, not swallowed");
+    let message = app.last_error().unwrap_or_default();
+    assert!(message.contains("broken.pdf"), "the message must name the file that failed, got: {message}");
+}
+
+//---------------------------------------------------------------------
+// Pages the rasterizer cannot resolve
+//---------------------------------------------------------------------
+
+/// Every page-border stroke colour this frame's shapes used.
+///
+/// The unrenderable placeholder is told apart from the ordinary one by the colour
+/// of its border, which is the only part of it that survives into the shape list
+/// as something a headless test can name.
+fn collect_rect_stroke_colours(shapes: &[ClippedShape]) -> HashSet<[u8; 4]> {
+    let mut colours = HashSet::new();
+    for clipped in shapes {
+        collect_strokes_from_shape(&clipped.shape, &mut colours);
+    }
+    colours
+}
+
+fn collect_strokes_from_shape(shape: &Shape, into: &mut HashSet<[u8; 4]>) {
+    match shape {
+        Shape::Rect(rect) => {
+            into.insert(rect.stroke.color.to_array());
+        }
+        Shape::Vec(inner) => {
+            for shape in inner {
+                collect_strokes_from_shape(shape, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A page the rasterizer refuses is a permanent condition, not a slow one.
+///
+/// The F5 fix froze the page-to-file index map at open, so a page inserted since
+/// then has no position in the file and fails by design. Clearing the pending slot
+/// and nothing else makes the scheduler ask again on the very next frame: the page
+/// stays a grey rectangle, the status bar reads "Rendering 1 page" for the life of
+/// the session, and the event loop never sleeps. That is the F3 shape exactly.
+#[test]
+fn an_unrenderable_page_shows_that_it_failed_and_stops_being_requested() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_unrenderable_page(3, 0).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    let mut last: Option<egui::FullOutput> = None;
+    for _ in 0..12 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE)),
+            ..Default::default()
+        };
+        last = Some(ctx.run(input, |ctx| app.draw(ctx)));
+    }
+    let output = last.unwrap();
+
+    assert_eq!(
+        app.canvas_cache().pending_count(),
+        0,
+        "a request that was answered — with a failure — must not stay in flight"
+    );
+
+    let theme = Theme::dark();
+    let colours = collect_rect_stroke_colours(&output.shapes);
+    assert!(
+        colours.contains(&theme.error_text.to_array()),
+        "the page the rasterizer refused must be drawn as refused, not as still loading"
+    );
+
+    let repaint_delay = output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|viewport| viewport.repaint_delay)
+        .unwrap_or_default();
+    assert!(
+        repaint_delay > std::time::Duration::ZERO,
+        "the shell must settle once every page has an answer, but it asked to be repainted immediately"
+    );
+}
+
+//---------------------------------------------------------------------
+// The File menu
+//---------------------------------------------------------------------
+
+#[test]
+fn the_file_menu_opens_the_document_the_chooser_returned() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing("chosen.pdf")), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::OpenDocument, &ctx);
+
+    assert_eq!(app.state().page_count(), 9, "File ▸ Open must open the file the dialog returned");
+    assert_eq!(app.document().map(|document| document.page_count()), Some(9));
+    assert!(app.last_error().is_none());
+}
+
+#[test]
+fn a_cancelled_file_dialog_leaves_the_document_alone_and_reports_nothing() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::cancelling()), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::OpenDocument, &ctx);
+
+    assert_eq!(app.state().page_count(), 3, "cancelling the dialog must not disturb the open document");
+    assert!(
+        app.last_error().is_none(),
+        "changing your mind is not a failure and must not be reported as one"
+    );
+}
+
+#[test]
+fn a_file_menu_open_that_fails_keeps_the_document_and_says_why() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing("broken.pdf")), Box::new(FakeOpener::failing()));
+
+    app.apply_action(MenuAction::OpenDocument, &ctx);
+
+    assert_eq!(app.state().page_count(), 3);
+    let message = app.last_error().unwrap_or_default();
+    assert!(message.contains("broken.pdf"), "the failure must name the file the user picked, got: {message}");
 }

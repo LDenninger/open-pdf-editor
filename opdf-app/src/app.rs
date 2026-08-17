@@ -4,11 +4,14 @@
 //! This module routes; it does not compute. Everything it decides was decided by
 //! [`crate::layout`], [`crate::zoom`], [`crate::scheduler`], and [`crate::viewer`].
 
-use opdf_core::document::DocumentSnapshot;
+use std::path::Path;
+
+use opdf_core::document::{Document, DocumentSnapshot};
 use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
 
+use crate::opener::{DocumentOpener, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
 use crate::panels::menu_bar::MenuAction;
 use crate::panels::status_bar::RenderStatus;
 use crate::panels::toolbar::ToolbarOutcome;
@@ -28,38 +31,68 @@ pub const RAIL_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 pub struct OpdfApp {
     theme: Theme,
     state: ViewerState,
+    document: Option<Box<dyn Document>>,
     service: Box<dyn RenderService>,
     canvas_cache: TextureCache,
     rail_cache: TextureCache,
     page_entry: String,
     show_about: bool,
+    last_error: Option<String>,
+    chooser: Box<dyn PathChooser>,
+    opener: Box<dyn DocumentOpener>,
 }
 
 impl OpdfApp {
-    /// Build the application around a snapshot, installing the theme into `ctx`.
+    /// Build the application around an already-opened document, installing the
+    /// theme into `ctx`.
     ///
-    /// The render service is constructed from the snapshot, mirroring how a real
-    /// worker will be constructed from the document it owns: the shell hands over
-    /// a description of the document and keeps only a handle.
-    pub fn new(ctx: &egui::Context, snapshot: DocumentSnapshot) -> Self {
+    /// The service is handed in rather than constructed here: that is what lets
+    /// the same shell draw an in-memory fake in tests and real PDFium in
+    /// production, and it guarantees the service and the snapshot the shell draws
+    /// were built from the same document at the same revision.
+    pub fn new(ctx: &egui::Context, opened: OpenedDocument) -> Self {
         let theme = Theme::dark();
         crate::theme::apply_theme(ctx, &theme);
-        let service = Box::new(FakeRenderService::new(snapshot.clone()));
         Self {
-            state: ViewerState::new(snapshot, &theme),
+            state: ViewerState::new(opened.snapshot, &theme),
             theme,
-            service,
+            document: Some(opened.document),
+            service: opened.service,
             canvas_cache: TextureCache::new(CANVAS_CACHE_BUDGET_BYTES),
             rail_cache: TextureCache::new(RAIL_CACHE_BUDGET_BYTES),
             page_entry: "1".to_owned(),
             show_about: false,
+            last_error: None,
+            chooser: Box::new(NativePathChooser),
+            opener: Box::new(PdfiumDocumentOpener),
         }
+    }
+
+    /// Replace the route File ▸ Open takes: which dialog asks the user, and what
+    /// opens the answer.
+    ///
+    /// Production uses the platform dialog and PDFium. A test injects both,
+    /// because a native file dialog cannot be driven headlessly — and what the
+    /// shell does with the dialog's answer is the part worth testing anyway.
+    pub fn with_open_route(mut self, chooser: Box<dyn PathChooser>, opener: Box<dyn DocumentOpener>) -> Self {
+        self.chooser = chooser;
+        self.opener = opener;
+        self
     }
 
     /// The viewer state this frame will draw: zoom, scroll offset, current page,
     /// rail visibility.
     pub fn state(&self) -> &ViewerState {
         &self.state
+    }
+
+    /// The document currently open, if any.
+    ///
+    /// The shell draws from the snapshot, never from this — it is kept so that a
+    /// later edit or save has something to act on, and so a test can check that
+    /// the shell is holding the document it was handed.
+    pub fn document(&self) -> Option<&dyn Document> {
+        self.document.as_deref()
     }
 
     /// The canvas's texture cache, for the status bar and for tests.
@@ -72,17 +105,79 @@ impl OpdfApp {
         &self.rail_cache
     }
 
-    /// Show `snapshot` as a newly opened document: a render service built from it,
-    /// a fresh document identity, both caches emptied, and the view back at page 1.
+    /// Show `opened` as a newly opened document: its own render service, a fresh
+    /// document identity, both caches emptied, and the view back at page 1.
     ///
-    /// Every way a document arrives goes through here — opening a file, closing
-    /// one, generating a synthetic one — because this is the single place that
+    /// Every way a document arrives goes through here — opening a file,
+    /// generating a synthetic one — because this is the single place that
     /// guarantees no pixel of the previous document survives into the new one.
     /// Emptying the caches is not an optimisation: two documents' render requests
     /// collide (see [`crate::viewer::DocumentId`]), so a surviving tile would be
-    /// served for the wrong document.
-    pub fn open_document(&mut self, snapshot: DocumentSnapshot) {
-        self.service = Box::new(FakeRenderService::new(snapshot.clone()));
+    /// served for the wrong document. Replacing the service matters for the same
+    /// reason: a response from the previous document that arrived late would be
+    /// filed as a tile of this one, and the request carries nothing that could
+    /// tell them apart.
+    pub fn open_document(&mut self, opened: OpenedDocument) {
+        self.install_document(Some(opened.document), opened.service, opened.snapshot);
+    }
+
+    /// Open `path` through `opener`, replacing whatever is currently open.
+    ///
+    /// A failed open is reported and otherwise inert: the document already on
+    /// screen stays exactly as it was. Losing the user's document because the file
+    /// they picked was malformed would be the worst possible response to an error
+    /// this API is guaranteed to produce.
+    pub fn open_path(&mut self, opener: &dyn DocumentOpener, path: &Path) {
+        let result = opener.open(path);
+        self.absorb_open(result, path);
+    }
+
+    /// Ask the configured chooser for a file and open it, doing nothing at all if
+    /// the user cancels.
+    ///
+    /// A cancelled dialog is not a failure and must not be reported as one.
+    fn open_chosen_path(&mut self) {
+        let Some(path) = self.chooser.choose_pdf() else {
+            return;
+        };
+        //--- the borrow of `self.opener` ends with the call, so the result can be
+        //--- absorbed through `&mut self` on the next line ---
+        let result = self.opener.open(&path);
+        self.absorb_open(result, &path);
+    }
+
+    /// Install an opened document, or record why it could not be opened.
+    fn absorb_open(&mut self, result: opdf_core::Result<OpenedDocument>, path: &Path) {
+        match result {
+            Ok(opened) => {
+                self.open_document(opened);
+                self.last_error = None;
+            }
+            Err(error) => self.last_error = Some(format!("could not open {}: {error}", path.display())),
+        }
+    }
+
+    /// The most recent failure the user has not yet dismissed.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Show no document at all, releasing the one that was open.
+    ///
+    /// Routed through the same installation as [`OpdfApp::open_document`] so that
+    /// closing cannot forget a step opening remembers.
+    fn close_document(&mut self) {
+        let snapshot = DocumentSnapshot::default();
+        self.install_document(None, Box::new(FakeRenderService::new(snapshot.clone())), snapshot);
+    }
+
+    /// The one place a document, its service, and its snapshot are installed
+    /// together.
+    fn install_document(&mut self, document: Option<Box<dyn Document>>, service: Box<dyn RenderService>, snapshot: DocumentSnapshot) {
+        self.document = document;
+        //--- the previous service is dropped here, which is what keeps a late
+        //--- response from the old document out of the new one's cache ---
+        self.service = service;
         self.state
             .open_document(snapshot, &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]);
         self.state.scroll_to_page(0, 0.0);
@@ -91,10 +186,10 @@ impl OpdfApp {
 
     /// Replace the document with a freshly generated synthetic one.
     fn load_synthetic(&mut self, page_count: usize) {
-        let Ok(snapshot) = crate::synthetic::build_synthetic_snapshot(page_count) else {
+        let Ok(opened) = crate::synthetic::open_synthetic_document(page_count) else {
             return;
         };
-        self.open_document(snapshot);
+        self.open_document(opened);
     }
 }
 
@@ -109,9 +204,8 @@ impl OpdfApp {
         let last_page = self.state.page_count().saturating_sub(1);
         let current = self.state.current_page().unwrap_or(0);
         match action {
-            //--- opening a real document belongs to Track A; say so rather than doing nothing ---
-            MenuAction::OpenDocument => self.show_about = true,
-            MenuAction::CloseDocument => self.open_document(DocumentSnapshot::default()),
+            MenuAction::OpenDocument => self.open_chosen_path(),
+            MenuAction::CloseDocument => self.close_document(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
             MenuAction::ZoomIn => {
@@ -238,7 +332,7 @@ impl OpdfApp {
         });
 
         egui::TopBottomPanel::bottom("opdf_status_bar").show(ctx, |ui| {
-            crate::panels::status_bar::show_status_bar(ui, &self.state, &RenderStatus::of(&self.canvas_cache), &self.theme);
+            crate::panels::status_bar::show_status_bar(ui, &self.state, &RenderStatus::of(&self.canvas_cache), self.last_error.as_deref(), &self.theme);
         });
 
         egui::SidePanel::left("opdf_thumbnail_rail")
@@ -275,7 +369,7 @@ impl OpdfApp {
             let mut open = true;
             egui::Window::new("About opdf").open(&mut open).resizable(false).show(ctx, |ui| {
                 ui.label(crate::describe_build());
-                ui.label("Track D shell. Opening real PDF files needs Track A; real rasterization needs Track B.");
+                ui.label("Documents are parsed by lopdf and rasterized by PDFium. Text selection and search are not implemented.");
                 ui.label("Icons: Phosphor (MIT). No Adobe assets are used.");
             });
             self.show_about = open;
@@ -304,11 +398,11 @@ impl eframe::App for OpdfApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synthetic::build_synthetic_snapshot;
+    use crate::synthetic::open_synthetic_document;
 
     fn build_app(page_count: usize) -> (OpdfApp, egui::Context) {
         let ctx = egui::Context::default();
-        let mut app = OpdfApp::new(&ctx, build_synthetic_snapshot(page_count).unwrap());
+        let mut app = OpdfApp::new(&ctx, open_synthetic_document(page_count).unwrap());
         app.state.viewport_size_px = (1000.0, 800.0);
         app.state.refresh_current_page();
         (app, ctx)

@@ -29,6 +29,7 @@ struct CacheEntry<T> {
 pub struct TileCache<T> {
     entries: HashMap<RenderRequest, CacheEntry<T>>,
     pending: HashSet<RenderRequest>,
+    failed: HashSet<RenderRequest>,
     budget_bytes: usize,
     used_bytes: usize,
     clock: u64,
@@ -40,6 +41,7 @@ impl<T> TileCache<T> {
         Self {
             entries: HashMap::new(),
             pending: HashSet::new(),
+            failed: HashSet::new(),
             budget_bytes,
             used_bytes: 0,
             clock: 0,
@@ -71,6 +73,11 @@ impl<T> TileCache<T> {
         self.pending.len()
     }
 
+    /// Number of requests the render service has refused.
+    pub fn failed_count(&self) -> usize {
+        self.failed.len()
+    }
+
     /// Mark the start of a frame, returning the clock value that separates
     /// "touched this frame" from "touched earlier".
     ///
@@ -95,6 +102,8 @@ impl<T> TileCache<T> {
     pub fn insert(&mut self, request: RenderRequest, value: T, bytes: usize) {
         self.clock += 1;
         self.pending.remove(&request);
+        //--- a tile that arrived supersedes an earlier refusal of the same request ---
+        self.failed.remove(&request);
         let entry = CacheEntry {
             value,
             bytes,
@@ -120,26 +129,47 @@ impl<T> TileCache<T> {
         self.entries.contains_key(request)
     }
 
-    /// Whether this request still needs rasterizing — neither cached nor
-    /// already in flight.
+    /// Every cached entry as a `(request, value)` pair, in no particular order,
+    /// without marking any of them as used.
+    ///
+    /// The drawing code looks entries up by key and has no use for this; it
+    /// exists so that a test can ask *what* the cache is holding rather than only
+    /// how much, which is the difference between proving a tile arrived and
+    /// proving the right pixels did.
+    pub fn entries(&self) -> impl Iterator<Item = (&RenderRequest, &T)> {
+        self.entries.iter().map(|(request, entry)| (request, &entry.value))
+    }
+
+    /// Whether this request still needs rasterizing — not cached, not already
+    /// in flight, and not already refused.
     ///
     /// The read-only half of [`TileCache::mark_pending`], for a caller that
     /// must decide whether it *would* submit before deciding whether it
     /// *can*. Planning a frame is exactly that: a request that does not fit
     /// this frame's budget must not be recorded as in flight, or nothing will
     /// ever clear it and the page stays blank forever.
+    ///
+    /// A refused request is excluded because a refusal is an answer. The
+    /// rasterizer resolves a page through the index map frozen when the file was
+    /// opened, so a page it cannot place is a permanent condition, not a slow
+    /// one — and asking again every frame is a repaint loop that never settles
+    /// behind a page that never appears.
     pub fn wants(&self, request: &RenderRequest) -> bool {
-        !self.entries.contains_key(request) && !self.pending.contains(request)
+        !self.entries.contains_key(request) && !self.pending.contains(request) && !self.failed.contains(request)
     }
 
     /// Record that `request` has been submitted, returning whether the caller
     /// should actually submit it.
     ///
-    /// Returns `false` when the request is already cached or already in flight —
-    /// which is what stops a viewer from resubmitting the same tile on every frame
-    /// while it waits.
+    /// Returns `false` when the request is already cached, already in flight, or
+    /// already refused — which is what stops a viewer from resubmitting the same
+    /// tile on every frame while it waits, or forever after it was refused.
+    ///
+    /// This agrees with [`TileCache::wants`] by construction. Two callers that
+    /// disagree about whether a request is still worth submitting is how a surface
+    /// ends up asking for a page every frame that nothing will ever answer.
     pub fn mark_pending(&mut self, request: RenderRequest) -> bool {
-        if self.entries.contains_key(&request) || self.pending.contains(&request) {
+        if !self.wants(&request) {
             return false;
         }
         self.pending.insert(request);
@@ -155,10 +185,28 @@ impl<T> TileCache<T> {
         self.pending.contains(request)
     }
 
-    /// Forget that a request is in flight, after a response arrives for it —
-    /// including a failed one, which never becomes an entry.
+    /// Forget that a request is in flight, after a response arrives for it.
+    ///
+    /// Use [`TileCache::note_failed`] for a response that reported a failure: a
+    /// request merely cleared is one [`TileCache::wants`] will ask for again.
     pub fn clear_pending(&mut self, request: &RenderRequest) {
         self.pending.remove(request);
+    }
+
+    /// Record that the render service refused `request`, releasing its pending
+    /// slot and stopping the scheduler from asking for it again.
+    pub fn note_failed(&mut self, request: RenderRequest) {
+        self.pending.remove(&request);
+        self.failed.insert(request);
+    }
+
+    /// Whether the render service has refused this request.
+    ///
+    /// The canvas asks so it can draw a page that failed differently from a page
+    /// that has not arrived yet: the two look identical to the user otherwise,
+    /// and one of them is never going to change.
+    pub fn has_failed(&self, request: &RenderRequest) -> bool {
+        self.failed.contains(request)
     }
 
     /// The cached request for `page` at `revision` whose scale is closest to
@@ -200,6 +248,8 @@ impl<T> TileCache<T> {
         });
         self.used_bytes = self.used_bytes.saturating_sub(freed_bytes);
         self.pending.retain(|request| request.revision == revision);
+        //--- an edit can be exactly what makes a refused page renderable again ---
+        self.failed.retain(|request| request.revision == revision);
     }
 
     /// Drop every entry and every pending request, whatever revision it belongs to.
@@ -213,6 +263,7 @@ impl<T> TileCache<T> {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.pending.clear();
+        self.failed.clear();
         self.used_bytes = 0;
     }
 
@@ -285,6 +336,51 @@ mod tests {
         cache.insert(request, 7, 100);
         assert_eq!(cache.pending_count(), 0, "an answered request must leave the pending set");
         assert!(!cache.mark_pending(request), "a cached request must never be resubmitted");
+    }
+
+    #[test]
+    fn stops_asking_for_a_request_the_service_refused() {
+        let mut cache: TileCache<u32> = TileCache::new(1_000);
+        let request = build_request(0, 1, 1.0);
+        assert!(cache.mark_pending(request));
+        cache.note_failed(request);
+        assert_eq!(cache.pending_count(), 0, "a refusal is an answer and must release the pending slot");
+        assert_eq!(cache.failed_count(), 1);
+        assert!(
+            cache.has_failed(&request),
+            "the canvas draws a refused page differently and must be able to tell"
+        );
+        assert!(
+            !cache.wants(&request),
+            "a refused request planned again every frame is a repaint loop behind a page that never appears"
+        );
+        assert!(!cache.mark_pending(request), "wants and mark_pending must agree, or one surface asks forever");
+    }
+
+    /// A refusal belongs to a document at a revision, not to the cache forever.
+    ///
+    /// The page the rasterizer could not place is exactly the page an edit or a
+    /// save is most likely to make placeable, so the refusal must not outlive the
+    /// structure it was made about.
+    #[test]
+    fn forgets_a_refusal_once_the_document_moves_on() {
+        let mut cache: TileCache<u32> = TileCache::new(1_000);
+        let request = build_request(0, 1, 1.0);
+        cache.note_failed(request);
+
+        cache.retain_revision(2);
+        assert!(cache.wants(&request), "a refusal of the previous revision must not silence the new one");
+
+        cache.note_failed(request);
+        cache.clear();
+        assert!(cache.wants(&request), "a different document must not inherit the previous one's refusals");
+
+        cache.note_failed(request);
+        cache.insert(request, 7, 100);
+        assert!(
+            !cache.has_failed(&request),
+            "a tile that arrived supersedes an earlier refusal of the same request"
+        );
     }
 
     #[test]
