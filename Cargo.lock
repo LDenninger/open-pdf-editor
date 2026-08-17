@@ -2099,6 +2099,10 @@ name = "opdf-cli"
 version = "0.0.0"
 dependencies = [
  "opdf-core",
+ "opdf-ops",
+ "opdf-pdf",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

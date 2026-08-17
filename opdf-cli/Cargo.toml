@@ -9,6 +9,14 @@ description = "Headless page operations"
 
 [dependencies]
 opdf-core = { path = "../opdf-core" }
+opdf-ops = { path = "../opdf-ops" }
+opdf-pdf = { path = "../opdf-pdf" }
+thiserror.workspace = true
 
 [dev-dependencies]
 opdf-core = { path = "../opdf-core", features = ["contract-tests"] }
+# Every operation is verified by reopening the file it wrote, so the tests need
+# a scratch directory. Same version the other crates in this workspace already
+# use for the same reason; kept out of the workspace dependency table because
+# the root manifest is not this crate's to edit.
+tempfile = "3"
