@@ -141,7 +141,7 @@ pub fn show_thumbnail_rail(ui: &mut egui::Ui, state: &mut ViewerState, cache: &m
                 painter.rect_stroke(
                     image_rect.expand(2.0),
                     egui::CornerRadius::same(theme.corner_radius),
-                    egui::Stroke::new(2.0, theme.accent),
+                    egui::Stroke::new(2.0_f32, theme.accent),
                     egui::StrokeKind::Outside,
                 );
             }
