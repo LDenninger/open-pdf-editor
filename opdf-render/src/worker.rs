@@ -11,6 +11,13 @@
 //! therefore made while holding [`crate::library::lock_pdfium`]. The lock is
 //! taken per operation rather than for the worker's lifetime, so that one
 //! worker cannot starve another.
+//!
+//! # Revisions
+//!
+//! A request's geometry is resolved against whatever snapshot is current when
+//! the worker renders it. That makes the backlog and the snapshot a single
+//! piece of state: a request queued under one snapshot must never be answered
+//! under the next one. See [`accept_message`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -154,6 +161,27 @@ fn serve_requests(
 ///
 /// A request evicted to keep the backlog bounded is answered immediately, so
 /// that every submitted request still receives exactly one response.
+///
+/// # A rebind supersedes the backlog
+///
+/// The worker resolves a request's geometry against whatever snapshot is
+/// current when it *renders* it, not when it accepted it. A request left in the
+/// backlog across a [`WorkerMessage::Rebind`] would therefore be rendered
+/// against the new snapshot and — because the cache is keyed on the request,
+/// which carries the old revision — stored under the revision it did not
+/// belong to. A revision 7 request came back with revision 8's swapped axes,
+/// and every later revision 7 request was served that tile from the cache.
+///
+/// So a rebind drains the backlog, answering everything in it
+/// [`RenderResponse::Failed`]. Failing is right rather than merely convenient:
+/// the caller has already moved to the new revision and will resubmit, whereas
+/// re-rendering against the retired snapshot would spend a rasterization on a
+/// tile nothing will ask for again. Requests that arrive *after* the rebind are
+/// untouched — they belong to the new snapshot.
+///
+/// The worker renders one request to completion before it reads the next
+/// message, so there is never a request in flight when a rebind is applied: the
+/// backlog is the whole set of requests the rebind can strand.
 fn accept_message(
     message: WorkerMessage,
     backlog: &mut Backlog,
@@ -172,6 +200,16 @@ fn accept_message(
             true
         }
         WorkerMessage::Rebind(replacement) => {
+            //--- drained before the snapshot moves, so nothing queued under the old one can be answered under the new ---
+            while let Some(superseded) = backlog.take_newest() {
+                let _ = responses.send(RenderResponse::Failed {
+                    request: superseded,
+                    reason: format!(
+                        "superseded by a rebind: the document moved from revision {} to revision {} while this request was queued, and answering it now would return the new revision's geometry",
+                        snapshot.revision, replacement.revision
+                    ),
+                });
+            }
             *snapshot = *replacement;
             cache.retain_revision(snapshot.revision);
             true
@@ -277,5 +315,91 @@ fn convert_file_rotation(rotation: PdfPageRenderRotation) -> Rotation {
         PdfPageRenderRotation::Degrees90 => Rotation::Quarter,
         PdfPageRenderRotation::Degrees180 => Rotation::Half,
         PdfPageRenderRotation::Degrees270 => Rotation::ThreeQuarter,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use opdf_core::{PageSize, Rotation};
+
+    fn build_snapshot(revision: u64, rotation: Rotation) -> DocumentSnapshot {
+        DocumentSnapshot {
+            revision,
+            pages: vec![PageInfo {
+                id: PageId::new(1),
+                size: PageSize::A4,
+                rotation,
+            }],
+        }
+    }
+
+    fn build_request(revision: u64) -> RenderRequest {
+        RenderRequest::new(PageId::new(1), revision, 1.0).unwrap()
+    }
+
+    /// A request accepted while one snapshot was current, then left in the
+    /// backlog while a rebind swapped that snapshot out, used to be rendered
+    /// against the *new* snapshot and cached under its own — now superseded —
+    /// revision key. The tile carried the new revision's geometry under the old
+    /// revision's name, and every later request for the old revision was served
+    /// that tile from the cache.
+    ///
+    /// A rebind therefore supersedes the whole backlog: nothing queued before it
+    /// may be answered after it.
+    #[test]
+    fn a_rebind_supersedes_every_request_queued_before_it() {
+        let (responses_tx, responses_rx) = unbounded::<RenderResponse>();
+        let mut backlog = Backlog::with_capacity(MAX_BACKLOG);
+        let mut snapshot = build_snapshot(7, Rotation::None);
+        let mut cache = TileCache::with_budget(DEFAULT_CACHE_BYTES);
+
+        let queued = build_request(7);
+        assert!(accept_message(
+            WorkerMessage::Render(queued),
+            &mut backlog,
+            &mut snapshot,
+            &mut cache,
+            &responses_tx
+        ));
+        assert!(!backlog.is_empty(), "the request must be queued before the rebind arrives");
+
+        let rebind = WorkerMessage::Rebind(Box::new(build_snapshot(8, Rotation::Quarter)));
+        assert!(accept_message(rebind, &mut backlog, &mut snapshot, &mut cache, &responses_tx));
+
+        assert!(
+            backlog.is_empty(),
+            "a request queued at revision 7 must not survive into revision 8; rendering it now would answer it with revision 8 geometry and cache it under revision 7"
+        );
+
+        let answered: Vec<RenderResponse> = responses_rx.try_iter().collect();
+        assert_eq!(answered.len(), 1, "every superseded request must still receive exactly one response");
+        assert_eq!(*answered[0].request(), queued, "the response must name the request that was superseded");
+        match &answered[0] {
+            RenderResponse::Failed { reason, .. } => assert!(reason.contains("rebind"), "the reason must name the cause, got: {reason}"),
+            RenderResponse::Ready { tile, .. } => panic!("a superseded request must not be answered with a {}x{} tile", tile.width(), tile.height()),
+        }
+    }
+
+    /// The backlog is drained on rebind, but a request that arrives *after* the
+    /// rebind belongs to the new snapshot and must be served normally.
+    #[test]
+    fn a_request_queued_after_a_rebind_is_untouched() {
+        let (responses_tx, responses_rx) = unbounded::<RenderResponse>();
+        let mut backlog = Backlog::with_capacity(MAX_BACKLOG);
+        let mut snapshot = build_snapshot(7, Rotation::None);
+        let mut cache = TileCache::with_budget(DEFAULT_CACHE_BYTES);
+
+        let rebind = WorkerMessage::Rebind(Box::new(build_snapshot(8, Rotation::Quarter)));
+        accept_message(rebind, &mut backlog, &mut snapshot, &mut cache, &responses_tx);
+        accept_message(WorkerMessage::Render(build_request(8)), &mut backlog, &mut snapshot, &mut cache, &responses_tx);
+
+        assert_eq!(
+            backlog.take_newest(),
+            Some(build_request(8)),
+            "a request queued after the rebind must still be served"
+        );
+        assert!(responses_rx.try_iter().next().is_none(), "nothing queued after the rebind may be failed");
     }
 }
