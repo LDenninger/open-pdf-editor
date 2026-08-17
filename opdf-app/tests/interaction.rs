@@ -21,7 +21,7 @@ use std::path::Path;
 
 use egui::epaint::ClippedShape;
 use egui::{Context, Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Shape, TextureId, Vec2, pos2, vec2};
-use opdf_app::app::OpdfApp;
+use opdf_app::app::{ExitIntent, OpdfApp};
 use opdf_app::opener::{DocumentOpener, FakeChooser, FakeOpener};
 use opdf_app::panels::menu_bar::MenuAction;
 use opdf_app::panels::thumbnail_rail::lay_out_thumbnails;
@@ -1149,4 +1149,138 @@ fn a_compaction_the_user_never_confirmed_cannot_be_confirmed_into_a_write() {
 
     assert!(!origin.exists(), "confirming a dialog that was never raised must not write the document");
     assert_eq!(app.undo_depth(), 1, "nor may it cost the history");
+}
+
+//---------------------------------------------------------------------
+// Unsaved changes
+//---------------------------------------------------------------------
+
+#[test]
+fn a_freshly_opened_document_has_nothing_unsaved() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let app = OpdfApp::new(&ctx, opened);
+    assert!(!app.has_unsaved_changes(), "opening a file does not modify it");
+}
+
+#[test]
+fn closing_with_unsaved_edits_asks_before_discarding_them() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    assert!(app.has_unsaved_changes());
+
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    assert_eq!(app.discard_prompt(), Some(ExitIntent::Close), "closing must ask rather than discard silently");
+    assert_eq!(app.state().page_count(), 3, "the document must still be open while the question stands");
+}
+
+#[test]
+fn closing_a_clean_document_does_not_ask() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    assert_eq!(app.discard_prompt(), None, "there is nothing to lose, so there is nothing to ask about");
+    assert_eq!(app.state().page_count(), 0, "a clean document must close immediately");
+}
+
+#[test]
+fn quitting_and_opening_with_unsaved_edits_both_ask_first() {
+    for (action, expected) in [(MenuAction::Quit, ExitIntent::Quit), (MenuAction::OpenDocument, ExitIntent::Open)] {
+        let ctx = Context::default();
+        let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+        let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing("other.pdf")), Box::new(FakeOpener::with_pages(9)));
+        app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+        app.apply_action(action, &ctx);
+
+        assert_eq!(app.discard_prompt(), Some(expected), "{action:?} must ask before it abandons unsaved edits");
+        assert_eq!(app.state().page_count(), 3, "{action:?} must not have gone through yet");
+    }
+}
+
+#[test]
+fn confirming_the_discard_goes_through_with_it() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    app.confirm_discard(&ctx);
+
+    assert_eq!(app.state().page_count(), 0, "confirming must actually close the document");
+    assert_eq!(app.discard_prompt(), None);
+}
+
+#[test]
+fn cancelling_the_discard_keeps_the_document_and_its_edits() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    app.cancel_discard();
+
+    assert_eq!(app.state().page_count(), 3, "cancelling must leave the document exactly where it was");
+    assert_eq!(app.discard_prompt(), None);
+    assert!(app.has_unsaved_changes(), "cancelling does not save; the edits are still unsaved");
+    assert_eq!(app.undo_depth(), 1);
+}
+
+#[test]
+fn saving_makes_the_document_clean_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    assert!(app.has_unsaved_changes());
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(!app.has_unsaved_changes(), "a saved document has nothing outstanding");
+
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+    assert_eq!(app.discard_prompt(), None, "a saved document must close without a question");
+    assert_eq!(app.state().page_count(), 0);
+}
+
+#[test]
+fn editing_after_a_save_makes_the_document_dirty_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::Save, &ctx);
+
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+    assert!(app.has_unsaved_changes(), "an edit after a save is unsaved work like any other");
+}
+
+/// Undoing back to the state that was saved is genuinely clean again — the
+/// comparison is against a revision, and undo advances the revision rather than
+/// rewinding it, so this is the case a naive "dirty flag" gets wrong in the
+/// opposite direction. Being asked about work that no longer differs is a
+/// nuisance, not a data-loss risk, so erring here is acceptable; what matters is
+/// that the shell never *fails* to ask.
+#[test]
+fn undoing_back_to_the_saved_state_still_errs_toward_asking() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+    app.apply_action(MenuAction::Save, &ctx);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    app.apply_action(MenuAction::Undo, &ctx);
+
+    assert!(
+        app.has_unsaved_changes(),
+        "the revision moved on, so the shell asks; asking needlessly is safe, failing to ask is not"
+    );
 }
