@@ -33,18 +33,28 @@
 //! # Threading
 //!
 //! Pdfium is not thread-safe, and neither is a document handle. One worker
-//! thread owns the document, the tile cache, and the backlog;
+//! thread per service owns that service's document, tile cache, and backlog;
 //! [`service::PdfiumRenderService`] owns only channel endpoints. `submit`
 //! pushes onto an unbounded sender and returns; `poll` drains a receiver with
 //! `try_iter` and returns whatever has arrived. Neither blocks.
 //!
-//! A thread per service is not sufficient on its own, because several services
-//! exist at once — the contract suite alone builds ten. `pdfium-render`'s
-//! `thread_safe` feature does not serialize anything in 0.9.3; it only makes
-//! the wrapper types `Send` and `Sync`. Every call into Pdfium, including the
-//! drops that close a document or a page, is therefore made while holding
-//! [`library::lock_pdfium`]. Without it, two threads loading a document at once
-//! corrupt Pdfium's global state permanently.
+//! **There is no single render thread.** There are N worker threads, one per
+//! open service — the contract suite alone builds ten — serialized by a
+//! process-wide mutex. That is a deliberate deviation and not an accident of
+//! implementation: `pdfium-render`'s `thread_safe` feature serializes nothing
+//! in 0.9.3, it only makes the wrapper types `Send` and `Sync`, so a thread per
+//! service buys isolation between documents and none at all inside Pdfium.
+//! Every call into Pdfium, including the drops that close a document or a page,
+//! is therefore made while holding the process-wide lock. One unlocked call
+//! corrupts Pdfium's global state permanently — see [`library`], which is why
+//! the binding is reachable only through [`library::with_pdfium`].
+//!
+//! The consequence a caller must plan for is that the lock is held for the
+//! whole of a rasterization, so any operation that needs Pdfium queues behind
+//! whatever render is in flight. `submit` and `poll` never touch Pdfium and are
+//! unaffected; opening a document does, and is documented at
+//! [`service::PdfiumRenderService::open`] with the measured cost and the
+//! non-blocking alternative.
 //!
 //! # Backpressure
 //!
@@ -91,6 +101,6 @@ mod fixture;
 pub use backlog::{Backlog, MAX_BACKLOG};
 pub use cache::{DEFAULT_CACHE_BYTES, TileCache};
 pub use geometry::{MAX_TILE_EDGE, MAX_TILE_PIXELS, TileGeometry, compute_tile_geometry};
-pub use library::bind_pdfium;
+pub use library::with_pdfium;
 pub use raster::rasterize_page;
 pub use service::PdfiumRenderService;
