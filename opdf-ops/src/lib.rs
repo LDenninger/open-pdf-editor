@@ -8,6 +8,10 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod binding;
+
+pub use binding::{BoundInverse, DocumentBinding};
+
 pub mod remove_page;
 
 pub use remove_page::{RemovePage, RestorePage};
@@ -46,7 +50,7 @@ pub use merge::Merge;
 
 pub mod extract;
 
-pub use extract::extract_range;
+pub use extract::{Extraction, extract_range};
 
 pub mod split;
 
