@@ -315,10 +315,11 @@ fn never_loses_a_drawable_tile_for_a_page_it_has_already_rendered() {
     harness.hover(point);
     harness.settle(6);
 
+    let document = harness.app.state().snapshot().document;
     let revision = harness.app.state().snapshot().revision;
     let first_page = harness.app.state().snapshot().pages[0].id;
     assert!(
-        harness.app.canvas_cache().find_nearest_scale(first_page, revision, 1.0).is_some(),
+        harness.app.canvas_cache().find_nearest_scale(document, first_page, revision, 1.0).is_some(),
         "the first page must be cached before the flicker check means anything"
     );
 
@@ -329,7 +330,7 @@ fn never_loses_a_drawable_tile_for_a_page_it_has_already_rendered() {
         harness.zoom_at(point, factor);
         let scale = harness.app.state().render_scale(1.0);
         assert!(
-            harness.app.canvas_cache().find_nearest_scale(first_page, revision, scale).is_some(),
+            harness.app.canvas_cache().find_nearest_scale(document, first_page, revision, scale).is_some(),
             "page 1 had no cached scale at all on zoom step {step}; the canvas would blink to a placeholder"
         );
     }
@@ -647,6 +648,7 @@ fn never_draws_the_first_documents_textures_after_a_second_document_is_opened() 
 fn replaces_a_document_mid_frame_without_serving_a_stale_tile() {
     let mut harness = Harness::build(40);
     harness.settle(4);
+    let old_document = harness.app.state().snapshot().document;
     let old_revision = harness.app.state().snapshot().revision;
     assert!(!harness.app.canvas_cache().is_empty(), "the cache must warm first");
 
@@ -657,11 +659,16 @@ fn replaces_a_document_mid_frame_without_serving_a_stale_tile() {
 
     let new_revision = harness.app.state().snapshot().revision;
     assert_ne!(old_revision, new_revision, "a new document must carry a new revision");
+    assert_ne!(
+        old_document,
+        harness.app.state().snapshot().document,
+        "a new document must carry a new identity, which is the part a revision cannot express"
+    );
     assert_eq!(harness.app.state().page_count(), 90);
     //--- nothing from the old structure may remain addressable ---
     let stale_page = opdf_core::page::PageId::new(0);
     assert_eq!(
-        harness.app.canvas_cache().find_nearest_scale(stale_page, old_revision, 1.0),
+        harness.app.canvas_cache().find_nearest_scale(old_document, stale_page, old_revision, 1.0),
         None,
         "a tile from the previous document survived the replacement"
     );
