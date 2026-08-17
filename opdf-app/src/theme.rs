@@ -33,6 +33,9 @@ pub struct Theme {
     pub text_primary: Color32,
     /// Secondary text: status bar detail, thumbnail numbers.
     pub text_muted: Color32,
+    /// Text colour for a failure the user must notice, such as an open that did
+    /// not happen. Warm enough to separate from muted status text at a glance.
+    pub error_text: Color32,
     /// Separator lines between chrome regions.
     pub separator: Color32,
     /// Standard inner padding for chrome regions, in egui points.
@@ -66,6 +69,7 @@ impl Theme {
             accent: Color32::from_rgb(0x4d, 0x8d, 0xf0),
             text_primary: Color32::from_rgb(0xdf, 0xe2, 0xe8),
             text_muted: Color32::from_rgb(0x8b, 0x91, 0x9d),
+            error_text: Color32::from_rgb(0xf0, 0x7f, 0x70),
             separator: Color32::from_rgb(0x2a, 0x2d, 0x33),
             gutter: 6.0,
             page_gap_pt: 14.0,
