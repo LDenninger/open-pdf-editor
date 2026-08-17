@@ -14,9 +14,7 @@
 //! [`BoundInverse`] closes that hole: it records which document the inverse was
 //! built against and refuses to apply to any other one.
 
-use std::ptr;
-
-use opdf_core::{Command, Document, Error, Result};
+use opdf_core::{Command, Document, DocumentId, Error, Result};
 
 //---------------------------------------------------------------------
 // Document identity
@@ -24,31 +22,32 @@ use opdf_core::{Command, Document, Error, Result};
 
 /// The identity of one live document.
 ///
-/// `opdf_core::Document` exposes no identity of its own — `revision` is a
-/// change counter that every implementation starts at zero, and page ids are
-/// allocated per document from zero as well, so neither distinguishes two
-/// documents of the same type. The address of the document value is the only
-/// discriminator available to this crate, and it is a sound one for the case
-/// that matters: a cross-document operation borrows both documents at once, so
-/// the borrow checker guarantees their addresses differ at the moment the
-/// binding is captured.
+/// A thin wrapper over [`DocumentId`], which every [`Document`] mints once at
+/// construction and keeps for its whole life. The wrapper exists so that this
+/// crate's guard reads as a *binding* — a claim about which document a command
+/// belongs to — rather than as an incidental equality of two ids.
 ///
-/// The cost of using an address is that moving a document in memory — into a
-/// `Box`, or through a `Vec` reallocation — invalidates bindings taken before
-/// the move. That direction is safe: a stale binding makes
-/// [`BoundInverse::apply`] fail loudly rather than mutate the wrong document.
+/// The identity travels with the document value, so a binding survives the
+/// document being moved: boxed, pushed through a reallocating `Vec`, or
+/// returned by value from the function that opened it. That is the whole
+/// difference from what this type used to be.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DocumentBinding(usize);
+pub struct DocumentBinding(DocumentId);
 
 impl DocumentBinding {
     /// Capture the identity of `document`.
     pub fn of<D: Document>(document: &D) -> Self {
-        Self(ptr::from_ref(document) as usize)
+        Self(document.id())
     }
 
     /// Whether `document` is the document this binding was captured from.
     pub fn matches<D: Document>(self, document: &D) -> bool {
         self == Self::of(document)
+    }
+
+    /// The identity this binding names.
+    pub const fn document(self) -> DocumentId {
+        self.0
     }
 }
 
@@ -86,8 +85,10 @@ impl<D: Document + 'static> Command<D> for BoundInverse<D> {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         if !self.binding.matches(document) {
             return Err(Error::Unsupported(format!(
-                "'{}' was built against a different document and must not be applied to this one: its page ids name pages of the document it came from",
-                self.inverse.label()
+                "'{}' was built against {} and must not be applied to {}: its page ids name pages of the document it came from",
+                self.inverse.label(),
+                self.binding.document(),
+                document.id()
             )));
         }
         let redo = self.inverse.apply(document)?;
@@ -158,6 +159,43 @@ mod tests {
 
         assert!(redo.apply(&mut other).is_err(), "the redo of a bound undo must be bound too");
         assert_eq!(other.page_count(), 3);
+    }
+
+    /// The cost the address-based binding could not avoid.
+    ///
+    /// A `DocumentBinding` built from `&document as *const _` names a stack
+    /// slot, not a document. Moving the value — into a `Box`, through a `Vec`
+    /// reallocation, or by the plain rebinding below — leaves the binding
+    /// pointing at an address the document no longer occupies, and the
+    /// legitimate undo is refused.
+    #[test]
+    fn a_binding_survives_the_document_moving_in_memory() {
+        let source = VecDocument::with_pages(4, PageSize::A4);
+        let mut target = VecDocument::new();
+        let extraction = crate::extract_range(&source, &mut target, 0, 2).unwrap();
+
+        //--- move the document; an address-based binding breaks here ---
+        let mut moved = target;
+
+        assert!(
+            extraction.undo(&mut moved).is_ok(),
+            "an identity-based binding must still recognise the document after it moves"
+        );
+        assert_eq!(moved.page_count(), 0, "the undo must actually have removed the extracted pages");
+    }
+
+    /// The same requirement one indirection further out, which is the shape the
+    /// shell actually holds: a document behind a `Box`.
+    #[test]
+    fn a_binding_survives_the_document_being_boxed() {
+        let document = VecDocument::with_pages(3, PageSize::A4);
+        let page = document.page_ids()[1];
+        let bound = BoundInverse::new(&document, Box::new(RemovePage { page }));
+
+        let mut boxed = Box::new(document);
+
+        bound.apply(&mut boxed).unwrap();
+        assert_eq!(boxed.page_count(), 2, "boxing a document must not invalidate a command bound to it");
     }
 
     #[test]
