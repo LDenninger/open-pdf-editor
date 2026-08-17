@@ -131,8 +131,12 @@ pub fn show_thumbnail_rail(ui: &mut egui::Ui, state: &mut ViewerState, cache: &m
                 ui.ctx().request_repaint();
             }
 
+            let refused = cache.has_failed(&request);
             match cache.get(&request) {
                 Some(texture) => super::canvas::draw_page_tile(&painter, image_rect, texture, theme),
+                //--- a thumbnail the rasterizer refused must read as refused here too,
+                //--- or the rail alone still promises a page that is never coming ---
+                None if refused => super::canvas::draw_unrenderable_page(&painter, image_rect, slot.index + 1, theme),
                 None => super::canvas::draw_page_placeholder(&painter, image_rect, slot.index + 1, theme),
             }
 
