@@ -2082,6 +2082,7 @@ dependencies = [
  "opdf-pdf",
  "opdf-render",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]
