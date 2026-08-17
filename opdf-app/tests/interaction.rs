@@ -839,3 +839,112 @@ fn a_file_menu_open_that_fails_keeps_the_document_and_says_why() {
     let message = app.last_error().unwrap_or_default();
     assert!(message.contains("broken.pdf"), "the failure must name the file the user picked, got: {message}");
 }
+
+//---------------------------------------------------------------------
+// Saving
+//---------------------------------------------------------------------
+
+/// A shell over a fake document opened from a real, writable path.
+fn app_opened_from(path: &Path) -> (OpdfApp, Context) {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(path).unwrap();
+    (OpdfApp::new(&ctx, opened), ctx)
+}
+
+#[test]
+fn saving_with_no_document_open_is_inert_and_reports_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, ctx) = app_opened_from(&directory.path().join("orig.pdf"));
+    app.apply_action(MenuAction::CloseDocument, &ctx);
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(
+        !directory.path().join("orig.pdf").exists(),
+        "saving with nothing open must not write the document that was closed"
+    );
+    assert!(
+        app.last_error().is_none(),
+        "saving with nothing open is a no-op, not a failure the user must be told about"
+    );
+}
+
+#[test]
+fn saving_writes_to_the_path_the_document_was_opened_from() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&origin);
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(origin.exists(), "Save must write back to the file the document came from");
+    assert!(app.last_error().is_none(), "a save that succeeded must not report an error");
+}
+
+#[test]
+fn save_as_writes_elsewhere_and_later_saves_follow_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let elsewhere = directory.path().join("elsewhere.pdf");
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(&origin).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing(elsewhere.clone())), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::SaveAs, &ctx);
+
+    assert!(elsewhere.exists(), "Save As must write to the path the dialog returned");
+    assert!(!origin.exists(), "Save As must not also write the file the document came from");
+
+    //--- a plain Save now has to follow the document to its new home ---
+    std::fs::remove_file(&elsewhere).unwrap();
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(elsewhere.exists(), "after Save As, a plain Save must write to the new path");
+    assert!(!origin.exists(), "after Save As, a plain Save must not go back to the original path");
+}
+
+#[test]
+fn saving_a_document_with_no_origin_asks_where_to_put_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let chosen = directory.path().join("named.pdf");
+    let ctx = Context::default();
+    //--- a synthetic document was never opened from a file, so Save has no path to reuse ---
+    let mut app = OpdfApp::new(&ctx, open_synthetic_document(4).unwrap())
+        .with_open_route(Box::new(FakeChooser::choosing(chosen.clone())), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert!(chosen.exists(), "Save on a document with no origin must fall back to asking, not fail silently");
+    assert!(app.last_error().is_none());
+}
+
+#[test]
+fn a_cancelled_save_dialog_writes_nothing_and_reports_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(&origin).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::cancelling()), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::SaveAs, &ctx);
+
+    assert!(!origin.exists(), "cancelling Save As must not fall back to writing the original file");
+    assert!(app.last_error().is_none(), "changing your mind is not a failure");
+}
+
+#[test]
+fn a_failed_save_leaves_the_document_open_and_says_why() {
+    let directory = tempfile::tempdir().unwrap();
+    //--- a directory that does not exist: the write fails for an ordinary, real reason ---
+    let unwritable = directory.path().join("no-such-directory").join("orig.pdf");
+    let (mut app, ctx) = app_opened_from(&unwritable);
+
+    app.apply_action(MenuAction::Save, &ctx);
+
+    assert_eq!(app.state().page_count(), 3, "a failed save must not close or disturb the document");
+    let message = app.last_error().unwrap_or_default();
+    assert!(
+        message.contains("orig.pdf"),
+        "the failure must name the file it could not write, got: {message}"
+    );
+}
