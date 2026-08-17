@@ -34,6 +34,66 @@ where
     assert_every_mutation_advances_the_revision(&make_document);
     assert_failed_mutations_leave_the_revision_untouched(&make_document);
     assert_read_only_calls_never_advance_the_revision(&make_document);
+    assert_document_identity_is_stable_and_unique(&make_document);
+}
+
+//---------------------------------------------------------------------
+// Identity
+//---------------------------------------------------------------------
+
+/// Two documents of the same implementation must never share an identity, and a
+/// document's identity must not change as it is mutated.
+///
+/// This is the assertion that makes [`Document::id`] worth having. An
+/// implementation that returned a constant would satisfy every other requirement
+/// in this suite, because identity is only ever *compared*: a shared value looks
+/// exactly like a working one until two documents are open at once and one
+/// document's tiles are served for the other's pages.
+///
+/// Stability across a mutation is the other half. An identity that advanced with
+/// the revision would make a cross-document command's binding fail against the
+/// very document it was built for, and would tell a tile cache that every edit
+/// opened a new document.
+fn assert_document_identity_is_stable_and_unique<D: Document, F: Fn(usize) -> D>(make_document: &F) {
+    let first = make_document(1);
+    let second = make_document(1);
+    let third = make_document(1);
+    assert_ne!(
+        first.id(),
+        second.id(),
+        "two documents must not share an identity, or a cache keyed on it serves one document's tiles for another"
+    );
+    assert_ne!(third.id(), first.id(), "an identity must not be handed out twice");
+    assert_ne!(third.id(), second.id(), "an identity must not be handed out twice");
+
+    //--- every kind of mutation, because forgetting exactly one is the realistic failure ---
+    let mut document = make_document(2);
+    let before = document.id();
+    let ids = document.page_ids();
+    document.set_rotation(ids[0], Rotation::Quarter).expect("setting rotation must succeed");
+    document.move_page(ids[0], 1).expect("moving to a valid position must succeed");
+    document.remove_page(ids[0]).expect("removing an existing page must succeed");
+    document.restore_page(ids[0], 0).expect("restoring a removed page must succeed");
+    document.insert_page(0, PageSize::A4).expect("inserting at a valid position must succeed");
+    assert_eq!(
+        document.id(),
+        before,
+        "a mutation must not change a document's identity: it is the same open document, edited"
+    );
+
+    let source = make_document(1);
+    document
+        .import_pages(&source, &source.page_ids(), 0)
+        .expect("importing existing pages must succeed");
+    assert_eq!(document.id(), before, "importing pages must not change the importing document's identity");
+    assert_ne!(source.id(), document.id(), "importing from a document must not merge the two identities");
+
+    //--- and a rejected mutation must not disturb it either ---
+    assert!(document.remove_page(PageId::new(u64::MAX)).is_err());
+    assert_eq!(document.id(), before, "a rejected mutation must not change a document's identity");
+
+    //--- identity is stable across reads, exactly as the revision is ---
+    assert_eq!(document.id(), document.id(), "id() must be stable when nothing has changed between two reads");
 }
 
 //---------------------------------------------------------------------
