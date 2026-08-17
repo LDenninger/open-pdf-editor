@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use opdf_core::document::DocumentId;
 use opdf_core::page::PageId;
 use opdf_core::render::RenderRequest;
 
@@ -209,17 +210,23 @@ impl<T> TileCache<T> {
         self.failed.contains(request)
     }
 
-    /// The cached request for `page` at `revision` whose scale is closest to
-    /// `wanted_scale`, if any.
+    /// The cached request for `page` of `document` at `revision` whose scale is
+    /// closest to `wanted_scale`, if any.
     ///
     /// This is what removes flicker. When the exact key misses — the first frames
     /// after opening a document, and every frame during a zoom — the canvas draws
     /// the nearest scale it already has, stretched, instead of a blank rectangle.
     /// Only when nothing at all is cached for the page does a placeholder appear.
-    pub fn find_nearest_scale(&self, page: PageId, revision: u64, wanted_scale: f32) -> Option<RenderRequest> {
+    ///
+    /// `document` is filtered on for the same reason `revision` is, and it is the
+    /// stricter of the two: the fallback deliberately relaxes the scale, so
+    /// without it a page of a document that merely *shares a page id* — which
+    /// every pair of freshly opened documents does — would be stretched onto this
+    /// one's canvas the moment the exact key missed.
+    pub fn find_nearest_scale(&self, document: DocumentId, page: PageId, revision: u64, wanted_scale: f32) -> Option<RenderRequest> {
         self.entries
             .keys()
-            .filter(|request| request.page == page && request.revision == revision)
+            .filter(|request| request.document == document && request.page == page && request.revision == revision)
             .copied()
             .min_by(|left, right| (left.scale - wanted_scale).abs().total_cmp(&(right.scale - wanted_scale).abs()))
     }
@@ -304,8 +311,15 @@ impl<T> TileCache<T> {
 mod tests {
     use super::*;
 
+    /// The document identity every request in this module names, unless a test
+    /// deliberately builds a second document.
+    fn test_document() -> DocumentId {
+        static DOCUMENT: std::sync::OnceLock<DocumentId> = std::sync::OnceLock::new();
+        *DOCUMENT.get_or_init(DocumentId::new_unique)
+    }
+
     fn build_request(page: u64, revision: u64, scale: f32) -> RenderRequest {
-        RenderRequest::new(PageId::new(page), revision, scale).unwrap()
+        RenderRequest::new(test_document(), PageId::new(page), revision, scale).unwrap()
     }
 
     #[test]
@@ -399,7 +413,7 @@ mod tests {
         cache.insert(build_request(3, 1, 0.5), 1, 10);
         cache.insert(build_request(3, 1, 2.0), 2, 10);
         cache.insert(build_request(4, 1, 1.0), 3, 10);
-        let found = cache.find_nearest_scale(PageId::new(3), 1, 1.6).unwrap();
+        let found = cache.find_nearest_scale(test_document(), PageId::new(3), 1, 1.6).unwrap();
         assert_eq!(found.scale, 2.0, "1.6 is closer to 2.0 than to 0.5");
         assert_eq!(found.page, PageId::new(3), "the fallback must never borrow another page's pixels");
     }
@@ -409,7 +423,7 @@ mod tests {
         let mut cache: TileCache<u32> = TileCache::new(10_000);
         cache.insert(build_request(3, 1, 1.0), 1, 10);
         assert_eq!(
-            cache.find_nearest_scale(PageId::new(3), 2, 1.0),
+            cache.find_nearest_scale(test_document(), PageId::new(3), 2, 1.0),
             None,
             "a pre-edit tile must not be drawn for the post-edit document"
         );
