@@ -1,8 +1,9 @@
 //! Deciding which pages to ask the render service for this frame.
 //!
 //! Requests are always built from the [`DocumentSnapshot`] currently being drawn,
-//! so the revision they carry cannot drift from the structure they describe. The
-//! function signature enforces that: there is no revision parameter to get wrong.
+//! so neither the document they name nor the revision they carry can drift from
+//! the structure they describe. The function signature enforces that: there is no
+//! document parameter and no revision parameter to get wrong.
 
 use std::ops::Range;
 
@@ -106,8 +107,8 @@ pub fn plan_render_requests(
         let Some(page) = snapshot.pages.get(index) else {
             continue;
         };
-        //--- the revision comes off the snapshot being drawn, never from a caller-held field ---
-        let Ok(request) = RenderRequest::new(page.id, snapshot.revision, settings.scale_for_page(page.display_size())) else {
+        //--- both the document and the revision come off the snapshot being drawn, never from a caller-held field ---
+        let Ok(request) = RenderRequest::new(snapshot.document, page.id, snapshot.revision, settings.scale_for_page(page.display_size())) else {
             continue;
         };
         let request = request.with_rotation(settings.view_rotation);
