@@ -205,10 +205,20 @@ impl Drop for PdfiumRenderService {
 mod tests {
     use super::*;
     use crate::fixture::ensure_contract_fixture;
-    use opdf_core::{PageId, PageInfo, PageSize, Rotation};
+    use opdf_core::{DocumentId, PageId, PageInfo, PageSize, Rotation};
+    /// The document identity every request and snapshot in this module names.
+    ///
+    /// Fixed for the whole module so that two requests differ only in the fields
+    /// the test varies, and so a rebind describes the *same* document at a new
+    /// revision rather than a different one.
+    fn test_document() -> DocumentId {
+        static DOCUMENT: std::sync::OnceLock<DocumentId> = std::sync::OnceLock::new();
+        *DOCUMENT.get_or_init(DocumentId::new_unique)
+    }
 
     fn build_snapshot() -> DocumentSnapshot {
         DocumentSnapshot {
+            document: test_document(),
             revision: 7,
             pages: vec![
                 PageInfo {
@@ -309,6 +319,7 @@ mod tests {
         let service = PdfiumRenderService::open(
             &pdf_path,
             DocumentSnapshot {
+                document: test_document(),
                 revision: 1,
                 pages: vec![red, green],
             },
@@ -316,7 +327,7 @@ mod tests {
         .unwrap();
 
         //--- baseline: before any edit, page one is the red page ---
-        service.submit(RenderRequest::new(PageId::new(1), 1, 1.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(1), 1, 1.0).unwrap());
         match &drain(&service, 1)[0] {
             RenderResponse::Ready { tile, .. } => assert!(centre_is_red(tile), "page one must be the red page before any edit"),
             RenderResponse::Failed { reason, .. } => panic!("the baseline render must succeed, got: {reason}"),
@@ -324,11 +335,12 @@ mod tests {
 
         //--- the user moves page two above page one; nothing is saved ---
         service.rebind(DocumentSnapshot {
+            document: test_document(),
             revision: 2,
             pages: vec![green, red],
         });
 
-        service.submit(RenderRequest::new(PageId::new(1), 2, 1.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(1), 2, 1.0).unwrap());
         match &drain(&service, 1)[0] {
             RenderResponse::Ready { tile, .. } => assert!(
                 centre_is_red(tile),
@@ -346,6 +358,7 @@ mod tests {
         let service = build_service();
 
         service.rebind(DocumentSnapshot {
+            document: test_document(),
             revision: 8,
             pages: vec![
                 PageInfo {
@@ -361,7 +374,7 @@ mod tests {
             ],
         });
 
-        service.submit(RenderRequest::new(PageId::new(99), 8, 1.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(99), 8, 1.0).unwrap());
         match &drain(&service, 1)[0] {
             RenderResponse::Failed { reason, .. } => assert!(
                 reason.contains("not in the file this service opened"),
@@ -380,7 +393,7 @@ mod tests {
     #[test]
     fn answers_a_submitted_request_on_the_worker_thread() {
         let service = build_service();
-        let request = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        let request = RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap();
         service.submit(request);
 
         let responses = drain(&service, 1);
@@ -399,7 +412,7 @@ mod tests {
         let service = build_service();
         require_send(&service);
 
-        let request = RenderRequest::new(PageId::new(1), 7, 0.1).unwrap();
+        let request = RenderRequest::new(test_document(), PageId::new(1), 7, 0.1).unwrap();
         service.submit(request);
         assert_eq!(drain(&service, 1).len(), 1);
     }
@@ -422,7 +435,7 @@ mod tests {
     fn polling_never_blocks_on_a_render_in_flight() {
         let service = build_service();
         //--- 595 x 842 at scale 4.0 is 2380 x 3368, about 32 MiB of RGBA: milliseconds of work, not microseconds ---
-        service.submit(RenderRequest::new(PageId::new(1), 7, 4.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(1), 7, 4.0).unwrap());
 
         let started = std::time::Instant::now();
         let _first_poll = service.poll();
@@ -444,7 +457,7 @@ mod tests {
     /// against. The short sleep only has to get the worker past its channel
     /// bookkeeping and into Pdfium.
     fn occupy_pdfium(service: &PdfiumRenderService) {
-        service.submit(RenderRequest::new(PageId::new(1), 7, 11.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(1), 7, 11.0).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
 
@@ -480,7 +493,7 @@ mod tests {
         );
 
         //--- and the service it returns is a real one ---
-        opened.submit(RenderRequest::new(PageId::new(1), 7, 1.0).unwrap());
+        opened.submit(RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap());
         match &drain(&opened, 1)[0] {
             RenderResponse::Ready { tile, .. } => assert_eq!((tile.width(), tile.height()), (595, 842)),
             RenderResponse::Failed { reason, .. } => panic!("a deferred open of a good file must still render, got: {reason}"),
@@ -490,7 +503,7 @@ mod tests {
     #[test]
     fn a_deferred_open_of_a_missing_file_answers_every_request_with_the_reason() {
         let service = PdfiumRenderService::open_deferred(Path::new("/nonexistent/missing.pdf"), build_snapshot()).unwrap();
-        service.submit(RenderRequest::new(PageId::new(1), 7, 1.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap());
 
         let responses = drain(&service, 1);
         assert_eq!(responses.len(), 1, "a request against a document that never opened must still be answered");
@@ -506,7 +519,7 @@ mod tests {
     #[test]
     fn an_unknown_page_identity_fails_without_panicking() {
         let service = build_service();
-        service.submit(RenderRequest::new(PageId::new(u64::MAX), 7, 1.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(u64::MAX), 7, 1.0).unwrap());
 
         let responses = drain(&service, 1);
         assert_eq!(responses.len(), 1, "an unknown page must still produce a response");
@@ -526,7 +539,7 @@ mod tests {
             rotation: Rotation::None,
         });
         let service = PdfiumRenderService::open(&ensure_contract_fixture(), snapshot).unwrap();
-        service.submit(RenderRequest::new(PageId::new(3), 7, 1.0).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(3), 7, 1.0).unwrap());
 
         let responses = drain(&service, 1);
         assert_eq!(responses.len(), 1);
@@ -536,7 +549,7 @@ mod tests {
     #[test]
     fn an_absurd_scale_fails_rather_than_allocating() {
         let service = build_service();
-        service.submit(RenderRequest::new(PageId::new(1), 7, 1e30).unwrap());
+        service.submit(RenderRequest::new(test_document(), PageId::new(1), 7, 1e30).unwrap());
 
         let responses = drain(&service, 1);
         assert_eq!(responses.len(), 1, "an oversized request must still be answered");
@@ -550,7 +563,7 @@ mod tests {
     #[test]
     fn a_repeated_request_is_answered_from_the_cache() {
         let service = build_service();
-        let request = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        let request = RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap();
 
         service.submit(request);
         assert_eq!(drain(&service, 1).len(), 1);
@@ -569,7 +582,7 @@ mod tests {
     #[test]
     fn rebinding_changes_the_geometry_and_drops_the_old_revision() {
         let service = build_service();
-        let before = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        let before = RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap();
         service.submit(before);
         assert_eq!(drain(&service, 1).len(), 1);
         assert_eq!(service.rasterizations(), 1);
@@ -580,7 +593,7 @@ mod tests {
         rotated.pages[0].rotation = Rotation::Quarter;
         service.rebind(rotated);
 
-        let after = RenderRequest::new(PageId::new(1), 8, 1.0).unwrap();
+        let after = RenderRequest::new(test_document(), PageId::new(1), 8, 1.0).unwrap();
         service.submit(after);
         let responses = drain(&service, 1);
         assert_eq!(responses.len(), 1);
@@ -624,12 +637,12 @@ mod tests {
         let service = build_service();
 
         //--- 595 x 842 at scale 8.0 is 4760 x 6736, about 32 megapixels: long enough to hold the worker ---
-        let slow = RenderRequest::new(PageId::new(1), 7, 8.0).unwrap();
+        let slow = RenderRequest::new(test_document(), PageId::new(1), 7, 8.0).unwrap();
         service.submit(slow);
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         //--- queued while revision 7 is still current, and still queued when the rebind lands ---
-        let queued = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        let queued = RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap();
         service.submit(queued);
         let mut rotated = build_snapshot();
         rotated.revision = 8;
@@ -664,7 +677,7 @@ mod tests {
     #[test]
     fn a_foreign_revision_is_rasterized_and_echoed_back_unchanged() {
         let service = build_service();
-        let request = RenderRequest::new(PageId::new(1), 4_242, 1.0).unwrap();
+        let request = RenderRequest::new(test_document(), PageId::new(1), 4_242, 1.0).unwrap();
         service.submit(request);
 
         let responses = drain(&service, 1);
