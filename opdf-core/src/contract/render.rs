@@ -1,6 +1,6 @@
 //! Behavioural contract that every [`RenderService`] implementation must satisfy.
 
-use crate::document::DocumentSnapshot;
+use crate::document::{DocumentId, DocumentSnapshot};
 use crate::page::{PageId, PageInfo, PageSize, Rotation};
 use crate::render::{RenderRequest, RenderResponse, RenderService};
 
@@ -28,8 +28,14 @@ fn drain_responses<S: RenderService>(service: &S, expected: usize) -> Vec<Render
 const SNAPSHOT_REVISION: u64 = 7;
 
 /// Build a two-page snapshot the contract suite renders against.
+///
+/// Each call mints a fresh [`DocumentId`], so a suite that builds two snapshots
+/// is building two *documents* — which is exactly the case
+/// [`assert_document_identity_distinguishes_cache_keys`] needs and no other
+/// field can express.
 fn build_snapshot() -> DocumentSnapshot {
     DocumentSnapshot {
+        document: DocumentId::new_unique(),
         revision: SNAPSHOT_REVISION,
         pages: vec![
             PageInfo {
@@ -44,6 +50,19 @@ fn build_snapshot() -> DocumentSnapshot {
             },
         ],
     }
+}
+
+/// A service over a fresh two-page snapshot, together with that snapshot's
+/// document identity.
+///
+/// Every assertion needs both: the service to submit to, and the identity every
+/// request it builds must name. Returning them as a pair is what stops an
+/// assertion from minting an unrelated identity and quietly testing the
+/// foreign-document path instead of the one it meant to.
+fn build_service<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) -> (S, DocumentId) {
+    let snapshot = build_snapshot();
+    let document = snapshot.document;
+    (make_service(snapshot), document)
 }
 
 /// Assert that an implementation honours the [`RenderService`] contract.
@@ -68,6 +87,113 @@ where
     assert_batched_requests_each_receive_a_response(&make_service);
     assert_a_foreign_revision_is_still_answered(&make_service);
     assert_revision_distinguishes_cache_keys();
+    assert_the_requested_document_is_echoed_back(&make_service);
+    assert_document_identity_distinguishes_cache_keys();
+}
+
+//---------------------------------------------------------------------
+// Document identity
+//---------------------------------------------------------------------
+
+/// The renderer carries the document identity; it never substitutes its own.
+///
+/// A response is filed by the request it names, so a service that answered with
+/// the identity it happens to hold rather than the one it was asked about would
+/// route the tile into the wrong document's cache — which is the failure the
+/// field exists to make impossible.
+///
+/// Like the revision, the identity is *not* validated: a service holding one
+/// document must still answer a request naming another, because a request can
+/// legitimately be queued before the caller learns which service will take it,
+/// and refusing would strand exactly the requests a cache most needs answered.
+fn assert_the_requested_document_is_echoed_back<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
+    let snapshot = build_snapshot();
+    let held = snapshot.document;
+    let service = make_service(snapshot);
+
+    let own = RenderRequest::new(held, PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
+    service.submit(own);
+    let responses = drain_responses(&service, 1);
+    assert_eq!(responses.len(), 1, "a request for the service's own document must be answered");
+    assert_eq!(
+        responses[0].request().document,
+        held,
+        "the response must echo the requested document unchanged, or a cache files the tile under the wrong document"
+    );
+
+    //--- a document the service does not hold: carried, not validated ---
+    let foreign = DocumentId::new_unique();
+    assert_ne!(foreign, held, "new_unique must not hand out an identity twice");
+    let (service, _own) = build_service(make_service);
+    let request = RenderRequest::new(foreign, PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
+    service.submit(request);
+
+    let responses = drain_responses(&service, 1);
+    assert_eq!(
+        responses.len(),
+        1,
+        "a request naming a document the service does not hold must still be answered"
+    );
+    assert_eq!(
+        responses[0].request().document,
+        foreign,
+        "the response must echo the requested document unchanged, not substitute the one the service holds"
+    );
+    match &responses[0] {
+        RenderResponse::Ready { tile, .. } => {
+            assert_eq!(tile.width(), 595, "a foreign document identity must not change how the page is rasterized");
+            assert_eq!(tile.height(), 842, "a foreign document identity must not change how the page is rasterized");
+        }
+        RenderResponse::Failed { reason, .. } => {
+            panic!("a renderer must not reject a request because its document differs from the snapshot it holds, got: {reason}")
+        }
+    }
+}
+
+/// Two requests differing only in **which document** they name must be distinct
+/// cache keys.
+///
+/// This is F14 written down. Two freshly opened documents agree on everything a
+/// request used to carry: page ids are allocated per document from zero, and
+/// every implementation starts its revision at zero too. A cache keyed on
+/// `(page, revision, scale, rotation)` therefore served document A's pixels for
+/// document B's pages, and the only defence was the convention that opening a
+/// document threw away every cache wholesale.
+fn assert_document_identity_distinguishes_cache_keys() {
+    //--- two documents that collide on every other field, which is what every pair of freshly opened documents does ---
+    let first = DocumentId::new_unique();
+    let second = DocumentId::new_unique();
+    assert_ne!(first, second, "two documents must not share an identity");
+
+    let from_first = RenderRequest::new(first, PageId::new(1), 0, 1.0).expect("scale 1.0 is valid");
+    let from_second = RenderRequest::new(second, PageId::new(1), 0, 1.0).expect("scale 1.0 is valid");
+
+    assert_ne!(
+        from_first, from_second,
+        "requests differing only in which document they name must not compare equal"
+    );
+
+    let mut cache = std::collections::HashMap::new();
+    cache.insert(from_first, "document A's pixels");
+    cache.insert(from_second, "document B's pixels");
+    assert_eq!(
+        cache.len(),
+        2,
+        "two documents agreeing on page, revision, scale and rotation must still occupy distinct HashMap keys"
+    );
+    assert_eq!(
+        cache[&from_first], "document A's pixels",
+        "a lookup for one document must never be answered with the other's tile"
+    );
+
+    //--- and the identity survives the rotation builder, which rebuilds the request ---
+    let rotated = from_first.with_rotation(Rotation::Quarter);
+    assert_eq!(rotated.document, first, "with_rotation must not drop the document identity");
+    assert_ne!(
+        rotated,
+        from_second.with_rotation(Rotation::Quarter),
+        "a view rotation must not collapse two documents onto one key"
+    );
 }
 
 //---------------------------------------------------------------------
@@ -82,9 +208,9 @@ where
 /// echo the requested revision back unchanged, so a cache can file the tile
 /// under the key it asked for.
 fn assert_a_foreign_revision_is_still_answered<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
-    let service = make_service(build_snapshot());
+    let (service, document) = build_service(make_service);
     let foreign = SNAPSHOT_REVISION.wrapping_add(1);
-    let request = RenderRequest::new(PageId::new(1), foreign, 1.0).expect("scale 1.0 is valid");
+    let request = RenderRequest::new(document, PageId::new(1), foreign, 1.0).expect("scale 1.0 is valid");
     service.submit(request);
 
     let responses = drain_responses(&service, 1);
@@ -114,8 +240,10 @@ fn assert_a_foreign_revision_is_still_answered<S: RenderService, F: Fn(DocumentS
 /// This is the whole point of the field: a tile rasterized before a structural
 /// change must not be addressable by a request built after one.
 fn assert_revision_distinguishes_cache_keys() {
-    let before = RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
-    let after = RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION.wrapping_add(1), 1.0).expect("scale 1.0 is valid");
+    //--- one document, two revisions: the revision must carry the distinction on its own ---
+    let document = DocumentId::new_unique();
+    let before = RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
+    let after = RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION.wrapping_add(1), 1.0).expect("scale 1.0 is valid");
 
     assert_ne!(before, after, "requests differing only in revision must not compare equal");
 
@@ -127,13 +255,13 @@ fn assert_revision_distinguishes_cache_keys() {
 }
 
 fn assert_polling_an_idle_service_is_empty<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
-    let service = make_service(build_snapshot());
+    let (service, _document) = build_service(make_service);
     assert!(service.poll().is_empty(), "polling before submitting must return nothing");
 }
 
 fn assert_every_request_is_answered_once<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
-    let service = make_service(build_snapshot());
-    let request = RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
+    let (service, document) = build_service(make_service);
+    let request = RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
     service.submit(request);
 
     let responses = drain_responses(&service, 1);
@@ -144,8 +272,8 @@ fn assert_every_request_is_answered_once<S: RenderService, F: Fn(DocumentSnapsho
 }
 
 fn assert_tile_dimensions_follow_scale<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
-    let service = make_service(build_snapshot());
-    service.submit(RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION, 2.0).expect("scale 2.0 is valid"));
+    let (service, document) = build_service(make_service);
+    service.submit(RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION, 2.0).expect("scale 2.0 is valid"));
 
     let responses = drain_responses(&service, 1);
     assert_eq!(responses.len(), 1, "a request at scale 2.0 must produce exactly one response");
@@ -164,8 +292,8 @@ fn assert_tile_dimensions_follow_scale<S: RenderService, F: Fn(DocumentSnapshot)
 /// `0.0005` proves the floor produces a 1x1 tile rather than a zero-sized one.
 fn assert_pixel_dimensions_round_to_nearest_with_a_one_pixel_floor<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
     //--- 595 * 0.51 = 303.45 and 842 * 0.51 = 429.42: rounding up would give 304x430 ---
-    let service = make_service(build_snapshot());
-    service.submit(RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION, 0.51).expect("scale 0.51 is valid"));
+    let (service, document) = build_service(make_service);
+    service.submit(RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION, 0.51).expect("scale 0.51 is valid"));
 
     let responses = drain_responses(&service, 1);
     assert_eq!(responses.len(), 1, "a request at scale 0.51 must produce exactly one response");
@@ -178,8 +306,8 @@ fn assert_pixel_dimensions_round_to_nearest_with_a_one_pixel_floor<S: RenderServ
     }
 
     //--- 595 * 0.0005 = 0.2975 and 842 * 0.0005 = 0.421: both round to zero and must be floored to one ---
-    let service = make_service(build_snapshot());
-    service.submit(RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION, 0.0005).expect("scale 0.0005 is valid"));
+    let (service, document) = build_service(make_service);
+    service.submit(RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION, 0.0005).expect("scale 0.0005 is valid"));
 
     let responses = drain_responses(&service, 1);
     assert_eq!(responses.len(), 1, "a request at scale 0.0005 must produce exactly one response");
@@ -201,8 +329,8 @@ fn assert_pixel_dimensions_round_to_nearest_with_a_one_pixel_floor<S: RenderServ
 }
 
 fn assert_rotation_swaps_tile_axes<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
-    let service = make_service(build_snapshot());
-    service.submit(RenderRequest::new(PageId::new(2), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid"));
+    let (service, document) = build_service(make_service);
+    service.submit(RenderRequest::new(document, PageId::new(2), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid"));
 
     let responses = drain_responses(&service, 1);
     assert_eq!(responses.len(), 1, "a request for a rotated page must produce exactly one response");
@@ -216,8 +344,8 @@ fn assert_rotation_swaps_tile_axes<S: RenderService, F: Fn(DocumentSnapshot) -> 
 }
 
 fn assert_unknown_pages_fail_without_panicking<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
-    let service = make_service(build_snapshot());
-    service.submit(RenderRequest::new(PageId::new(u64::MAX), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid"));
+    let (service, document) = build_service(make_service);
+    service.submit(RenderRequest::new(document, PageId::new(u64::MAX), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid"));
 
     let responses = drain_responses(&service, 1);
     assert_eq!(responses.len(), 1, "an unknown page must still produce a response");
@@ -229,9 +357,9 @@ fn assert_unknown_pages_fail_without_panicking<S: RenderService, F: Fn(DocumentS
 
 fn assert_view_rotation_composes_with_page_rotation<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
     //--- an unrotated page viewed at a quarter turn must swap its axes ---
-    let service = make_service(build_snapshot());
+    let (service, document) = build_service(make_service);
     service.submit(
-        RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION, 1.0)
+        RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION, 1.0)
             .expect("scale 1.0 is valid")
             .with_rotation(Rotation::Quarter),
     );
@@ -246,9 +374,9 @@ fn assert_view_rotation_composes_with_page_rotation<S: RenderService, F: Fn(Docu
     }
 
     //--- a quarter-turned page viewed at a further quarter turn composes to a half turn, restoring its axes ---
-    let service = make_service(build_snapshot());
+    let (service, document) = build_service(make_service);
     service.submit(
-        RenderRequest::new(PageId::new(2), SNAPSHOT_REVISION, 1.0)
+        RenderRequest::new(document, PageId::new(2), SNAPSHOT_REVISION, 1.0)
             .expect("scale 1.0 is valid")
             .with_rotation(Rotation::Quarter),
     );
@@ -272,9 +400,9 @@ fn assert_view_rotation_composes_with_page_rotation<S: RenderService, F: Fn(Docu
 }
 
 fn assert_batched_requests_each_receive_a_response<S: RenderService, F: Fn(DocumentSnapshot) -> S>(make_service: &F) {
-    let service = make_service(build_snapshot());
-    let first = RenderRequest::new(PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
-    let second = RenderRequest::new(PageId::new(2), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
+    let (service, document) = build_service(make_service);
+    let first = RenderRequest::new(document, PageId::new(1), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
+    let second = RenderRequest::new(document, PageId::new(2), SNAPSHOT_REVISION, 1.0).expect("scale 1.0 is valid");
     service.submit(first);
     service.submit(second);
 
