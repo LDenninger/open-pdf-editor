@@ -10,7 +10,7 @@ pub struct MovePage {
     pub to_index: usize,
 }
 
-impl<D: Document> Command<D> for MovePage {
+impl<D: Document + ?Sized> Command<D> for MovePage {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         let from_index = document.index_of(self.page)?;
         document.move_page(self.page, self.to_index)?;
