@@ -202,6 +202,20 @@ impl<T> TileCache<T> {
         self.pending.retain(|request| request.revision == revision);
     }
 
+    /// Drop every entry and every pending request, whatever revision it belongs to.
+    ///
+    /// Called when a *different document* is opened, where
+    /// [`TileCache::retain_revision`] is not enough: a revision counts edits within
+    /// one document, every document starts that count at zero, and page ids are
+    /// allocated per document — so the previous document's entries are keyed
+    /// exactly as the new document will look them up, and retaining them serves one
+    /// document's pixels for another.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.pending.clear();
+        self.used_bytes = 0;
+    }
+
     /// Evict least-recently-used entries until the cache is within budget,
     /// returning how many were dropped.
     ///
@@ -371,6 +385,24 @@ mod tests {
         assert_eq!(cache.len(), 1, "only the current revision may survive");
         assert_eq!(cache.used_bytes(), 100, "freed entries must return their bytes to the budget");
         assert_eq!(cache.pending_count(), 0, "a request in flight for a superseded revision must be forgotten too");
+    }
+
+    #[test]
+    fn drops_everything_including_the_current_revision_when_cleared() {
+        let mut cache: TileCache<u32> = TileCache::new(10_000);
+        cache.insert(build_request(0, 0, 1.0), 1, 100);
+        cache.insert(build_request(1, 0, 1.0), 2, 100);
+        cache.mark_pending(build_request(5, 0, 1.0));
+
+        cache.clear();
+
+        assert_eq!(cache.len(), 0, "a different document must not inherit the previous one's tiles");
+        assert_eq!(cache.used_bytes(), 0, "cleared entries must return their bytes to the budget");
+        assert_eq!(cache.pending_count(), 0, "a request in flight for the previous document must be forgotten");
+        assert!(
+            cache.wants(&build_request(0, 0, 1.0)),
+            "the new document must rasterize its own pixels for a colliding key, not reuse what is cached"
+        );
     }
 
     #[test]

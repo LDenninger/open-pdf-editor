@@ -6,19 +6,61 @@
 //! `eframe::App::update`, split out because `eframe::Frame` has no public
 //! constructor and so cannot be built by a test.
 //!
-//! They assert on state, not on pixels: what a page *looks* like is still only
-//! checked by hand. What they do cover is every wiring bug an eyeball check would
-//! catch — a scroll that does not move, an anchor measured from the wrong origin,
-//! a click that selects nothing, a cache that grows without bound — and unlike the
-//! eyeball check they run in headless CI on every commit.
+//! They assert mostly on state rather than on pixels: what a page *looks* like is
+//! still only checked by hand. What they do cover is every wiring bug an eyeball
+//! check would catch — a scroll that does not move, an anchor measured from the
+//! wrong origin, a click that selects nothing, a cache that grows without bound —
+//! and unlike the eyeball check they run in headless CI on every commit.
+//!
+//! Where a defect is invisible in state — a texture from one document drawn for
+//! another, when both documents look the same — the test reads the shapes the
+//! frame actually emitted; see [`Harness::drawn_textures`].
 
-use egui::{Context, Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Vec2, pos2, vec2};
+use std::collections::HashSet;
+
+use egui::epaint::ClippedShape;
+use egui::{Context, Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Shape, TextureId, Vec2, pos2, vec2};
 use opdf_app::app::OpdfApp;
+use opdf_app::panels::menu_bar::MenuAction;
 use opdf_app::panels::thumbnail_rail::lay_out_thumbnails;
 use opdf_app::synthetic::build_synthetic_snapshot;
 use opdf_app::theme::Theme;
 
 const WINDOW_SIZE: Vec2 = vec2(1440.0, 900.0);
+
+/// egui's font atlas, allocated before the shell has drawn anything and drawn on
+/// every frame. It is the one textured mesh in a frame that is not a page tile.
+const FONT_ATLAS: TextureId = TextureId::Managed(0);
+
+/// Every texture drawn by this frame's shapes, other than the font atlas.
+///
+/// `egui::Painter::image` — which is how both the canvas and the rail draw a tile —
+/// emits a textured `Shape::Mesh`, so this is the set of tiles that actually
+/// reached the frame's shape list. It is the closest thing to a pixel assertion
+/// this crate can make without a GPU: two frames that draw the same texture id
+/// drew the same pixels.
+fn collect_drawn_textures(shapes: &[ClippedShape]) -> HashSet<TextureId> {
+    let mut drawn = HashSet::new();
+    for clipped in shapes {
+        collect_from_shape(&clipped.shape, &mut drawn);
+    }
+    drawn
+}
+
+/// Walk one shape, recursing into groups, collecting textured meshes.
+fn collect_from_shape(shape: &Shape, into: &mut HashSet<TextureId>) {
+    match shape {
+        Shape::Mesh(mesh) if mesh.texture_id != FONT_ATLAS => {
+            into.insert(mesh.texture_id);
+        }
+        Shape::Vec(inner) => {
+            for shape in inner {
+                collect_from_shape(shape, into);
+            }
+        }
+        _ => {}
+    }
+}
 
 //---------------------------------------------------------------------
 // Harness
@@ -29,6 +71,7 @@ struct Harness {
     app: OpdfApp,
     ctx: Context,
     window_size: Vec2,
+    drawn_textures: HashSet<TextureId>,
 }
 
 impl Harness {
@@ -44,12 +87,13 @@ impl Harness {
             app,
             ctx,
             window_size: WINDOW_SIZE,
+            drawn_textures: HashSet::new(),
         };
         harness.settle(4);
         harness
     }
 
-    /// Run one frame with the given events.
+    /// Run one frame with the given events, recording what it drew.
     fn run_frame(&mut self, events: Vec<Event>) {
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.window_size)),
@@ -57,7 +101,13 @@ impl Harness {
             ..Default::default()
         };
         let app = &mut self.app;
-        let _ = self.ctx.run(input, |ctx| app.draw(ctx));
+        let output = self.ctx.run(input, |ctx| app.draw(ctx));
+        self.drawn_textures = collect_drawn_textures(&output.shapes);
+    }
+
+    /// The tile textures the most recent frame put on screen.
+    fn drawn_textures(&self) -> &HashSet<TextureId> {
+        &self.drawn_textures
     }
 
     /// Run `count` frames with no input, letting tiles arrive and scrolling settle.
@@ -317,25 +367,91 @@ fn pages_forward_and_back_with_the_page_keys() {
     assert_eq!(harness.app.state().current_page(), Some(0), "PageUp must go back one page");
 }
 
+/// Fit-width must survive a resize with **no** further action from the user.
+///
+/// The point of a fit mode is that it holds. An earlier version of this test
+/// re-issued `FitWidth` after the resize and so only measured the fit arithmetic,
+/// which was never the broken part: nothing in the frame compared this frame's
+/// viewport with the last, so the content stayed at its old width inside a
+/// viewport half the size, and the mode's promise to "keep it fitted" was false.
 #[test]
 fn keeps_fitting_the_width_when_the_window_is_resized() {
     let mut harness = Harness::build(40);
     harness.hover(harness.canvas_point());
 
-    harness.app.apply_action(opdf_app::panels::menu_bar::MenuAction::FitWidth, &harness.ctx);
-    harness.settle(2);
+    harness.app.apply_action(MenuAction::FitWidth, &harness.ctx);
+    harness.settle(4);
     let wide_zoom = harness.app.state().zoom;
-
-    //--- halve the window width; fit-width must follow it down ---
-    harness.window_size = vec2(WINDOW_SIZE.x * 0.5, WINDOW_SIZE.y);
-    harness.settle(2);
-    harness.app.apply_action(opdf_app::panels::menu_bar::MenuAction::FitWidth, &harness.ctx);
-    harness.settle(2);
-    let narrow_zoom = harness.app.state().zoom;
-
+    let wide_viewport_px = harness.app.state().viewport_size_px.0;
     assert!(
-        narrow_zoom < wide_zoom,
-        "a narrower window must fit the content at a smaller zoom: {wide_zoom} -> {narrow_zoom}"
+        (harness.app.state().content_size_px().0 - wide_viewport_px).abs() < 1.0,
+        "fit-width must fill the viewport to begin with, or the resize proves nothing"
+    );
+
+    //--- halve the window width, and issue nothing else at all ---
+    harness.window_size = vec2(WINDOW_SIZE.x * 0.5, WINDOW_SIZE.y);
+    harness.settle(6);
+
+    let narrow_viewport_px = harness.app.state().viewport_size_px.0;
+    let narrow_content_px = harness.app.state().content_size_px().0;
+    assert!(
+        narrow_viewport_px < wide_viewport_px,
+        "the resize must actually shrink the canvas: {wide_viewport_px} -> {narrow_viewport_px}"
+    );
+    assert!(
+        (narrow_content_px - narrow_viewport_px).abs() < 1.0,
+        "after the resize the content is {narrow_content_px} pt wide in a {narrow_viewport_px} pt viewport; the fit did not survive it"
+    );
+    assert!(
+        harness.app.state().zoom < wide_zoom,
+        "a narrower window must fit the content at a smaller zoom: {wide_zoom} -> {}",
+        harness.app.state().zoom
+    );
+
+    //--- refitting changes the content height, which can show or hide the scroll
+    //--- bar, which changes the viewport again: that loop must not run forever ---
+    let settled_zoom = harness.app.state().zoom;
+    harness.settle(10);
+    assert_eq!(
+        harness.app.state().zoom,
+        settled_zoom,
+        "the refit must settle rather than oscillate with the scroll bar frame after frame"
+    );
+}
+
+/// Fit-page must survive a resize with no further action either.
+///
+/// Asserted as the promise itself — the current page fits entirely inside the
+/// viewport — rather than as a zoom number, so it holds whichever page the
+/// viewer settles on.
+#[test]
+fn keeps_fitting_the_page_when_the_window_is_resized() {
+    let mut harness = Harness::build(40);
+    harness.hover(harness.canvas_point());
+
+    harness.app.apply_action(MenuAction::FitPage, &harness.ctx);
+    harness.settle(4);
+    let tall_zoom = harness.app.state().zoom;
+    let tall_viewport_px = harness.app.state().viewport_size_px.1;
+
+    //--- halve the window height, and issue nothing else at all ---
+    harness.window_size = vec2(WINDOW_SIZE.x, WINDOW_SIZE.y * 0.5);
+    harness.settle(6);
+
+    let state = harness.app.state();
+    let short_viewport_px = state.viewport_size_px.1;
+    assert!(
+        short_viewport_px < tall_viewport_px,
+        "the resize must actually shorten the canvas: {tall_viewport_px} -> {short_viewport_px}"
+    );
+    let index = state.current_page().unwrap_or(0);
+    let placement = state.layout().placement(index).expect("the current page must have a placement");
+    let page_height_px = placement.height_pt * state.zoom;
+    assert!(
+        page_height_px <= short_viewport_px + 1.0,
+        "page {index} is {page_height_px} pt tall in a {short_viewport_px} pt viewport after the resize; fit-page did not survive it \
+         (zoom went {tall_zoom} -> {})",
+        state.zoom
     );
 }
 
@@ -475,6 +591,54 @@ fn draws_an_empty_document_without_panicking() {
     }
     assert_eq!(app.state().page_count(), 0);
     assert_eq!(app.state().current_page(), None);
+}
+
+/// A second document must never be drawn with the first document's pixels.
+///
+/// A revision counts edits *within* one document: every document starts it at
+/// zero and allocates page ids from zero, so two documents of the same length
+/// produce byte-identical `RenderRequest`s. Discarding stale tiles by revision
+/// alone therefore leaves the first document's textures in the cache, exactly
+/// keyed for the second document to find — `Open A`, `Open B`, and B's pages are
+/// drawn from A's pixels.
+///
+/// Two synthetic documents of the same length look alike, so this cannot be
+/// caught by comparing state; it is caught by the texture ids the frame drew.
+/// egui never reuses a texture id, so a texture allocated for A and drawn again
+/// while B is open is the defect itself, at the level of what reaches the GPU.
+#[test]
+fn never_draws_the_first_documents_textures_after_a_second_document_is_opened() {
+    let mut harness = Harness::build(40);
+    harness.settle(6);
+    let first_document: HashSet<TextureId> = harness.drawn_textures().clone();
+    assert!(
+        !first_document.is_empty(),
+        "the first document must have real tiles on screen, or this test proves nothing"
+    );
+
+    //--- another document of the same length: same revision, same page ids ---
+    let revision_before = harness.app.state().snapshot().revision;
+    harness.app.apply_action(MenuAction::GenerateSynthetic(40), &harness.ctx);
+    assert_eq!(
+        harness.app.state().snapshot().revision,
+        revision_before,
+        "this test is only meaningful while the two documents collide on revision"
+    );
+    assert!(
+        harness.app.canvas_cache().is_empty() && harness.app.rail_cache().is_empty(),
+        "opening another document must release the previous document's textures, not leave them addressable"
+    );
+
+    harness.settle(8);
+    let second_document: HashSet<TextureId> = harness.drawn_textures().clone();
+    assert!(!second_document.is_empty(), "the second document must reach the screen too");
+
+    let shared: Vec<&TextureId> = second_document.intersection(&first_document).collect();
+    assert!(
+        shared.is_empty(),
+        "{} textures rasterized for the previous document were drawn for the new one: {shared:?}",
+        shared.len()
+    );
 }
 
 #[test]
