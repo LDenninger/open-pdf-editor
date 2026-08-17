@@ -27,6 +27,7 @@ use opdf_app::panels::menu_bar::MenuAction;
 use opdf_app::panels::thumbnail_rail::lay_out_thumbnails;
 use opdf_app::synthetic::open_synthetic_document;
 use opdf_app::theme::Theme;
+use opdf_core::page::Rotation;
 
 const WINDOW_SIZE: Vec2 = vec2(1440.0, 900.0);
 
@@ -947,4 +948,93 @@ fn a_failed_save_leaves_the_document_open_and_says_why() {
         message.contains("orig.pdf"),
         "the failure must name the file it could not write, got: {message}"
     );
+}
+
+//---------------------------------------------------------------------
+// Editing, undo and redo
+//---------------------------------------------------------------------
+
+/// The rotation the document actually reports for the page at `index`.
+fn rotation_at(app: &OpdfApp, index: usize) -> Rotation {
+    app.state().snapshot().pages[index].rotation
+}
+
+#[test]
+fn rotating_a_page_is_undoable_and_redoable() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    let before = rotation_at(&app, 0);
+    assert_eq!(app.undo_depth(), 0, "a freshly opened document has nothing to undo");
+
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+    let rotated = rotation_at(&app, 0);
+    assert_eq!(rotated, before.rotated_by(Rotation::Quarter), "the page must actually turn");
+    assert_eq!(app.undo_depth(), 1, "an edit must be recorded on the undo stack");
+
+    app.apply_action(MenuAction::Undo, &ctx);
+
+    assert_eq!(rotation_at(&app, 0), before, "undo must put the page back");
+    assert_eq!(app.undo_depth(), 0);
+    assert_eq!(app.redo_depth(), 1);
+
+    app.apply_action(MenuAction::Redo, &ctx);
+
+    assert_eq!(rotation_at(&app, 0), rotated, "redo must turn the page again");
+    assert_eq!(app.undo_depth(), 1);
+    assert_eq!(app.redo_depth(), 0);
+}
+
+#[test]
+fn an_edit_reaches_the_document_and_not_only_the_snapshot() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    let revision = app.document().map(|document| document.revision());
+
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+
+    assert_ne!(
+        app.document().map(|document| document.revision()),
+        revision,
+        "the edit must be applied to the document itself; a snapshot the document does not back is a lie"
+    );
+    assert_eq!(
+        app.state().snapshot().revision,
+        app.document().map(|document| document.revision()).unwrap_or_default(),
+        "the snapshot the shell draws must be the one the document is at"
+    );
+}
+
+#[test]
+fn undo_and_redo_are_inert_with_nothing_to_undo() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    app.apply_action(MenuAction::Undo, &ctx);
+    app.apply_action(MenuAction::Redo, &ctx);
+
+    assert_eq!(app.undo_depth(), 0);
+    assert_eq!(app.redo_depth(), 0);
+    assert!(app.last_error().is_none(), "pressing undo with an empty history is not a failure");
+}
+
+#[test]
+fn opening_another_document_starts_a_fresh_history() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::RotatePageClockwise, &ctx);
+    assert_eq!(app.undo_depth(), 1);
+
+    app.open_path(&FakeOpener::with_pages(5), Path::new("b.pdf"));
+
+    assert_eq!(
+        app.undo_depth(),
+        0,
+        "an entry addresses pages of the document it was recorded against; applying it to another document would address the wrong pages"
+    );
+    assert_eq!(app.redo_depth(), 0);
 }
