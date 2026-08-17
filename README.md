@@ -195,7 +195,7 @@ The fakes are what make parallelism possible: the UI is built against
 | A — Document | `opdf-pdf` | Open, enumerate, save unchanged |
 | B — Rendering | `opdf-render` | PDFium worker and tile cache — **complete** |
 | C — Ops & CLI | `opdf-ops`, `opdf-cli` | Invertible page operations |
-| D — Shell | `opdf-app` | Application chrome and canvas |
+| D — Shell | `opdf-app` | Application chrome, canvas, save path and undo history |
 | E — Verification | `tests`, `fuzz`, `benches` | Corpus, round-trip harness, fuzzing |
 
 Integration is trunk-based: tracks merge to master as soon as a task is green,
@@ -234,13 +234,21 @@ the directory the library is loaded from. PDFium is BSD-3-Clause licensed.
 
 ## Usage
 
-Planned interfaces, for orientation only. Neither exists yet.
-
 The desktop application opens documents directly:
 
 ```bash
 opdf document.pdf
 ```
+
+It renders a real file, scrolls and zooms it, and edits it: rotate a page,
+delete a page, undo and redo, and save. **Save** writes an incremental update —
+it appends to the original bytes, preserving structure the implementation does
+not model, and keeps deleted pages recoverable. **Save as…** writes the same
+thing elsewhere. **Save compacted…** rewrites the file without its unreferenced
+objects; that permanently discards pages deleted in this session, so it asks
+first and clears the undo history when it goes ahead.
+
+Text selection and search are not implemented, and neither is drag-to-reorder.
 
 The CLI covers page operations headlessly, and doubles as the core's test
 harness:
