@@ -36,12 +36,12 @@ pub struct DocumentBinding(DocumentId);
 
 impl DocumentBinding {
     /// Capture the identity of `document`.
-    pub fn of<D: Document>(document: &D) -> Self {
+    pub fn of<D: Document + ?Sized>(document: &D) -> Self {
         Self(document.id())
     }
 
     /// Whether `document` is the document this binding was captured from.
-    pub fn matches<D: Document>(self, document: &D) -> bool {
+    pub fn matches<D: Document + ?Sized>(self, document: &D) -> bool {
         self == Self::of(document)
     }
 
@@ -61,12 +61,12 @@ impl DocumentBinding {
 /// that document untouched. The command it hands back in turn — the redo of
 /// this undo — carries the same binding, so the guard survives a full
 /// undo/redo cycle rather than being shed on the first application.
-pub struct BoundInverse<D: Document> {
+pub struct BoundInverse<D: Document + ?Sized> {
     binding: DocumentBinding,
     inverse: Box<dyn Command<D>>,
 }
 
-impl<D: Document + 'static> BoundInverse<D> {
+impl<D: Document + ?Sized + 'static> BoundInverse<D> {
     /// Bind `inverse` to `document`.
     pub fn new(document: &D, inverse: Box<dyn Command<D>>) -> Self {
         Self {
@@ -81,7 +81,7 @@ impl<D: Document + 'static> BoundInverse<D> {
     }
 }
 
-impl<D: Document + 'static> Command<D> for BoundInverse<D> {
+impl<D: Document + ?Sized + 'static> Command<D> for BoundInverse<D> {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         if !self.binding.matches(document) {
             return Err(Error::Unsupported(format!(
