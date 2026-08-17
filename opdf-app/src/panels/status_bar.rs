@@ -52,14 +52,27 @@ pub fn format_cache_usage(used_bytes: usize, budget_bytes: usize) -> String {
 //---------------------------------------------------------------------
 
 /// Draw the status bar.
-pub fn show_status_bar(ui: &mut egui::Ui, state: &ViewerState, status: &RenderStatus, theme: &Theme) {
+///
+/// `last_error` is the most recent failure the user has not dismissed — an open
+/// that did not happen, most often. It is shown here rather than in a modal
+/// because the shell has no modal infrastructure, and because a failure that
+/// changed nothing does not warrant interrupting the document that is still on
+/// screen.
+pub fn show_status_bar(ui: &mut egui::Ui, state: &ViewerState, status: &RenderStatus, last_error: Option<&str>, theme: &Theme) {
     ui.horizontal(|ui| {
         ui.set_height(theme.status_bar_height);
         ui.label(format_page_position(state.current_page(), state.page_count()));
         ui.separator();
         ui.label(format_zoom_percentage(state.zoom));
         ui.separator();
-        ui.colored_label(theme.text_muted, summarise_render_status(status));
+        match last_error {
+            Some(message) => {
+                ui.colored_label(theme.error_text, message);
+            }
+            None => {
+                ui.colored_label(theme.text_muted, summarise_render_status(status));
+            }
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.colored_label(theme.text_muted, format_cache_usage(status.used_bytes, status.budget_bytes));
         });
