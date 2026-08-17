@@ -11,7 +11,7 @@ use opdf_core::document::{Document, DocumentSnapshot};
 use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
-use opdf_ops::{SetRotation, UndoStack};
+use opdf_ops::{RemovePage, SetRotation, UndoStack};
 
 use crate::opener::{DocumentOpener, EditableDocument, NativePathChooser, OpenedDocument, PathChooser, PdfiumDocumentOpener};
 use crate::panels::menu_bar::MenuAction;
@@ -55,6 +55,13 @@ pub struct OpdfApp {
     /// document because that is what the shell owns; `Command` and `UndoStack`
     /// accept a `?Sized` document precisely so this is possible.
     undo: UndoStack<dyn EditableDocument>,
+    /// Whether the shell is waiting for the user to confirm a compacting save.
+    ///
+    /// Raised by [`MenuAction::Compact`] and answered by
+    /// [`OpdfApp::confirm_compaction`] or [`OpdfApp::cancel_compaction`]. Nothing
+    /// is written while this is set: the write is what the user is being asked
+    /// about.
+    compaction_pending: bool,
     service: Box<dyn RenderService>,
     canvas_cache: TextureCache,
     rail_cache: TextureCache,
@@ -82,6 +89,7 @@ impl OpdfApp {
             document: Some(opened.document),
             document_path: opened.path,
             undo: UndoStack::new(),
+            compaction_pending: false,
             service: opened.service,
             canvas_cache: TextureCache::new(CANVAS_CACHE_BUDGET_BYTES),
             rail_cache: TextureCache::new(RAIL_CACHE_BUDGET_BYTES),
@@ -362,6 +370,71 @@ impl OpdfApp {
         }
     }
 
+    //---------------------------------------------------------------------
+    // Compaction, and the history it costs — F16
+    //---------------------------------------------------------------------
+
+    /// Whether the shell is waiting for an answer about a compacting save.
+    pub fn compaction_pending(&self) -> bool {
+        self.compaction_pending
+    }
+
+    /// Ask the user whether to compact, writing nothing yet.
+    ///
+    /// Compaction is the one save that cannot be silently offered. It purges
+    /// unreferenced objects, and a page deleted in this session is exactly that:
+    /// it sits in the trash, referenced only by the undo entry that would put it
+    /// back. Since the compacted bytes become the document's base, that entry is
+    /// dead afterwards — so the user is told what it costs before it happens.
+    fn ask_to_compact(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+        self.compaction_pending = true;
+    }
+
+    /// Go ahead with the compacting save the user was asked about.
+    ///
+    /// The history is cleared **only after** `save_compacted` reports success, so
+    /// a compaction that failed costs nothing — mirroring `opdf-pdf`, where a
+    /// failed compaction leaves the trash intact. Both stacks go: a redo entry
+    /// produced by undoing an insertion resolves to `RestorePage` just as an undo
+    /// entry produced by a deletion does, and a queued command is opaque, so
+    /// there is no way to keep only the survivors.
+    pub fn confirm_compaction(&mut self) {
+        if !self.compaction_pending {
+            return;
+        }
+        self.compaction_pending = false;
+        let path = match self.document_path.clone() {
+            Some(path) => Some(path),
+            None => self.chooser.choose_save_path(),
+        };
+        let Some(path) = path else {
+            return;
+        };
+        if self.save_to(&path, SaveMode::Compacted) {
+            self.undo.clear();
+        }
+    }
+
+    /// Think better of the compacting save, writing nothing and keeping the
+    /// history.
+    pub fn cancel_compaction(&mut self) {
+        self.compaction_pending = false;
+    }
+
+    /// Delete the page the user is looking at.
+    fn delete_current_page(&mut self) {
+        let Some(index) = self.state.current_page() else {
+            return;
+        };
+        let Some(page) = self.state.snapshot().pages.get(index) else {
+            return;
+        };
+        self.apply_command(Box::new(RemovePage { page: page.id }));
+    }
+
     /// Turn the page the user is looking at a quarter turn clockwise.
     fn rotate_current_page(&mut self) {
         let Some(index) = self.state.current_page() else {
@@ -404,6 +477,8 @@ impl OpdfApp {
             MenuAction::Undo => self.undo_edit(),
             MenuAction::Redo => self.redo_edit(),
             MenuAction::RotatePageClockwise => self.rotate_current_page(),
+            MenuAction::DeletePage => self.delete_current_page(),
+            MenuAction::Compact => self.ask_to_compact(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
             MenuAction::ZoomIn => {
@@ -561,6 +636,40 @@ impl OpdfApp {
         if self.state.sync_fit_to_viewport() {
             //--- the refit lands after this frame's shapes, so ask for the frame that draws it ---
             ctx.request_repaint();
+        }
+
+        //--- the compaction warning: what it costs, in the user's terms, before it costs it ---
+        if self.compaction_pending {
+            let mut confirmed = false;
+            let mut cancelled = false;
+            egui::Modal::new(egui::Id::new("opdf_compaction_warning")).show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading("Save compacted?");
+                ui.add_space(8.0);
+                ui.label(
+                    "Compacting rewrites the file without the parts nothing refers to any more. \
+                     Pages you deleted in this session are among them, so they become permanently \
+                     unrecoverable.",
+                );
+                ui.add_space(4.0);
+                ui.label("Your undo history will be discarded. This cannot be undone.");
+                ui.add_space(4.0);
+                ui.colored_label(self.theme.text_muted, "Save (incremental) keeps both your deleted pages and your undo history.");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                    if ui.button("Compact and discard history").clicked() {
+                        confirmed = true;
+                    }
+                });
+            });
+            if confirmed {
+                self.confirm_compaction();
+            } else if cancelled {
+                self.cancel_compaction();
+            }
         }
 
         if self.show_about {
