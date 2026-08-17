@@ -157,8 +157,12 @@ concurrent work never touches the same files.
 - **A `Renderer` trait from day one.** PDFium sits behind it and is never called
   directly from the core or the UI, so a future pure-Rust rasterizer replaces
   one crate rather than the application.
-- **A single render worker.** PDFium is not thread-safe, so one dedicated thread
-  owns it and the UI thread never blocks on rendering.
+- **Serialized access to PDFium.** PDFium is not thread-safe, and
+  `pdfium-render`'s `thread_safe` feature only marks it `Send`/`Sync` without
+  serializing anything, so every call goes through a scoped `with_pdfium` that
+  holds a process-wide lock. One worker thread per open document, never two
+  inside the library at once. `submit` and `poll` never block the UI thread;
+  `open` does, measurably, and `open_deferred` is the non-blocking alternative.
 - **Every mutation is a `Command` with an inverse.** Undo/redo is a property of
   the architecture, not a feature added later.
 - **Incremental save by default.** A full rewrite is offered explicitly as a
