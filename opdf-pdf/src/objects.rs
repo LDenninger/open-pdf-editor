@@ -151,6 +151,42 @@ fn remap_references(object: &mut Object, mapping: &HashMap<ObjectId, ObjectId>) 
 // Page construction and deep copy
 //---------------------------------------------------------------------
 
+/// The version a document created from nothing announces.
+///
+/// 1.7 rather than the format's oldest common denominator because a fresh file
+/// has no legacy reader to placate, and because `lopdf` writes a cross-reference
+/// stream, which is a 1.5 feature.
+const CREATED_DOCUMENT_VERSION: &str = "1.7";
+
+/// Serialize the smallest valid PDF: a catalog naming a page tree with no pages.
+///
+/// This is what a document created from nothing is opened from, so that such a
+/// document is in every other respect an ordinary parsed one — same catalog
+/// lookup, same page-tree root, same append-only save path.
+///
+/// Returns the writer's error, which for an in-memory buffer cannot occur in
+/// practice but is not worth a panic to rule out.
+pub(crate) fn build_empty_document_bytes() -> std::io::Result<Vec<u8>> {
+    let mut document = Document::with_version(CREATED_DOCUMENT_VERSION);
+
+    let pages_id = document.new_object_id();
+    let mut pages = Dictionary::new();
+    pages.set("Type", Object::Name(b"Pages".to_vec()));
+    pages.set("Kids", Object::Array(Vec::new()));
+    pages.set("Count", Object::Integer(0));
+    document.objects.insert(pages_id, Object::Dictionary(pages));
+
+    let mut catalog = Dictionary::new();
+    catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+    catalog.set("Pages", Object::Reference(pages_id));
+    let catalog_id = document.add_object(Object::Dictionary(catalog));
+    document.trailer.set("Root", Object::Reference(catalog_id));
+
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Add an empty page of the given size to a document, returning its object id.
 ///
 /// The page carries an explicit `/MediaBox` and an empty `/Resources`, so it
@@ -317,6 +353,22 @@ mod tests {
         assert!(INHERITABLE_KEYS.contains(&b"MediaBox".as_slice()));
         assert!(INHERITABLE_KEYS.contains(&b"CropBox".as_slice()));
         assert!(INHERITABLE_KEYS.contains(&b"Rotate".as_slice()));
+    }
+
+    #[test]
+    fn builds_an_empty_document_that_parses_and_holds_no_pages() {
+        let bytes = build_empty_document_bytes().expect("an in-memory write must succeed");
+        let document = load(&bytes);
+        assert_eq!(document.page_iter().count(), 0, "a created document starts with no pages");
+
+        let root_id = document
+            .catalog()
+            .and_then(|catalog| catalog.get(b"Pages"))
+            .and_then(lopdf::Object::as_reference)
+            .expect("a created document must name a page tree root");
+        let pages = document.get_dictionary(root_id).expect("the page tree root must resolve");
+        assert_eq!(pages.get_type().unwrap_or_default(), b"Pages".as_slice());
+        assert_eq!(pages.get(b"Count").and_then(lopdf::Object::as_i64).unwrap_or(-1), 0);
     }
 
     #[test]
