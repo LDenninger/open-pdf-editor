@@ -67,7 +67,17 @@ mod tests {
     use super::*;
     use crate::fixture::ensure_contract_fixture;
     use crate::geometry::compute_tile_geometry;
-    use opdf_core::{PageId, PageInfo, PageSize, RenderRequest};
+    use opdf_core::{DocumentId, PageId, PageInfo, PageSize, RenderRequest};
+    /// The document identity every request in this module names.
+    ///
+    /// Fixed for the whole module so that two requests differ only in the fields
+    /// the test varies. Minted rather than a constant because an identity is
+    /// deliberately unforgeable: [`DocumentId`] has no `const` constructor.
+    fn test_document() -> DocumentId {
+        static DOCUMENT: std::sync::OnceLock<DocumentId> = std::sync::OnceLock::new();
+        *DOCUMENT.get_or_init(DocumentId::new_unique)
+    }
+
     use pdfium_render::prelude::PdfPageIndex;
 
     fn build_page_info(rotation: Rotation) -> PageInfo {
@@ -92,7 +102,7 @@ mod tests {
 
     #[test]
     fn renders_an_unrotated_page_at_its_point_size() {
-        let request = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        let request = RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap();
         let tile = render_fixture_page(0, build_page_info(Rotation::None), &request, Rotation::None);
 
         assert_eq!(tile.width(), 595);
@@ -102,7 +112,7 @@ mod tests {
 
     #[test]
     fn draws_the_page_content_rather_than_a_blank_bitmap() {
-        let request = RenderRequest::new(PageId::new(1), 7, 1.0).unwrap();
+        let request = RenderRequest::new(test_document(), PageId::new(1), 7, 1.0).unwrap();
         let tile = render_fixture_page(0, build_page_info(Rotation::None), &request, Rotation::None);
 
         //--- the fixture fills its media box with pure blue, so the centre pixel proves real rasterization ---
@@ -114,7 +124,7 @@ mod tests {
 
     #[test]
     fn renders_a_stored_quarter_turn_with_swapped_axes() {
-        let request = RenderRequest::new(PageId::new(2), 7, 1.0).unwrap();
+        let request = RenderRequest::new(test_document(), PageId::new(2), 7, 1.0).unwrap();
         let tile = render_fixture_page(1, build_page_info(Rotation::Quarter), &request, Rotation::Quarter);
 
         assert_eq!(tile.width(), 842, "a quarter-turned A4 page is 842 pixels wide at scale 1.0");
