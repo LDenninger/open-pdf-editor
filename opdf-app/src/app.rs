@@ -4,12 +4,14 @@
 //! This module routes; it does not compute. Everything it decides was decided by
 //! [`crate::layout`], [`crate::zoom`], [`crate::scheduler`], and [`crate::viewer`].
 
+use std::path::Path;
+
 use opdf_core::document::{Document, DocumentSnapshot};
 use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
 
-use crate::opener::OpenedDocument;
+use crate::opener::{DocumentOpener, OpenedDocument};
 use crate::panels::menu_bar::MenuAction;
 use crate::panels::status_bar::RenderStatus;
 use crate::panels::toolbar::ToolbarOutcome;
@@ -35,6 +37,7 @@ pub struct OpdfApp {
     rail_cache: TextureCache,
     page_entry: String,
     show_about: bool,
+    last_error: Option<String>,
 }
 
 impl OpdfApp {
@@ -57,6 +60,7 @@ impl OpdfApp {
             rail_cache: TextureCache::new(RAIL_CACHE_BUDGET_BYTES),
             page_entry: "1".to_owned(),
             show_about: false,
+            last_error: None,
         }
     }
 
@@ -99,6 +103,27 @@ impl OpdfApp {
     /// tell them apart.
     pub fn open_document(&mut self, opened: OpenedDocument) {
         self.install_document(Some(opened.document), opened.service, opened.snapshot);
+    }
+
+    /// Open `path` through `opener`, replacing whatever is currently open.
+    ///
+    /// A failed open is reported and otherwise inert: the document already on
+    /// screen stays exactly as it was. Losing the user's document because the file
+    /// they picked was malformed would be the worst possible response to an error
+    /// this API is guaranteed to produce.
+    pub fn open_path(&mut self, opener: &dyn DocumentOpener, path: &Path) {
+        match opener.open(path) {
+            Ok(opened) => {
+                self.open_document(opened);
+                self.last_error = None;
+            }
+            Err(error) => self.last_error = Some(format!("could not open {}: {error}", path.display())),
+        }
+    }
+
+    /// The most recent failure the user has not yet dismissed.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     /// Show no document at all, releasing the one that was open.
@@ -272,7 +297,7 @@ impl OpdfApp {
         });
 
         egui::TopBottomPanel::bottom("opdf_status_bar").show(ctx, |ui| {
-            crate::panels::status_bar::show_status_bar(ui, &self.state, &RenderStatus::of(&self.canvas_cache), &self.theme);
+            crate::panels::status_bar::show_status_bar(ui, &self.state, &RenderStatus::of(&self.canvas_cache), self.last_error.as_deref(), &self.theme);
         });
 
         egui::SidePanel::left("opdf_thumbnail_rail")
