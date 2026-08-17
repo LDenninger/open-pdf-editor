@@ -2,10 +2,11 @@
 //! rasterization, and what any rasterizer must provide.
 
 use crate::Result;
+use crate::document::DocumentId;
 use crate::error::Error;
 use crate::page::{PageId, Rotation};
 
-/// A request to rasterize one page.
+/// A request to rasterize one page of one document.
 ///
 /// This type is usable as a cache key: a tile cache and the UI's tile map both
 /// key on it directly, rather than each inventing its own quantised-scale key.
@@ -19,8 +20,26 @@ use crate::page::{PageId, Rotation};
 /// `revision` is what keeps a cache honest across edits: two requests that
 /// differ only in revision are distinct keys, so a tile rasterized before a
 /// structural change can never be served for the document as it stands now.
+///
+/// `document` is what keeps it honest across *documents*, which the revision
+/// cannot: every implementation starts its revision at zero and allocates page
+/// ids from zero, so two freshly opened documents produce requests that agree on
+/// every other field. Without this one, a cache could only avoid serving
+/// document A's pixels for document B's pages by being emptied wholesale
+/// whenever a document was opened — a convention nothing enforced.
+///
+/// The fields are readable but the struct is `#[non_exhaustive]`: a struct
+/// literal outside this crate would bypass [`RenderRequest::new`]'s validation,
+/// and every field added here is one more a literal can get wrong.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct RenderRequest {
+    /// Which document the page belongs to.
+    ///
+    /// Normally read from the [`crate::document::DocumentSnapshot`] being drawn.
+    /// Opaque to the renderer, which neither validates nor interprets it — see
+    /// [`RenderService`].
+    pub document: DocumentId,
     /// Page to rasterize.
     pub page: PageId,
     /// The value [`crate::document::Document::revision`] held when this request
@@ -36,19 +55,22 @@ pub struct RenderRequest {
 }
 
 impl RenderRequest {
-    /// A request at the given scale and document revision, with no additional
-    /// view rotation.
+    /// A request for one page of one document, at the given scale and revision,
+    /// with no additional view rotation.
     ///
-    /// `revision` is deliberately a required argument rather than a default or a
-    /// builder step: a caller who omits it silently reintroduces stale tiles, so
-    /// the decision is forced at the call site.
+    /// `document` and `revision` are both deliberately required arguments rather
+    /// than defaults or builder steps, for the same reason: a caller who omits
+    /// the revision silently reintroduces stale tiles, and a caller who omits
+    /// the document silently reintroduces one document's tiles being served for
+    /// another's pages. Both decisions are forced at the call site.
     ///
     /// Returns [`Error::Unsupported`] for a scale that is not finite and positive.
-    pub fn new(page: PageId, revision: u64, scale: f32) -> Result<Self> {
+    pub fn new(document: DocumentId, page: PageId, revision: u64, scale: f32) -> Result<Self> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(Error::Unsupported(format!("render scale {scale} must be finite and positive")));
         }
         Ok(Self {
+            document,
             page,
             revision,
             scale,
@@ -69,7 +91,11 @@ impl RenderRequest {
 impl PartialEq for RenderRequest {
     /// Compare `scale` bitwise, so that equality agrees with [`Hash`].
     fn eq(&self, other: &Self) -> bool {
-        self.page == other.page && self.revision == other.revision && self.rotation == other.rotation && self.scale.to_bits() == other.scale.to_bits()
+        self.document == other.document
+            && self.page == other.page
+            && self.revision == other.revision
+            && self.rotation == other.rotation
+            && self.scale.to_bits() == other.scale.to_bits()
     }
 }
 
@@ -77,6 +103,7 @@ impl Eq for RenderRequest {}
 
 impl std::hash::Hash for RenderRequest {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.document.hash(state);
         self.page.hash(state);
         self.revision.hash(state);
         self.rotation.hash(state);
@@ -179,27 +206,29 @@ impl RenderResponse {
 /// Implementations must never block in [`RenderService::poll`]: the caller runs
 /// on the UI thread and a stalled poll drops frames.
 ///
-/// # A renderer must not validate `RenderRequest::revision`
+/// # A renderer must not validate `RenderRequest::revision` or `document`
 ///
-/// The revision exists for the benefit of *caches*, not of the rasterizer. An
-/// implementation carries it, and echoes it back unchanged inside the response's
-/// request, so that a cache can tell an image of the old structure from an image
-/// of the current one. It must never compare the revision against whatever state
-/// it happens to hold, and must never fail, drop, or defer a request because the
-/// two disagree.
+/// Both fields exist for the benefit of *caches*, not of the rasterizer. An
+/// implementation carries them, and echoes them back unchanged inside the
+/// response's request, so that a cache can tell an image of the old structure
+/// from an image of the current one, and one document's tile from another's. It
+/// must never compare either against whatever state it happens to hold, and must
+/// never fail, drop, or defer a request because the two disagree.
 ///
 /// This is a hard requirement rather than a convention: a real rasterizer may
 /// legitimately hold several revisions at once — an in-flight request queued
 /// before an edit, a snapshot taken after it — and a service that rejected
 /// unfamiliar revisions would fail exactly the requests a cache most needs
 /// answered. A service holding a snapshot at one revision must still answer a
-/// request naming another.
+/// request naming another, and the same goes for the document identity: the
+/// value's only job is to come back unchanged so the answer can be filed.
 pub trait RenderService: Send {
     /// Queue a request. Submitting the same request twice is permitted:
     /// identical pending requests may be answered by a single response, while
     /// distinct requests each receive their own response.
     ///
-    /// The request's `revision` is carried, not checked — see the trait docs.
+    /// The request's `document` and `revision` are carried, not checked — see
+    /// the trait docs.
     fn submit(&self, request: RenderRequest);
 
     /// Collect every response completed since the last call, without blocking.
@@ -249,15 +278,17 @@ mod tests {
 
     #[test]
     fn rejects_a_non_positive_scale() {
-        assert!(RenderRequest::new(PageId::new(0), 0, 0.0).is_err());
-        assert!(RenderRequest::new(PageId::new(0), 0, f32::NAN).is_err());
+        let document = DocumentId::new_unique();
+        assert!(RenderRequest::new(document, PageId::new(0), 0, 0.0).is_err());
+        assert!(RenderRequest::new(document, PageId::new(0), 0, f32::NAN).is_err());
     }
 
     #[test]
     fn serves_as_a_hash_map_key() {
-        let first = RenderRequest::new(PageId::new(1), 0, 1.0).unwrap();
-        let same = RenderRequest::new(PageId::new(1), 0, 1.0).unwrap();
-        let different_scale = RenderRequest::new(PageId::new(1), 0, 1.5).unwrap();
+        let document = DocumentId::new_unique();
+        let first = RenderRequest::new(document, PageId::new(1), 0, 1.0).unwrap();
+        let same = RenderRequest::new(document, PageId::new(1), 0, 1.0).unwrap();
+        let different_scale = RenderRequest::new(document, PageId::new(1), 0, 1.5).unwrap();
 
         let mut cache = std::collections::HashMap::new();
         cache.insert(first, "first");
@@ -270,8 +301,9 @@ mod tests {
 
     #[test]
     fn distinguishes_requests_by_revision() {
-        let before = RenderRequest::new(PageId::new(1), 1, 1.0).unwrap();
-        let after = RenderRequest::new(PageId::new(1), 2, 1.0).unwrap();
+        let document = DocumentId::new_unique();
+        let before = RenderRequest::new(document, PageId::new(1), 1, 1.0).unwrap();
+        let after = RenderRequest::new(document, PageId::new(1), 2, 1.0).unwrap();
 
         assert_ne!(before, after, "requests differing only in revision must not compare equal");
 
@@ -281,5 +313,30 @@ mod tests {
 
         assert_eq!(cache.len(), 2, "a tile cached before an edit must not be addressable after one");
         assert_eq!(cache[&before], "stale", "the pre-edit entry must survive under its own revision");
+    }
+
+    /// The two documents here agree on every other field, which is what every
+    /// pair of freshly opened documents does: page ids and revisions both start
+    /// at zero, per document.
+    #[test]
+    fn distinguishes_requests_by_document() {
+        let first = RenderRequest::new(DocumentId::new_unique(), PageId::new(1), 0, 1.0).unwrap();
+        let second = RenderRequest::new(DocumentId::new_unique(), PageId::new(1), 0, 1.0).unwrap();
+
+        assert_ne!(first, second, "requests differing only in their document must not compare equal");
+
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(first, "A");
+        cache.insert(second, "B");
+
+        assert_eq!(cache.len(), 2, "one document's tile must not be addressable by the other's request");
+        assert_eq!(cache[&first], "A");
+    }
+
+    #[test]
+    fn keeps_the_document_through_the_rotation_builder() {
+        let document = DocumentId::new_unique();
+        let request = RenderRequest::new(document, PageId::new(1), 0, 1.0).unwrap();
+        assert_eq!(request.with_rotation(Rotation::Quarter).document, document);
     }
 }
