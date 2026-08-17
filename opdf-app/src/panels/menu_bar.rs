@@ -9,6 +9,10 @@
 pub enum MenuAction {
     /// Open a document from disk. Not implemented until Track A lands.
     OpenDocument,
+    /// Write the document back to where it was opened from, as an incremental update.
+    Save,
+    /// Write the document to a path the user picks, as an incremental update.
+    SaveAs,
     /// Close the open document and show the empty state.
     CloseDocument,
     /// Exit the application.
@@ -48,6 +52,8 @@ impl MenuAction {
     pub fn label(&self) -> String {
         match self {
             Self::OpenDocument => "Open document".to_owned(),
+            Self::Save => "Save".to_owned(),
+            Self::SaveAs => "Save as…".to_owned(),
             Self::CloseDocument => "Close document".to_owned(),
             Self::Quit => "Quit".to_owned(),
             Self::GenerateSynthetic(page_count) => format!("Generate {page_count} synthetic pages"),
@@ -83,6 +89,13 @@ pub fn show_menu_bar(ui: &mut egui::Ui) -> Option<MenuAction> {
             {
                 chosen = Some(MenuAction::OpenDocument);
                 ui.close();
+            }
+            ui.separator();
+            for action in [MenuAction::Save, MenuAction::SaveAs] {
+                if ui.button(action.label()).clicked() {
+                    chosen = Some(action);
+                    ui.close();
+                }
             }
             ui.separator();
             for page_count in [12_usize, 120, 1_200] {
@@ -149,8 +162,10 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const EVERY_ACTION: [MenuAction; 17] = [
+    const EVERY_ACTION: [MenuAction; 19] = [
         MenuAction::OpenDocument,
+        MenuAction::Save,
+        MenuAction::SaveAs,
         MenuAction::CloseDocument,
         MenuAction::Quit,
         MenuAction::GenerateSynthetic(12),
