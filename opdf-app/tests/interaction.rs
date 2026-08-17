@@ -679,3 +679,33 @@ fn the_app_draws_the_document_it_was_given_rather_than_one_it_built() {
     assert_eq!(app.state().page_count(), 7);
     assert_eq!(app.document().map(|document| document.page_count()), Some(7));
 }
+
+#[test]
+fn opening_a_second_document_replaces_the_first() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    assert_eq!(app.state().page_count(), 3);
+
+    app.open_path(&FakeOpener::with_pages(11), Path::new("b.pdf"));
+
+    assert_eq!(app.state().page_count(), 11);
+    assert_eq!(app.document().map(|document| document.page_count()), Some(11));
+    //--- F14: the previous document's tiles must not survive into the new one ---
+    assert!(app.canvas_cache().is_empty());
+    assert!(app.last_error().is_none(), "a successful open must clear whatever failed before it");
+}
+
+#[test]
+fn a_failed_open_leaves_the_current_document_untouched_and_reports_why() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+
+    app.open_path(&FakeOpener::failing(), Path::new("broken.pdf"));
+
+    assert_eq!(app.state().page_count(), 3, "a failed open must not close the open document");
+    assert!(app.last_error().is_some(), "a failed open must be surfaced, not swallowed");
+    let message = app.last_error().unwrap_or_default();
+    assert!(message.contains("broken.pdf"), "the message must name the file that failed, got: {message}");
+}
