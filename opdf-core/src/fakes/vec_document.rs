@@ -2,9 +2,19 @@
 //! crates before a real PDF parser exists.
 
 use crate::Result;
-use crate::document::{Document, DocumentId};
+use crate::document::{Document, DocumentId, PortablePages};
 use crate::error::Error;
 use crate::page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
+
+/// What a [`VecDocument`] puts inside a [`PortablePages`].
+///
+/// Private on purpose: privacy is what makes the carrier implementation-specific.
+/// No other crate can name this type, so no other implementation can take a
+/// `VecDocument`'s payload back out — [`PortablePages::take`] refuses instead.
+#[derive(Debug)]
+struct VecPortablePayload {
+    pages: Vec<PageInfo>,
+}
 
 /// A document that stores page metadata in a vector and no content at all.
 ///
@@ -179,6 +189,30 @@ impl Document for VecDocument {
 
         let mut new_ids = Vec::with_capacity(imported.len());
         for (offset, page) in imported.into_iter().enumerate() {
+            let id = self.allocator.allocate();
+            self.pages.insert(at_index + offset, PageInfo { id, ..page });
+            new_ids.push(id);
+        }
+        self.advance_revision();
+        Ok(new_ids)
+    }
+
+    fn export_pages(&self, ids: &[PageId]) -> Result<PortablePages> {
+        //--- resolve every page before building the carrier, so a failure produces none ---
+        let mut pages = Vec::with_capacity(ids.len());
+        for id in ids {
+            pages.push(self.page(*id)?);
+        }
+        Ok(PortablePages::new(VecPortablePayload { pages }))
+    }
+
+    fn import_portable(&mut self, pages: PortablePages, at_index: usize) -> Result<Vec<PageId>> {
+        //--- the position is checked first, matching import_pages' precedence ---
+        self.check_insertion_index(at_index)?;
+        let payload: VecPortablePayload = pages.take()?;
+
+        let mut new_ids = Vec::with_capacity(payload.pages.len());
+        for (offset, page) in payload.pages.into_iter().enumerate() {
             let id = self.allocator.allocate();
             self.pages.insert(at_index + offset, PageInfo { id, ..page });
             new_ids.push(id);
