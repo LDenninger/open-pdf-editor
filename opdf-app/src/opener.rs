@@ -4,7 +4,7 @@
 //! implementation is [`PdfiumDocumentOpener`]; the fake one here lets every
 //! headless test run the open path without PDFium on the machine.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use opdf_core::document::{Document, DocumentIo, DocumentSnapshot};
@@ -35,6 +35,54 @@ pub trait DocumentOpener {
     /// Returns whatever error the underlying implementation produces; the shell
     /// surfaces it to the user rather than interpreting it.
     fn open(&self, path: &Path) -> Result<OpenedDocument>;
+}
+
+//---------------------------------------------------------------------
+// Asking the user which file to open
+//---------------------------------------------------------------------
+
+/// Asking the user to name a document.
+///
+/// Separated from [`DocumentOpener`] because a native file dialog cannot be
+/// driven headlessly, and the interesting part of File ▸ Open is not the dialog
+/// but what the shell does with its answer. With the dialog behind a trait, that
+/// part is testable and only the dialog itself is judged by eye.
+pub trait PathChooser {
+    /// Show a picker for PDF files, returning the chosen path, or `None` if the
+    /// user cancelled.
+    fn choose_pdf(&self) -> Option<PathBuf>;
+}
+
+/// The production chooser: the platform's own file dialog.
+pub struct NativePathChooser;
+
+impl PathChooser for NativePathChooser {
+    fn choose_pdf(&self) -> Option<PathBuf> {
+        rfd::FileDialog::new().add_filter("PDF document", &["pdf"]).pick_file()
+    }
+}
+
+/// A chooser that answers with a fixed decision, for tests.
+pub struct FakeChooser {
+    path: Option<PathBuf>,
+}
+
+impl FakeChooser {
+    /// A chooser that always returns `path`.
+    pub fn choosing(path: impl Into<PathBuf>) -> Self {
+        Self { path: Some(path.into()) }
+    }
+
+    /// A chooser the user always cancels.
+    pub fn cancelling() -> Self {
+        Self { path: None }
+    }
+}
+
+impl PathChooser for FakeChooser {
+    fn choose_pdf(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
 }
 
 //---------------------------------------------------------------------
