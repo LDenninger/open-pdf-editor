@@ -123,7 +123,7 @@ pub fn show_thumbnail_rail(ui: &mut egui::Ui, state: &mut ViewerState, cache: &m
             //--- ratio is 132 points wide and still taller than the backend allows ---
             let size = page.display_size();
             let scale = crate::zoom::fit_render_scale_to_texture_limit(compute_thumbnail_scale(size.width_pt), size.width_pt, size.height_pt, max_texture_side);
-            let Ok(request) = RenderRequest::new(page.id, snapshot.revision, scale) else {
+            let Ok(request) = RenderRequest::new(snapshot.document, page.id, snapshot.revision, scale) else {
                 continue;
             };
             if cache.mark_pending(request) {
