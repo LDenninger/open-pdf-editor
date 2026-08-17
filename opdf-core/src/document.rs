@@ -166,8 +166,16 @@ pub trait DocumentIo: Document + Sized {
 ///
 /// The UI holds a snapshot rather than the document itself, because the render
 /// worker owns the document and cannot share it across threads.
-#[derive(Clone, PartialEq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct DocumentSnapshot {
+    /// Which document this is a snapshot *of*.
+    ///
+    /// Carried so that a caller which never touches the document — the shell, the
+    /// scheduler, a tile cache — can still tell one document's work from
+    /// another's. Every [`crate::render::RenderRequest`] is built from this
+    /// value, exactly as `revision` is, so neither can drift from the structure
+    /// it describes.
+    pub document: DocumentId,
     /// Page metadata in document order.
     pub pages: Vec<PageInfo>,
     /// The value [`Document::revision`] held when this snapshot was captured.
@@ -178,14 +186,34 @@ pub struct DocumentSnapshot {
     pub revision: u64,
 }
 
+/// An empty snapshot of a document that does not exist — what a shell shows
+/// before anything is open.
+///
+/// Hand-written rather than derived, because a derived `Default` would need a
+/// `Default` for [`DocumentId`], and a default identity is one every empty
+/// snapshot would share. Minting instead means two "no document open" states are
+/// two distinct documents, which is the safe direction: their cache keys cannot
+/// collide.
+impl Default for DocumentSnapshot {
+    fn default() -> Self {
+        Self {
+            document: DocumentId::new_unique(),
+            pages: Vec::new(),
+            revision: 0,
+        }
+    }
+}
+
 impl DocumentSnapshot {
-    /// Capture the current page list of a document, together with its revision.
+    /// Capture the current page list of a document, together with its identity
+    /// and revision.
     pub fn of<D: Document + ?Sized>(document: &D) -> Result<Self> {
         let mut pages = Vec::with_capacity(document.page_count());
         for id in document.page_ids() {
             pages.push(document.page(id)?);
         }
         Ok(Self {
+            document: document.id(),
             pages,
             revision: document.revision(),
         })
