@@ -75,6 +75,8 @@ pub fn open_synthetic_document(page_count: usize) -> Result<OpenedDocument> {
         document: Box::new(document),
         service,
         snapshot,
+        //--- generated, not opened: there is nowhere for Save to write it back to ---
+        path: None,
     })
 }
 
