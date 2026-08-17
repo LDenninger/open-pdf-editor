@@ -10,9 +10,11 @@ publish = false
 
 [dependencies]
 opdf-core = { path = "../../opdf-core" }
+opdf-pdf = { path = "../../opdf-pdf" }
 
 [dev-dependencies]
 criterion = "0.8"
+tempfile = "3"
 
 # A declared bench target whose file does not exist yet is a manifest parse
 # error, not a missing-target warning, so each [[bench]] entry lands in the
@@ -24,4 +26,8 @@ harness = false
 
 [[bench]]
 name = "vec_document_mutations"
+harness = false
+
+[[bench]]
+name = "open_save"
 harness = false
