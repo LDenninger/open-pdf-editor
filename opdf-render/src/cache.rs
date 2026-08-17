@@ -76,6 +76,12 @@ impl TileCache {
     /// Called when the worker is rebound to a new snapshot: tiles for a
     /// superseded revision can never be served again, so holding them is pure
     /// memory cost.
+    ///
+    /// Pruning here does not by itself make the cache revision-honest. A tile
+    /// rasterized against the new snapshot but keyed on a request naming the
+    /// old revision would be inserted *after* this call and survive it. The
+    /// worker prevents that upstream, by superseding everything still queued
+    /// when a rebind arrives rather than rendering it.
     pub fn retain_revision(&mut self, revision: u64) {
         self.entries.retain(|request, _| request.revision == revision);
         self.recency.retain(|request| request.revision == revision);
