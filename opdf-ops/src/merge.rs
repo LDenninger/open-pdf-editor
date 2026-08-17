@@ -3,9 +3,14 @@
 use opdf_core::{Command, Document, Result};
 
 use crate::remove_page::RemovePage;
-use crate::sequence::Sequence;
+use crate::sequence::{Sequence, roll_back};
 
 /// Append every page of every document in `sources`, in order, atomically.
+///
+/// Atomicity holds under the same single caveat as [`Sequence`]'s: if a source
+/// fails to import and undoing an *earlier* source's import then fails too,
+/// the document is left part-merged and the returned error names both
+/// failures rather than reporting only the first.
 pub struct Merge<D: Document> {
     sources: Vec<D>,
 }
@@ -31,10 +36,8 @@ impl<D: Document + Send + 'static> Command<D> for Merge<D> {
                     }
                 }
                 Err(error) => {
-                    for rollback in removals.into_iter().rev() {
-                        let _ = rollback.apply(document);
-                    }
-                    return Err(error);
+                    //--- identical to Sequence's rollback, and now literally the same code, so a failed rollback is reported there too ---
+                    return Err(roll_back(document, removals, &self.label(), error));
                 }
             }
         }
