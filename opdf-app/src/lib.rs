@@ -17,6 +17,7 @@
 pub mod app;
 pub mod icons;
 pub mod layout;
+pub mod opener;
 pub mod panels;
 pub mod scheduler;
 pub mod synthetic;
@@ -25,6 +26,7 @@ pub mod tiles;
 pub mod viewer;
 pub mod zoom;
 
+pub use opener::{DocumentOpener, OpenedDocument};
 pub use theme::{Theme, apply_theme};
 
 /// Name shown in the window title bar and the about box.
