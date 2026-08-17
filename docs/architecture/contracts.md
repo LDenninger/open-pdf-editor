@@ -178,6 +178,7 @@ content) and `opdf-pdf::PdfDocument` (Track A), over a real PDF file.
 
 ```rust
 pub trait Document {
+    fn id(&self) -> DocumentId;
     fn revision(&self) -> u64;
     fn page_count(&self) -> usize;
     fn page_ids(&self) -> Vec<PageId>;
@@ -191,6 +192,8 @@ pub trait Document {
     fn import_pages(&mut self, source: &Self, ids: &[PageId], at_index: usize) -> Result<Vec<PageId>>
     where
         Self: Sized;
+    fn export_pages(&self, ids: &[PageId]) -> Result<PortablePages>;
+    fn import_portable(&mut self, pages: PortablePages, at_index: usize) -> Result<Vec<PageId>>;
 }
 ```
 
@@ -198,6 +201,83 @@ pub trait Document {
 modified. Pages are addressed by `PageId`, which survives reordering.
 Indices appear only as insertion positions and are always interpreted
 against the document's state at the moment of the call.
+
+### `Document::id` and `DocumentId`
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    pub fn new_unique() -> Self;
+    pub const fn get(self) -> u64;
+}
+
+impl std::fmt::Display for DocumentId { /* renders as `document#{raw}` */ }
+```
+
+**Purpose:** distinguish two documents of the same implementation. Nothing else
+in the contract can: `revision` counts edits *within* one document and every
+implementation starts it at zero, and page ids are allocated per document from
+zero as well, so two freshly opened documents agree on every other field.
+
+**Requirements:**
+
+- `id()` has **no default body**, deliberately. A default would let an
+  implementation silently share one identity across every instance, and because
+  identity is only ever *compared*, nothing else in the suite would notice.
+- An identity is minted at construction and never reused, including after a
+  document is dropped.
+- An identity **never changes as a document is mutated**, and specifically
+  survives `PdfDocument`'s compacting save: `rebase_onto` rewrites the backing
+  bytes of the document already open, which is not a different document.
+- Asserted by `assert_document_identity_is_stable_and_unique`, wired into
+  `assert_document_contract`.
+
+**Requirement: never persist a `DocumentId`.** See
+[Known gaps](#known-gaps) item 6.
+
+### `export_pages` / `import_portable` and `PortablePages`
+
+```rust
+pub struct PortablePages { /* opaque; private fields, no inspection */ }
+
+impl PortablePages {
+    pub fn new<T: Any + Send>(payload: T) -> Self;
+    pub fn take<T: Any + Send>(self) -> Result<T>;
+}
+```
+
+**Purpose:** the object-safe way to move pages between two documents.
+`import_pages` takes `&Self` and so carries `where Self: Sized`, which keeps it
+out of the vtable — a caller holding two `&dyn Document`, as a cross-document
+drag in the UI does, cannot express the operation at all. This pair can.
+
+`import_pages` is **unchanged** and remains the fast path wherever both concrete
+types are known; it copies the object graph directly, which is what `opdf-pdf`'s
+importer does well and what an object-safe `import_pages` taking
+`&dyn Document` could not have done. The pair costs a copy instead.
+
+**Requirements:**
+
+- The carrier is **opaque**. What is inside it — serialized bytes, an
+  implementation-specific structure — is not part of the contract. The payload
+  is erased behind `Any`, so only the implementation that wrote it can name the
+  type that gets it back.
+- A carrier produced by one implementation and handed to **another** must be
+  refused with `Error::Unsupported`, never guessed at and never partially
+  imported. `PortablePages::take` produces that error, so no implementation has
+  to invent it. Asserted in both directions by
+  `assert_a_foreign_carrier_is_refused_rather_than_guessed_at`, which carries a
+  second `Document` implementation of its own for the purpose — two instances of
+  the type under test recognise each other's payloads by construction and would
+  prove nothing.
+- `export_pages` is a read: it must not mutate the document or advance the
+  revision, and it rejects an unknown `PageId` with `Error::PageNotFound` before
+  a carrier exists.
+- `import_portable` is a mutation: it advances the revision on success, rejects a
+  position beyond the page count with `Error::IndexOutOfBounds`, and leaves the
+  document untouched on any rejection.
 
 **The trait is object-safe, and must stay that way.** `import_pages` is the
 only method that names `Self` in its signature, and it carries
@@ -472,11 +552,15 @@ an append-only prefix after an edit):**
 **Implemented by:** `opdf-core` itself (concrete struct).
 
 ```rust
-#[derive(Clone, PartialEq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct DocumentSnapshot {
+    pub document: DocumentId,
     pub pages: Vec<PageInfo>,
     pub revision: u64,
 }
+
+// `Default` is hand-written, minting a fresh DocumentId rather than sharing one.
+impl Default for DocumentSnapshot { /* ... */ }
 
 impl DocumentSnapshot {
     pub fn of<D: Document + ?Sized>(document: &D) -> Result<Self>;
@@ -500,6 +584,9 @@ the document itself — see
   the value a caller feeds to `RenderRequest::new`: the snapshot is the UI's
   only view of the document, so it must carry everything a render request
   needs.
+- `DocumentSnapshot::of` captures `document.id()` into `document`, for the same
+  reason and with the same rule: a render request takes the identity off the
+  snapshot being drawn, never off a separately tracked field.
 
 **Note on `PartialEq`:** because `revision` is a field, two snapshots of a
 structurally identical document taken at different revisions are **not** equal.
@@ -519,15 +606,40 @@ minimal example (`SetRotation`) that exists only to prove the trait is
 usable — it is test-only, not a fake for reuse.
 
 ```rust
-pub trait Command<D: Document>: Send {
+pub trait Command<D: Document + ?Sized>: Send {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>>;
     fn label(&self) -> String;
 }
 ```
 
+**Why `D: ?Sized`.** A consumer that cannot name the concrete document type
+holds a `Box<dyn Document>` — `opdf-app` does, because its opener hands it one.
+With the implicit `Sized` bound, `Command<dyn Document>` and any undo stack over
+it were unnameable, so such a consumer could hold the document but no history
+over it. Relaxing it is additive: a sized type satisfies `?Sized`, so every
+existing impl and call site is unaffected. A command that genuinely needs a
+sized document — one owning a `Vec<D>`, or one calling `import_pages` — keeps
+`D: Document` in its own `impl`.
+
 **Purpose:** every mutation to a document is expressed as an invertible
 command. Undo/redo is a property of the architecture, not a feature added
 later (see the top-level `README.md`'s "Load-bearing decisions").
+
+**When a composite command's rollback itself fails**, the document is in neither
+the original nor the intended state and the caller must be told so distinctly.
+`Error::RollbackFailed { original: Box<Error>, rollback: Box<Error> }` carries
+both causes whole:
+
+```rust
+#[error("{original}; the rollback then failed: {rollback}")]
+RollbackFailed { original: Box<Error>, rollback: Box<Error> },
+```
+
+Every other variant means "your command did not happen"; this one means "your
+command did not happen *and* the document is no longer what it was", which calls
+for a reload rather than a retry. It is a variant rather than a formatted string
+precisely so a caller can match on that difference. `opdf-ops`' `Sequence` and
+`Merge` return it, and no other producer should invent an equivalent.
 
 **Why `Send` is a supertrait:** the render worker thread owns the document, so
 the UI thread cannot hold a `Document` at all (see
@@ -569,7 +681,9 @@ commands are exercised directly by their own tests):
 
 ```rust
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct RenderRequest {
+    pub document: DocumentId,
     pub page: PageId,
     pub revision: u64,
     pub scale: f32,
@@ -577,13 +691,13 @@ pub struct RenderRequest {
 }
 
 impl RenderRequest {
-    pub fn new(page: PageId, revision: u64, scale: f32) -> Result<Self>;
+    pub fn new(document: DocumentId, page: PageId, revision: u64, scale: f32) -> Result<Self>;
     pub fn with_rotation(self, rotation: Rotation) -> Self;
 }
 
-impl PartialEq for RenderRequest { /* compares scale bitwise; revision participates */ }
+impl PartialEq for RenderRequest { /* compares scale bitwise; document and revision participate */ }
 impl Eq for RenderRequest {}
-impl std::hash::Hash for RenderRequest { /* hashes revision and scale.to_bits() */ }
+impl std::hash::Hash for RenderRequest { /* hashes document, revision and scale.to_bits() */ }
 ```
 
 **Purpose:** a request to rasterize one page. `scale` is a zoom factor where
@@ -592,12 +706,19 @@ rotation applied **on top of** the rotation already stored on the page (see
 `assert_view_rotation_composes_with_page_rotation` in the `RenderService`
 table below). `revision` is the `Document::revision` the request was built
 against, normally read straight off the `DocumentSnapshot` the UI holds.
+`document` is the `Document::id` it belongs to, read off the same snapshot: the
+revision cannot tell two documents apart, because both start it at zero and
+allocate page ids from zero, so without this field a cache served one document's
+pixels for another's pages.
 
 **Behavioural requirement:** `new` returns `Error::Unsupported` for a scale
 that is not finite and positive — this rejects `0.0`, negative values, `NaN`,
 and infinities (`rejects_a_non_positive_scale`, in `render.rs`'s test
-module). It performs no validation on `revision`, which is an opaque `u64`
-and may be any value.
+module). It performs no validation on `revision` or `document`, both of which
+are opaque and may be any value. Both are required arguments rather than
+defaults for the same reason: a caller who omits either silently reintroduces
+the defect the field exists to prevent, so the decision is forced at the call
+site.
 
 **`revision` is a required argument, on purpose.** There is no default and no
 `with_revision` builder step, deliberately, and a track must not add one. A
@@ -848,9 +969,11 @@ where
 **What passing proves:** the implementation satisfies every behavioural
 requirement listed in the tables above for `Document` and `RenderService`
 respectively — identity stability, ordering, error semantics on invalid
-input, revision advancement on success and non-advancement on failure, and
-(for rendering) correct tile dimensions under scale and rotation composition
-plus revision pass-through. Both functions panic with a descriptive message on the first
+input, revision advancement on success and non-advancement on failure,
+document-identity uniqueness and stability, the portable-pages round trip and
+the clean refusal of a foreign carrier, and (for rendering) correct tile
+dimensions under scale and rotation composition plus revision and document
+pass-through. Both functions panic with a descriptive message on the first
 violated requirement, so a track failing the suite gets a specific pointer
 to what broke, not a bare `assert` failure.
 
@@ -912,22 +1035,28 @@ silently "fix" or work around — the same issue twice.
    implementation is expected to behave the same way: fail the request, loudly,
    with a reason.
 
-3. **`RenderRequest`'s fields are public, so `new`'s validation is optional.**
-   Writing `RenderRequest { page, revision, scale: f32::NAN }` compiles and
-   bypasses the finite-and-positive check entirely. The `Eq`/`Hash`
-   implementations stay lawful either way, because both compare `scale.to_bits()`
-   rather than the float, so a `NaN` request is merely self-equal and useless —
-   not unsound. Prefer `RenderRequest::new` everywhere; if a track finds itself
-   wanting the struct literal, that is a signal the constructor is missing
+3. **`RenderRequest`'s fields are public, so `new`'s validation is optional
+   *within `opdf-core`*.** *Narrowed, not closed.* The struct is now
+   `#[non_exhaustive]`, so a struct literal outside `opdf-core` no longer
+   compiles at all and every other crate must go through `RenderRequest::new`.
+   Inside `opdf-core`, writing `RenderRequest { document, page, revision,
+   scale: f32::NAN, rotation }` still compiles and still bypasses the
+   finite-and-positive check. The `Eq`/`Hash` implementations stay lawful either
+   way, because both compare `scale.to_bits()` rather than the float, so a `NaN`
+   request is merely self-equal and useless — not unsound. If a track finds
+   itself wanting the struct literal, that is a signal the constructor is missing
    something, and the fix is an additive change to `new`, not a bypass.
 
-4. **The revision counter proves freshness only if the caller threads the right
-   one.** Nothing in the type system forces a `RenderRequest` to carry the
-   revision of the document it is actually about — a track holding a stale
-   variable reintroduces exactly the stale-tile bug the field exists to prevent.
-   Whichever track builds the first real tile cache should derive requests from
-   the `DocumentSnapshot` it is drawing, rather than from a separately tracked
-   number, so that the two cannot drift.
+4. **The revision counter and the document identity prove freshness only if the
+   caller threads the right ones.** Nothing in the type system forces a
+   `RenderRequest` to carry the revision — or the identity — of the document it
+   is actually about; a track holding a stale variable reintroduces exactly the
+   bug each field exists to prevent. Both are required positional arguments to
+   `new`, which forces the decision but not the *correct* decision. Derive
+   requests from the `DocumentSnapshot` being drawn, which carries both, rather
+   than from separately tracked values, so that they cannot drift.
+   `opdf-app`'s `plan_render_requests` takes no document and no revision
+   parameter for exactly this reason: there is nothing to get wrong.
 
    Note also that `import_pages` advances the revision even when handed an empty
    `ids` slice. That is deliberate: a spurious cache miss is cheap, a stale tile
@@ -958,3 +1087,23 @@ silently "fix" or work around — the same issue twice.
    Within a session, compaction cuts that window short deliberately rather
    than by construction — see
    [Compaction destroys undo of deletions](#compaction-destroys-undo-of-deletions).
+
+6. **`DocumentId` is a within-process concept only.** *Open by construction; not
+   a defect to be fixed.* The same trap as item 5, one level up. `DocumentId` is
+   minted from a process-local counter and is **never reused**, including after
+   the document it named is dropped — so within a process an identity is a sound
+   discriminator, and a stale one can never be recycled onto a different
+   document. It also **survives a compacting save**, because that rewrites the
+   document already open rather than opening a new one.
+
+   Across processes it means nothing whatever, and unlike a `PageId` it does not
+   even correspond to anything in the file. **No track may persist a
+   `DocumentId`**: not in a session file, not in a recent-documents list, not as
+   a cache key written to disk. Reopening the same path in a new process yields a
+   different identity, and — worse — a persisted identity can collide with a live
+   one, which is the failure mode never-reuse exists to rule out. `DocumentId::get`
+   is for in-memory interchange with code that cannot name the type, exactly as
+   `PageId::get` is.
+
+   Identity does not survive a reopen. If a track needs one that does, that is a
+   new contract and must be designed as one.
