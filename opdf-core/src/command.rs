@@ -19,7 +19,21 @@ use crate::document::Document;
 /// supertrait rather than a bound added at each use site so that
 /// `Box<dyn Command<D>>` is sendable everywhere it appears, including as the
 /// return type of [`Command::apply`].
-pub trait Command<D: Document>: Send {
+///
+/// # Why `D: ?Sized`
+///
+/// A consumer that cannot name the concrete document type holds a
+/// `Box<dyn Document>` — the shell does, because its opener hands it one. With
+/// the implicit `Sized` bound, `Command<dyn Document>` and any undo stack built
+/// on it were unnameable, so such a consumer could hold the document but no
+/// history over it.
+///
+/// Relaxing the bound is additive: every `Command<ConcreteDocument>` that
+/// compiled before still does, because a sized type satisfies `?Sized`. A
+/// command that genuinely needs a sized document — one owning a `Vec<D>`, or
+/// calling [`Document::import_pages`], whose `&Self` source is itself only
+/// available on a sized type — simply keeps `D: Document` in its own `impl`.
+pub trait Command<D: Document + ?Sized>: Send {
     /// Apply this change, returning the command that reverses it.
     ///
     /// On failure the document must be left exactly as it was found.

@@ -105,6 +105,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut ViewerState, cache: &mut Textu
     }
 
     let zoom = crate::zoom::clamp_zoom(state.zoom);
+    let document = state.snapshot().document;
     let revision = state.snapshot().revision;
     //--- the same settings the scheduler built its requests from, so a page whose
     //--- scale was capped for its size is looked up at that capped scale ---
@@ -126,13 +127,13 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut ViewerState, cache: &mut Textu
 
             //--- tier 1: the exact tile for this page's scale, capped as the scheduler capped it ---
             let page_scale = settings.scale_for_page(opdf_core::page::PageSize::new(placement.width_pt, placement.height_pt));
-            let exact = opdf_core::render::RenderRequest::new(placement.id, revision, page_scale)
+            let exact = opdf_core::render::RenderRequest::new(document, placement.id, revision, page_scale)
                 .ok()
                 .map(|request| request.with_rotation(settings.view_rotation));
             let key = match exact.filter(|request| cache.contains(request)) {
                 Some(request) => Some(request),
                 //--- tier 2: any cached scale of the same page at the same revision ---
-                None => cache.find_nearest_scale(placement.id, revision, page_scale),
+                None => cache.find_nearest_scale(document, placement.id, revision, page_scale),
             };
 
             //--- a refusal is only known for the exact request; a page with any cached

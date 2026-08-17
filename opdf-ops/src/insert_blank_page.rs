@@ -12,7 +12,7 @@ pub struct InsertBlankPage {
     pub size: PageSize,
 }
 
-impl<D: Document> Command<D> for InsertBlankPage {
+impl<D: Document + ?Sized> Command<D> for InsertBlankPage {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         let id = document.insert_page(self.at_index, self.size)?;
         Ok(Box::new(RemovePage { page: id }))

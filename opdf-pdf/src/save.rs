@@ -141,7 +141,7 @@ impl PdfDocument {
     /// is lossy by design: anything unreferenced that a reader might still have
     /// wanted — a superseded annotation, a stale outline — is gone. That is why
     /// compaction is only ever invoked on an explicit user request.
-    fn build_compacted_document(&self) -> lopdf::Document {
+    pub(crate) fn build_compacted_document(&self) -> lopdf::Document {
         let mut compacted = self.incremental().get_prev_documents().clone();
         for (object_id, object) in &self.incremental().new_document.objects {
             compacted.objects.insert(*object_id, object.clone());
@@ -694,6 +694,33 @@ mod tests {
         document
             .restore_page(ids[1], 0)
             .expect("a compaction that never wrote a file must not have destroyed the trash");
+    }
+
+    /// Compaction rewrites the bytes; it does not open a different document.
+    ///
+    /// A fresh identity here would tell the shell's tile caches and every
+    /// `opdf-ops` binding that the user had opened a new file, blanking the
+    /// canvas and invalidating a perfectly good undo stack on every `Save as…`.
+    #[test]
+    fn compacting_keeps_the_document_s_identity() {
+        let directory = tempfile::tempdir().expect("a temporary directory must be creatable");
+        let sizes = [PageSize::new(100.0, 100.0), PageSize::new(200.0, 200.0)];
+        let source = write_fixture(directory.path(), "flat.pdf", &fixture::build_flat_pages(&sizes));
+        let compacted_path = directory.path().join("compacted.pdf");
+
+        let mut document = PdfDocument::open(&source).unwrap();
+        let before = document.id();
+        document.save_compacted(&compacted_path).unwrap();
+
+        assert_eq!(
+            document.id(),
+            before,
+            "a compacting save rewrites the bytes of the document already open; it is not a different document"
+        );
+
+        //--- a document opened from those same bytes, by contrast, is a different one ---
+        let reopened = PdfDocument::open(&compacted_path).unwrap();
+        assert_ne!(reopened.id(), before, "opening the compacted file again produces a second, distinct document");
     }
 
     #[test]

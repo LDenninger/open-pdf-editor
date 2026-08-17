@@ -7,7 +7,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use opdf_core::Tile;
-use opdf_core::document::DocumentSnapshot;
+use opdf_core::document::{DocumentId, DocumentSnapshot};
 use opdf_core::fakes::FakeRenderService;
 use opdf_core::page::{PageId, PageInfo, PageSize, Rotation};
 use opdf_core::render::{RenderRequest, RenderService};
@@ -24,7 +24,9 @@ fn bench_tile_new(criterion: &mut Criterion) {
 }
 
 fn bench_fake_render_service_throughput(criterion: &mut Criterion) {
+    let document = DocumentId::new_unique();
     let snapshot = DocumentSnapshot {
+        document,
         pages: vec![PageInfo {
             id: PageId::new(1),
             size: PageSize::A4,
@@ -36,7 +38,7 @@ fn bench_fake_render_service_throughput(criterion: &mut Criterion) {
     criterion.bench_function("FakeRenderService: submit+poll one A4 tile at scale 2.0", |bencher| {
         bencher.iter(|| {
             let service = FakeRenderService::new(snapshot.clone());
-            let request = RenderRequest::new(PageId::new(1), 0, 2.0).unwrap();
+            let request = RenderRequest::new(document, PageId::new(1), 0, 2.0).unwrap();
             service.submit(request);
             let responses = service.poll();
             assert_eq!(responses.len(), 1);

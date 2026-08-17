@@ -111,12 +111,13 @@ impl OpdfApp {
     /// Every way a document arrives goes through here — opening a file,
     /// generating a synthetic one — because this is the single place that
     /// guarantees no pixel of the previous document survives into the new one.
-    /// Emptying the caches is not an optimisation: two documents' render requests
-    /// collide (see [`crate::viewer::DocumentId`]), so a surviving tile would be
-    /// served for the wrong document. Replacing the service matters for the same
-    /// reason: a response from the previous document that arrived late would be
-    /// filed as a tile of this one, and the request carries nothing that could
-    /// tell them apart.
+    /// Emptying the caches is not an optimisation: the previous document's tiles
+    /// can never be served again, so keeping them is pure memory cost. It is no
+    /// longer what makes the change *correct* — a render request now names its
+    /// [`opdf_core::DocumentId`], so a late response from the previous document
+    /// is rejected by key rather than filed as a tile of this one. Replacing the
+    /// service is likewise kept for its own reasons: the rasterizer resolves page
+    /// positions against the file it opened, which is a different file now.
     pub fn open_document(&mut self, opened: OpenedDocument) {
         self.install_document(Some(opened.document), opened.service, opened.snapshot);
     }

@@ -176,6 +176,7 @@ mod tests {
 
     fn build_snapshot(pages: &[(f32, f32, Rotation)]) -> DocumentSnapshot {
         DocumentSnapshot {
+            document: opdf_core::document::DocumentId::new_unique(),
             pages: pages
                 .iter()
                 .enumerate()

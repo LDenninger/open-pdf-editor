@@ -100,7 +100,16 @@ fn scale_edge(size_pt: f32, scale: f32) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opdf_core::{PageId, PageSize};
+    use opdf_core::{DocumentId, PageId, PageSize};
+    /// The document identity every request in this module names.
+    ///
+    /// Fixed for the whole module so that two requests differ only in the fields
+    /// the test varies. Minted rather than a constant because an identity is
+    /// deliberately unforgeable: [`DocumentId`] has no `const` constructor.
+    fn test_document() -> DocumentId {
+        static DOCUMENT: std::sync::OnceLock<DocumentId> = std::sync::OnceLock::new();
+        *DOCUMENT.get_or_init(DocumentId::new_unique)
+    }
 
     fn build_page(rotation: Rotation) -> PageInfo {
         PageInfo {
@@ -111,7 +120,7 @@ mod tests {
     }
 
     fn build_request(scale: f32) -> RenderRequest {
-        RenderRequest::new(PageId::new(1), 7, scale).unwrap()
+        RenderRequest::new(test_document(), PageId::new(1), 7, scale).unwrap()
     }
 
     #[test]

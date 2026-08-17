@@ -22,17 +22,22 @@ use opdf_core::{Command, Document, Error, Result};
 /// the one that tells the caller the document is no longer what it was, and
 /// the original failure is the one that says why.
 ///
-/// The composed error is [`Error::Unsupported`]: `opdf_core::Error` has no
-/// variant for a compound failure, and adding one is a breaking change to a
-/// contract this crate does not own.
-pub(crate) fn roll_back<D: Document>(document: &mut D, applied: Vec<Box<dyn Command<D>>>, label: &str, original: Error) -> Error {
+/// The composed error is [`Error::RollbackFailed`], which carries both causes
+/// whole rather than formatted into one string. That distinction is the point:
+/// a caller has to be able to tell "your command failed" from "your command
+/// failed *and* the document is now inconsistent", and match on it, because the
+/// second calls for a reload rather than a retry.
+pub(crate) fn roll_back<D: Document + ?Sized>(document: &mut D, applied: Vec<Box<dyn Command<D>>>, label: &str, original: Error) -> Error {
     for rollback in applied.into_iter().rev() {
         if let Err(rollback_error) = rollback.apply(document) {
-            return Error::Unsupported(format!(
-                "'{label}' failed and could not be rolled back, so the document is left partially modified: \
-                 the step that failed reported '{original}', and undoing '{}' then reported '{rollback_error}'",
-                rollback.label()
-            ));
+            //--- the labels go in the rollback cause, which is the one naming a step the caller did not write ---
+            return Error::RollbackFailed {
+                original: Box::new(original),
+                rollback: Box::new(Error::Unsupported(format!(
+                    "'{label}' was left partially applied because undoing '{}' reported: {rollback_error}",
+                    rollback.label()
+                ))),
+            };
         }
     }
     original
@@ -58,27 +63,28 @@ pub(crate) fn roll_back<D: Document>(document: &mut D, applied: Vec<Box<dyn Comm
 /// at this layer — the sub-command that failed has already been asked to undo
 /// itself and refused. `Sequence` therefore does not promise atomicity
 /// unconditionally; it promises that a failed rollback is *reported* rather
-/// than swallowed. The error returned in that case is an
-/// [`Error::Unsupported`] naming both the original failure and the rollback
-/// failure, and it is the caller's signal that the document must be reloaded
-/// rather than edited further.
+/// than swallowed. The error returned in that case is
+/// [`Error::RollbackFailed`], carrying both the original failure and the
+/// rollback failure, and it is the caller's signal that the document must be
+/// reloaded rather than edited further — a signal it can match on rather than
+/// read.
 ///
 /// This is reachable only for a [`Document`] whose mutations can fail for
 /// reasons other than a bad argument — `opdf_core::fakes::VecDocument` cannot
 /// reach it, a document backed by a real file can.
-pub struct Sequence<D: Document> {
+pub struct Sequence<D: Document + ?Sized> {
     label: String,
     commands: Vec<Box<dyn Command<D>>>,
 }
 
-impl<D: Document + 'static> Sequence<D> {
+impl<D: Document + ?Sized + 'static> Sequence<D> {
     /// Build a sequence from an ordered list of sub-commands.
     pub fn new(label: String, commands: Vec<Box<dyn Command<D>>>) -> Self {
         Self { label, commands }
     }
 }
 
-impl<D: Document + 'static> Command<D> for Sequence<D> {
+impl<D: Document + ?Sized + 'static> Command<D> for Sequence<D> {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         let mut applied: Vec<Box<dyn Command<D>>> = Vec::with_capacity(self.commands.len());
         for command in &self.commands {
@@ -113,7 +119,7 @@ mod tests {
     /// rollback path by construction rather than by inspecting the code.
     struct AlwaysFails;
 
-    impl<D: Document> Command<D> for AlwaysFails {
+    impl<D: Document + ?Sized> Command<D> for AlwaysFails {
         fn apply(&self, _document: &mut D) -> Result<Box<dyn Command<D>>> {
             Err(Error::Unsupported("deliberately fails".to_string()))
         }
@@ -196,9 +202,25 @@ mod tests {
             before.pages,
             "this test is only meaningful while the rollback genuinely cannot restore the document"
         );
+
+        //--- the caller must be able to *branch* on this, not only read it: "your command
+        //--- failed" and "your command failed and the document is now inconsistent" call for
+        //--- different responses, and a string cannot be matched on ---
+        let Error::RollbackFailed { original, rollback } = &error else {
+            panic!("a failed rollback must be its own variant, not a formatted Error::Unsupported, got: {error:?}");
+        };
+        assert!(
+            matches!(original.as_ref(), Error::Unsupported(_)),
+            "the original failure must be carried whole, not flattened into a string: {original:?}"
+        );
+        assert!(
+            matches!(rollback.as_ref(), Error::Unsupported(_)),
+            "the rollback failure must be carried whole too: {rollback:?}"
+        );
+
         let message = error.to_string();
         assert!(
-            message.contains("rolled back"),
+            message.contains("rollback"),
             "the caller must be told the rollback failed and the document is left modified, not merely that a step failed: {message}"
         );
         assert!(

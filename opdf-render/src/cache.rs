@@ -145,10 +145,19 @@ impl TileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opdf_core::PageId;
+    use opdf_core::{DocumentId, PageId};
+    /// The document identity every request in this module names.
+    ///
+    /// Fixed for the whole module so that two requests differ only in the fields
+    /// the test varies. Minted rather than a constant because an identity is
+    /// deliberately unforgeable: [`DocumentId`] has no `const` constructor.
+    fn test_document() -> DocumentId {
+        static DOCUMENT: std::sync::OnceLock<DocumentId> = std::sync::OnceLock::new();
+        *DOCUMENT.get_or_init(DocumentId::new_unique)
+    }
 
     fn build_request(page: u64, revision: u64) -> RenderRequest {
-        RenderRequest::new(PageId::new(page), revision, 1.0).unwrap()
+        RenderRequest::new(test_document(), PageId::new(page), revision, 1.0).unwrap()
     }
 
     /// A tile of `pixel_count` pixels — four bytes each.

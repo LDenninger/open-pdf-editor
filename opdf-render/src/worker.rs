@@ -362,10 +362,20 @@ fn convert_file_rotation(rotation: PdfPageRenderRotation) -> Rotation {
 mod tests {
     use super::*;
     use crossbeam_channel::unbounded;
-    use opdf_core::{PageSize, Rotation};
+    use opdf_core::{DocumentId, PageSize, Rotation};
+    /// The document identity every request and snapshot in this module names.
+    ///
+    /// Fixed for the whole module so that two requests differ only in the fields
+    /// the test varies, and so a rebind describes the *same* document at a new
+    /// revision rather than a different one.
+    fn test_document() -> DocumentId {
+        static DOCUMENT: std::sync::OnceLock<DocumentId> = std::sync::OnceLock::new();
+        *DOCUMENT.get_or_init(DocumentId::new_unique)
+    }
 
     fn build_snapshot(revision: u64, rotation: Rotation) -> DocumentSnapshot {
         DocumentSnapshot {
+            document: test_document(),
             revision,
             pages: vec![PageInfo {
                 id: PageId::new(1),
@@ -376,7 +386,7 @@ mod tests {
     }
 
     fn build_request(revision: u64) -> RenderRequest {
-        RenderRequest::new(PageId::new(1), revision, 1.0).unwrap()
+        RenderRequest::new(test_document(), PageId::new(1), revision, 1.0).unwrap()
     }
 
     /// A request accepted while one snapshot was current, then left in the

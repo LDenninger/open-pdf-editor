@@ -1,7 +1,7 @@
 //! `PdfDocument`: a real PDF file behind the `Document` contract.
 
 use lopdf::{IncrementalDocument, Object, ObjectId};
-use opdf_core::{Document, Error, PageId, PageInfo, Result};
+use opdf_core::{Document, DocumentId, Error, PageId, PageInfo, PortablePages, Result};
 
 use crate::error::convert_lopdf_error;
 use crate::geometry::{read_page_rotation, read_page_size};
@@ -47,6 +47,7 @@ impl DirtyState {
 /// full so that a save appends an incremental update rather than rewriting.
 #[derive(Debug)]
 pub struct PdfDocument {
+    id: DocumentId,
     incremental: IncrementalDocument,
     root_pages_id: ObjectId,
     pub(crate) pages: PageMap,
@@ -94,6 +95,7 @@ impl PdfDocument {
         incremental.new_document.version = version;
 
         Ok(Self {
+            id: DocumentId::new_unique(),
             incremental,
             root_pages_id,
             pages: PageMap::new(),
@@ -125,6 +127,7 @@ impl PdfDocument {
         incremental.new_document.version = version;
 
         Ok(Self {
+            id: DocumentId::new_unique(),
             incremental,
             root_pages_id,
             pages,
@@ -141,10 +144,13 @@ impl PdfDocument {
     /// would append to bytes that no longer describe it — re-emitting the file
     /// the compaction was asked to replace, purged objects included.
     ///
-    /// Identity is preserved: `PageId`s, page order, geometry and rotation all
-    /// stay as they were, because the bytes were written from them. Only the
-    /// backing objects move, and the revision counter does not advance — the
-    /// document a reader sees is unchanged.
+    /// Identity is preserved: the document's own [`Document::id`], its
+    /// `PageId`s, page order, geometry and rotation all stay as they were,
+    /// because the bytes were written from them. Only the backing objects move,
+    /// and the revision counter does not advance — the document a reader sees is
+    /// unchanged. Minting a fresh identity here would tell every cache and every
+    /// bound command that the user had opened a different file, when all that
+    /// happened is that the one they have open was rewritten.
     ///
     /// Returns [`Error::Malformed`] if the bytes do not parse, name no page
     /// tree, or hold a different number of pages than this document does.
@@ -162,6 +168,7 @@ impl PdfDocument {
 
         //--- an appended revision announces the same version as the file it extends ---
         incremental.new_document.version = version;
+        //--- `self.id` is deliberately untouched: this is the same open document, rewritten ---
         self.incremental = incremental;
         self.root_pages_id = root_pages_id;
         //--- the new base already carries every change, so there is nothing left to append ---
@@ -213,6 +220,10 @@ impl Document for PdfDocument {
     //---------------------------------------------------------------------
     // Inspection
     //---------------------------------------------------------------------
+
+    fn id(&self) -> DocumentId {
+        self.id
+    }
 
     fn revision(&self) -> u64 {
         self.revision
@@ -301,17 +312,82 @@ impl Document for PdfDocument {
             let copied = copy_page_into(source, object_id, &mut self.incremental.new_document)
                 .ok_or_else(|| Error::Malformed(format!("source page object {object_id:?} could not be copied")))?;
             let id = self.pages.insert_slot(at_index + offset, copied, size, rotation)?;
+            //--- the rotation is carried in memory but nothing has written it down: the source may
+            //--- have rotated the page without saving, and `copy_page_into` copies the page's own
+            //--- dictionary without the /Rotate it may have been inheriting from a parent node that
+            //--- is not copied. Marking it makes the next save state it explicitly, either way.
+            self.pages.find_slot_mut(id)?.rotation_changed = true;
             imported.push(id);
         }
 
         //--- an empty import changes nothing on disk, so it must not force the page tree to be rewritten ---
         if !imported.is_empty() {
             self.dirty.structure = true;
+            self.dirty.rotations = true;
         }
         //--- but it still advances the revision: a spurious cache miss is cheaper than a stale tile ---
         self.advance_revision();
         Ok(imported)
     }
+
+    /// Serialize the requested pages into a standalone PDF and carry its bytes.
+    ///
+    /// The pages are first imported into a scratch document, which reuses
+    /// [`Document::import_pages`]'s object-graph copy verbatim — the same
+    /// traversal, the same reference remapping — and only then serialized. Going
+    /// through the importer rather than reaching into the object graph again is
+    /// what keeps the two paths from drifting apart.
+    ///
+    /// Bytes rather than an `lopdf` structure because the carrier is opaque, so
+    /// nothing is gained by exposing a richer payload, and bytes are the one
+    /// representation this crate is already obliged to read and write correctly.
+    fn export_pages(&self, ids: &[PageId]) -> Result<PortablePages> {
+        //--- resolve every page before building anything, so a failure produces no carrier ---
+        for id in ids {
+            self.pages.find_slot(*id)?;
+        }
+        if ids.is_empty() {
+            //--- a PDF with no pages does not parse, so an empty export is carried as empty bytes ---
+            return Ok(PortablePages::new(PdfPortablePayload { bytes: Vec::new() }));
+        }
+
+        let mut scratch = Self::empty()?;
+        scratch.import_pages(self, ids, 0)?;
+        scratch.materialize_changes()?;
+
+        let mut bytes = Vec::new();
+        //--- `Document::save_to` reports through `std::io::Error`, not `lopdf::Error` ---
+        scratch.build_compacted_document().save_to(&mut bytes).map_err(Error::from)?;
+        Ok(PortablePages::new(PdfPortablePayload { bytes }))
+    }
+
+    fn import_portable(&mut self, pages: PortablePages, at_index: usize) -> Result<Vec<PageId>> {
+        //--- the position is checked first, matching import_pages' precedence ---
+        self.pages.check_insertion_index(at_index)?;
+        let payload: PdfPortablePayload = pages.take()?;
+
+        if payload.bytes.is_empty() {
+            //--- an empty import changes nothing on disk but still advances the revision, exactly as import_pages does ---
+            self.advance_revision();
+            return Ok(Vec::new());
+        }
+
+        let source = Self::load_from_bytes(&payload.bytes)?;
+        let ids = source.page_ids();
+        self.import_pages(&source, &ids, at_index)
+    }
+}
+
+/// What a [`PdfDocument`] puts inside a [`PortablePages`]: a standalone PDF.
+///
+/// Private on purpose. Privacy is what makes the carrier implementation-specific:
+/// no other crate can name this type, so no other implementation can take a
+/// `PdfDocument`'s payload back out — [`PortablePages::take`] refuses instead.
+#[derive(Debug)]
+struct PdfPortablePayload {
+    /// A complete PDF holding the exported pages, in order. Empty for an export
+    /// of no pages, which is not a document a parser would accept.
+    bytes: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -651,6 +727,67 @@ mod tests {
         let before = document.revision();
         document.restore_page(ids[0], 0).unwrap();
         assert_ne!(before, document.revision(), "restore_page must advance the revision on success");
+    }
+
+    //---------------------------------------------------------------------
+    // Portable pages
+    //---------------------------------------------------------------------
+
+    /// The reason option 2 was chosen over making `import_pages` object-safe:
+    /// the copy still goes through the object graph, so geometry and rotation
+    /// survive it. An object-safe `import_pages` taking `&dyn Document` could
+    /// only have moved `PageInfo` metadata across and rebuilt blank pages.
+    #[test]
+    fn exports_and_imports_pages_with_their_geometry_and_rotation_intact() {
+        let mut source = PdfDocument::load_from_bytes(&fixture::build_flat_pages(&[
+            PageSize::new(100.0, 100.0),
+            PageSize::new(200.0, 200.0),
+            PageSize::new(300.0, 300.0),
+        ]))
+        .unwrap();
+        let source_ids = source.page_ids();
+        source.set_rotation(source_ids[1], Rotation::Quarter).unwrap();
+
+        let mut target = build_document(2);
+        let target_ids = target.page_ids();
+        let carrier = source.export_pages(&source_ids[0..2]).unwrap();
+        let imported = target.import_portable(carrier, 1).unwrap();
+
+        assert_eq!(imported.len(), 2);
+        assert_eq!(target.page_count(), 4);
+        let widths: Vec<f32> = imported.iter().map(|id| target.page(*id).unwrap().size.width_pt).collect();
+        assert_eq!(
+            widths,
+            vec![100.0, 200.0],
+            "the carrier must preserve each page's own geometry, not a default size"
+        );
+        assert_eq!(
+            target.page(imported[1]).unwrap().rotation,
+            Rotation::Quarter,
+            "the carrier must preserve a rotation the source had not saved"
+        );
+        assert_eq!(target.index_of(target_ids[1]).unwrap(), 3, "pages after the insertion point must shift");
+        assert_eq!(source.page_count(), 3, "exporting must not mutate the source");
+    }
+
+    /// The cross-implementation case, with two *real* implementations rather
+    /// than the contract suite's stand-in.
+    #[test]
+    fn refuses_a_carrier_exported_by_a_different_implementation() {
+        let other = opdf_core::fakes::VecDocument::with_pages(2, PageSize::A4);
+        let carrier = other.export_pages(&other.page_ids()).unwrap();
+
+        let mut target = build_document(2);
+        let before = target.page_ids();
+        let before_revision = target.revision();
+
+        let refused = target.import_portable(carrier, 1);
+        assert!(
+            matches!(refused, Err(opdf_core::Error::Unsupported(_))),
+            "a VecDocument's carrier must be refused, not reinterpreted as PDF bytes, got: {refused:?}"
+        );
+        assert_eq!(target.page_ids(), before, "a refused import must leave the document untouched");
+        assert_eq!(before_revision, target.revision(), "a refused import must leave the revision untouched");
     }
 
     #[test]

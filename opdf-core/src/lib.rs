@@ -17,7 +17,7 @@ pub use page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
 
 pub mod document;
 
-pub use document::{Document, DocumentIo, DocumentSnapshot};
+pub use document::{Document, DocumentId, DocumentIo, DocumentSnapshot, PortablePages};
 
 pub mod fakes;
 

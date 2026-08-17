@@ -8,9 +8,9 @@ use crate::sequence::{Sequence, roll_back};
 /// Append every page of every document in `sources`, in order, atomically.
 ///
 /// Atomicity holds under the same single caveat as [`Sequence`]'s: if a source
-/// fails to import and undoing an *earlier* source's import then fails too,
-/// the document is left part-merged and the returned error names both
-/// failures rather than reporting only the first.
+/// fails to import and undoing an *earlier* source's import then fails too, the
+/// document is left part-merged and the returned [`opdf_core::Error::RollbackFailed`]
+/// carries both failures rather than reporting only the first.
 pub struct Merge<D: Document> {
     sources: Vec<D>,
 }

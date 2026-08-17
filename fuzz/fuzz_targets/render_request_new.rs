@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use opdf_core::{PageId, RenderRequest};
+use opdf_core::{DocumentId, PageId, RenderRequest};
 
 #[derive(Debug, arbitrary::Arbitrary)]
 struct RenderRequestInput {
@@ -12,7 +12,10 @@ struct RenderRequestInput {
 
 fuzz_target!(|input: RenderRequestInput| {
     let scale = f32::from_bits(input.scale_bits);
-    let result = RenderRequest::new(PageId::new(input.page_raw), input.revision, scale);
+    // The document identity is not fuzzed: it is unforgeable by construction --
+    // DocumentId::new_unique is the only way to make one, and new() neither
+    // validates nor interprets it. The scale is the only argument with a rule.
+    let result = RenderRequest::new(DocumentId::new_unique(), PageId::new(input.page_raw), input.revision, scale);
 
     match result {
         Ok(request) => {

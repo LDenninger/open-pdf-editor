@@ -1,9 +1,112 @@
 //! The document contract: what every PDF document implementation must provide.
 
+use std::any::Any;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Result;
+use crate::error::Error;
 use crate::page::{PageId, PageInfo, Rotation};
+
+/// The identity of one open document, unique within this process.
+///
+/// Minted at construction and never reused, including after a document is
+/// dropped. Unlike [`Document::revision`], which every implementation starts at
+/// zero, an identity distinguishes two documents of the same type — which is
+/// what a tile cache, a cross-document command, and a render worker each need
+/// in order to refuse work built for a different document.
+///
+/// It is meaningful within one process only, exactly like [`PageId`]: nothing
+/// in the PDF format can carry it, and persisting one would silently address
+/// the wrong document after a reopen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    /// Mint an identity no other live or past document in this process holds.
+    pub fn new_unique() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Unwrap the raw identifier, for in-memory interchange with code that
+    /// cannot name the `DocumentId` type — a widget id, a bare `u64` key.
+    ///
+    /// The returned value must never be written to disk or carried across a
+    /// save-and-reopen: an identity is unique within one process and means
+    /// nothing outside it. See `docs/architecture/contracts.md`.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DocumentId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "document#{}", self.0)
+    }
+}
+
+/// Pages taken out of one document and not yet put into another.
+///
+/// An **opaque owned carrier**. What is inside it — serialized bytes, an
+/// implementation-specific structure — is deliberately not part of the contract,
+/// and there is no way to inspect it: the payload is erased behind [`Any`] and
+/// only the implementation that wrote it can name the type that gets it back.
+///
+/// That erasure is the whole design. [`Document::export_pages`] and
+/// [`Document::import_portable`] are object-safe, so a caller holding two
+/// `&dyn Document` can move pages between them without knowing either concrete
+/// type — which [`Document::import_pages`], with its `&Self` source, cannot
+/// express. The price is that the target may be a *different* implementation
+/// from the source, and must then refuse: [`PortablePages::take`] answers
+/// [`Error::Unsupported`] rather than letting a payload be reinterpreted.
+///
+/// `import_pages` remains the fast path, unchanged. This is the general one, and
+/// it costs a copy.
+pub struct PortablePages {
+    /// The payload's type name, for the refusal message only.
+    payload_type: &'static str,
+    payload: Box<dyn Any + Send>,
+}
+
+impl PortablePages {
+    /// Wrap an implementation's own payload.
+    ///
+    /// Called by [`Document::export_pages`]. `T` should be a type private to the
+    /// implementation: privacy is what stops another implementation naming it,
+    /// and naming it is the only way to get the payload back.
+    pub fn new<T: Any + Send>(payload: T) -> Self {
+        Self {
+            payload_type: std::any::type_name::<T>(),
+            payload: Box::new(payload),
+        }
+    }
+
+    /// Take the payload back, if this carrier is one `T` was put into.
+    ///
+    /// Called by [`Document::import_portable`]. Returns [`Error::Unsupported`]
+    /// when the carrier came from a different implementation — which is the
+    /// contract's answer for a foreign carrier, and the reason no implementation
+    /// has to invent one.
+    pub fn take<T: Any + Send>(self) -> Result<T> {
+        let expected = std::any::type_name::<T>();
+        let actual = self.payload_type;
+        self.payload.downcast::<T>().map(|payload| *payload).map_err(|_| {
+            Error::Unsupported(format!(
+                "these pages were exported by a different document implementation ({actual}) and cannot be imported here ({expected}); \
+                 the carrier's contents are opaque, so there is nothing to fall back on"
+            ))
+        })
+    }
+}
+
+impl std::fmt::Debug for PortablePages {
+    /// Names the payload's type and nothing else: the contents are opaque by
+    /// design, and a `Debug` that printed them would be an inspection route.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PortablePages").field("payload_type", &self.payload_type).finish()
+    }
+}
 
 /// A paginated document that can be inspected and structurally modified.
 ///
@@ -11,6 +114,19 @@ use crate::page::{PageId, PageInfo, Rotation};
 /// Indices appear only as insertion positions, and are always interpreted
 /// against the document's state at the moment of the call.
 pub trait Document {
+    /// Which document this is, distinct from every other document in this process.
+    ///
+    /// Minted once, at construction, and unchanged for the life of the value —
+    /// through every mutation, and through a compacting save that rewrites the
+    /// backing bytes, because that is the same open document rewritten. A new
+    /// identity means a *different* document, which is exactly what a tile cache
+    /// and a cross-document command need to be told.
+    ///
+    /// Deliberately without a default body: a default would let an
+    /// implementation silently share one identity across every instance, and
+    /// nothing else in the contract would notice.
+    fn id(&self) -> DocumentId;
+
     /// A counter that advances whenever this document's structure changes.
     ///
     /// Tile caches key on this so that an image rendered before a change is never
@@ -86,6 +202,36 @@ pub trait Document {
     fn import_pages(&mut self, source: &Self, ids: &[PageId], at_index: usize) -> Result<Vec<PageId>>
     where
         Self: Sized;
+
+    /// Take copies of the given pages out of this document, in the order given,
+    /// as an opaque carrier another document can import.
+    ///
+    /// The object-safe counterpart to [`Document::import_pages`], whose `&Self`
+    /// source keeps it out of the vtable and so out of reach of a caller holding
+    /// two `&dyn Document` — a cross-document drag in the user interface, for
+    /// instance. `import_pages` stays the fast path where both concrete types are
+    /// known; this pair costs a copy and works regardless.
+    ///
+    /// A read: the document is not modified and the revision does not advance.
+    ///
+    /// Returns [`crate::Error::PageNotFound`] if any page is absent, in which
+    /// case no carrier is produced.
+    fn export_pages(&self, ids: &[PageId]) -> Result<PortablePages>;
+
+    /// Insert pages carried by [`Document::export_pages`] at a position,
+    /// returning their new identities in this document.
+    ///
+    /// Consumes the carrier, because the pages it holds are moved into this
+    /// document rather than borrowed from it.
+    ///
+    /// Returns [`crate::Error::IndexOutOfBounds`] if the position exceeds the
+    /// page count, and [`crate::Error::Unsupported`] if the carrier was produced
+    /// by a *different* implementation — its contents are opaque, so there is
+    /// nothing to fall back on and guessing would corrupt. [`PortablePages::take`]
+    /// produces that error, so no implementation has to invent it.
+    ///
+    /// Advances the revision on success.
+    fn import_portable(&mut self, pages: PortablePages, at_index: usize) -> Result<Vec<PageId>>;
 }
 
 /// Reading a document from disk and writing it back.
@@ -114,8 +260,16 @@ pub trait DocumentIo: Document + Sized {
 ///
 /// The UI holds a snapshot rather than the document itself, because the render
 /// worker owns the document and cannot share it across threads.
-#[derive(Clone, PartialEq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct DocumentSnapshot {
+    /// Which document this is a snapshot *of*.
+    ///
+    /// Carried so that a caller which never touches the document — the shell, the
+    /// scheduler, a tile cache — can still tell one document's work from
+    /// another's. Every [`crate::render::RenderRequest`] is built from this
+    /// value, exactly as `revision` is, so neither can drift from the structure
+    /// it describes.
+    pub document: DocumentId,
     /// Page metadata in document order.
     pub pages: Vec<PageInfo>,
     /// The value [`Document::revision`] held when this snapshot was captured.
@@ -126,14 +280,34 @@ pub struct DocumentSnapshot {
     pub revision: u64,
 }
 
+/// An empty snapshot of a document that does not exist — what a shell shows
+/// before anything is open.
+///
+/// Hand-written rather than derived, because a derived `Default` would need a
+/// `Default` for [`DocumentId`], and a default identity is one every empty
+/// snapshot would share. Minting instead means two "no document open" states are
+/// two distinct documents, which is the safe direction: their cache keys cannot
+/// collide.
+impl Default for DocumentSnapshot {
+    fn default() -> Self {
+        Self {
+            document: DocumentId::new_unique(),
+            pages: Vec::new(),
+            revision: 0,
+        }
+    }
+}
+
 impl DocumentSnapshot {
-    /// Capture the current page list of a document, together with its revision.
+    /// Capture the current page list of a document, together with its identity
+    /// and revision.
     pub fn of<D: Document + ?Sized>(document: &D) -> Result<Self> {
         let mut pages = Vec::with_capacity(document.page_count());
         for id in document.page_ids() {
             pages.push(document.page(id)?);
         }
         Ok(Self {
+            document: document.id(),
             pages,
             revision: document.revision(),
         })

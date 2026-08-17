@@ -116,7 +116,9 @@ mod tests {
     #[test]
     fn reads_its_status_straight_out_of_a_cache() {
         let mut cache = TextureCache::new(4 * 1024 * 1024);
-        cache.mark_pending(opdf_core::render::RenderRequest::new(opdf_core::page::PageId::new(0), 1, 1.0).unwrap());
+        cache.mark_pending(
+            opdf_core::render::RenderRequest::new(opdf_core::document::DocumentId::new_unique(), opdf_core::page::PageId::new(0), 1, 1.0).unwrap(),
+        );
         let status = RenderStatus::of(&cache);
         assert_eq!(status.pending, 1);
         assert_eq!(status.cached, 0);

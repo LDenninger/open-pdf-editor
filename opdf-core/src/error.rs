@@ -47,6 +47,26 @@ pub enum Error {
         end: usize,
     },
 
+    /// A command failed and the rollback of its already-applied parts also failed,
+    /// so the document is in neither the original nor the intended state.
+    ///
+    /// The caller cannot recover at this layer: the sub-command that was asked to
+    /// undo itself refused. Reload the document.
+    ///
+    /// Distinct from every other variant because the *response* differs. Every
+    /// other error says "your command did not happen"; this one says "your
+    /// command did not happen and the document is no longer what it was". A
+    /// caller that cannot tell the two apart either treats a recoverable
+    /// rejection as corruption, or keeps editing a document it should have
+    /// reloaded.
+    #[error("{original}; the rollback then failed: {rollback}")]
+    RollbackFailed {
+        /// Why the sequence failed in the first place.
+        original: Box<Error>,
+        /// Why the rollback of the applied prefix then failed.
+        rollback: Box<Error>,
+    },
+
     /// Rasterization failed.
     #[error("render failed: {0}")]
     Render(String),
@@ -66,6 +86,21 @@ mod tests {
     fn formats_an_inverted_range_without_implying_either_end_is_out_of_bounds() {
         let error = Error::InvalidRange { start: 5, end: 2 };
         assert_eq!(error.to_string(), "invalid range 5..2: the end precedes the start");
+    }
+
+    /// The composed message must name both failures: the rollback failure is
+    /// what tells the caller the document is no longer what it was, and the
+    /// original is what says why anything was attempted.
+    #[test]
+    fn formats_a_failed_rollback_with_both_causes() {
+        let error = Error::RollbackFailed {
+            original: Box::new(Error::Unsupported("the step refused".to_string())),
+            rollback: Box::new(Error::PageNotFound(PageId::new(3))),
+        };
+        assert_eq!(
+            error.to_string(),
+            "unsupported: the step refused; the rollback then failed: page not found: page#3"
+        );
     }
 
     #[test]
