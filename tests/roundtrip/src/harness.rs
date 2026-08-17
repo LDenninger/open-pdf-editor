@@ -15,7 +15,7 @@ use crate::diff::{DiffError, StructuralDiff, diff_bytes};
 /// Which check `assert_round_trip` applies to a file's saved-vs-original bytes.
 ///
 /// There is no default: a caller must choose explicitly, per file, mirroring
-/// `RenderRequest::new` taking `revision` positionally rather than defaulting
+/// `RenderRequest::new` taking `document` and `revision` positionally rather than defaulting
 /// it (`docs/architecture/contracts.md`) -- a caller who silently reaches for
 /// the weaker check reintroduces exactly the regression this harness exists
 /// to catch, one that produces a passing test rather than a compile error.
