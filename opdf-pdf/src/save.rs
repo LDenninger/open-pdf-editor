@@ -141,7 +141,7 @@ impl PdfDocument {
     /// is lossy by design: anything unreferenced that a reader might still have
     /// wanted — a superseded annotation, a stale outline — is gone. That is why
     /// compaction is only ever invoked on an explicit user request.
-    fn build_compacted_document(&self) -> lopdf::Document {
+    pub(crate) fn build_compacted_document(&self) -> lopdf::Document {
         let mut compacted = self.incremental().get_prev_documents().clone();
         for (object_id, object) in &self.incremental().new_document.objects {
             compacted.objects.insert(*object_id, object.clone());
