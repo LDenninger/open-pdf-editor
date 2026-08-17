@@ -11,6 +11,13 @@
 //! therefore made while holding [`crate::library::lock_pdfium`]. The lock is
 //! taken per operation rather than for the worker's lifetime, so that one
 //! worker cannot starve another.
+//!
+//! # Revisions
+//!
+//! A request's geometry is resolved against whatever snapshot is current when
+//! the worker renders it. That makes the backlog and the snapshot a single
+//! piece of state: a request queued under one snapshot must never be answered
+//! under the next one. See [`accept_message`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +46,17 @@ pub(crate) enum WorkerMessage {
 }
 
 /// Own Pdfium and the document, and answer requests until told to stop.
+///
+/// `ready` reports the outcome of opening the document exactly once. Nobody may
+/// be listening — [`crate::service::PdfiumRenderService::open_deferred`] drops
+/// the receiver immediately — so the send is fire-and-forget and the worker
+/// serves regardless. The channel is bounded at one, so the send never blocks.
+///
+/// A document that cannot be opened does *not* end the worker: it would close
+/// the request channel, and every later request would be answered with a
+/// generic "the worker is no longer running" instead of the reason the file
+/// failed. The worker stays and answers each request with the real reason,
+/// until it is shut down or its handle is dropped.
 pub(crate) fn run_worker(
     pdf_path: PathBuf,
     snapshot: DocumentSnapshot,
@@ -50,17 +68,22 @@ pub(crate) fn run_worker(
     let pdfium = match bind_pdfium() {
         Ok(pdfium) => pdfium,
         Err(reason) => {
-            let _ = ready.send(Err(reason));
+            let _ = ready.send(Err(reason.clone()));
+            fail_every_request(&requests, &responses, &reason);
             return;
         }
     };
 
     let document = {
+        //--- declared before the document, so the document's own closing call is still covered ---
         let _guard = lock_pdfium();
         match pdfium.load_pdf_from_file(&pdf_path, None) {
             Ok(document) => document,
             Err(error) => {
-                let _ = ready.send(Err(format!("could not open {}: {error}", pdf_path.display())));
+                let reason = format!("could not open {}: {error}", pdf_path.display());
+                let _ = ready.send(Err(reason.clone()));
+                drop(_guard);
+                fail_every_request(&requests, &responses, &reason);
                 return;
             }
         }
@@ -70,11 +93,35 @@ pub(crate) fn run_worker(
     //--- moment the snapshot's order and the file's order are the same ---
     let file_indices = map_file_indices(&snapshot);
 
-    if ready.send(Ok(())).is_ok() {
-        serve_requests(&document, snapshot, &file_indices, &requests, &responses, &rasterizations);
-    }
+    let _ = ready.send(Ok(()));
+    serve_requests(&document, snapshot, &file_indices, &requests, &responses, &rasterizations);
 
     close_document(document);
+}
+
+/// Answer every request with `reason`, for a worker whose document never opened.
+///
+/// Keeps the contract's one-response-per-request promise, and keeps the reason
+/// the caller actually needs — the open error — rather than the shape of the
+/// failure that followed from it.
+fn fail_every_request(requests: &Receiver<WorkerMessage>, responses: &Sender<RenderResponse>, reason: &str) {
+    while let Ok(message) = requests.recv() {
+        match message {
+            WorkerMessage::Render(request) => {
+                if responses
+                    .send(RenderResponse::Failed {
+                        request,
+                        reason: reason.to_string(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            WorkerMessage::Rebind(_) => {}
+            WorkerMessage::Shutdown => return,
+        }
+    }
 }
 
 /// Where each page sits in the file Pdfium has open.
@@ -154,6 +201,27 @@ fn serve_requests(
 ///
 /// A request evicted to keep the backlog bounded is answered immediately, so
 /// that every submitted request still receives exactly one response.
+///
+/// # A rebind supersedes the backlog
+///
+/// The worker resolves a request's geometry against whatever snapshot is
+/// current when it *renders* it, not when it accepted it. A request left in the
+/// backlog across a [`WorkerMessage::Rebind`] would therefore be rendered
+/// against the new snapshot and — because the cache is keyed on the request,
+/// which carries the old revision — stored under the revision it did not
+/// belong to. A revision 7 request came back with revision 8's swapped axes,
+/// and every later revision 7 request was served that tile from the cache.
+///
+/// So a rebind drains the backlog, answering everything in it
+/// [`RenderResponse::Failed`]. Failing is right rather than merely convenient:
+/// the caller has already moved to the new revision and will resubmit, whereas
+/// re-rendering against the retired snapshot would spend a rasterization on a
+/// tile nothing will ask for again. Requests that arrive *after* the rebind are
+/// untouched — they belong to the new snapshot.
+///
+/// The worker renders one request to completion before it reads the next
+/// message, so there is never a request in flight when a rebind is applied: the
+/// backlog is the whole set of requests the rebind can strand.
 fn accept_message(
     message: WorkerMessage,
     backlog: &mut Backlog,
@@ -172,6 +240,16 @@ fn accept_message(
             true
         }
         WorkerMessage::Rebind(replacement) => {
+            //--- drained before the snapshot moves, so nothing queued under the old one can be answered under the new ---
+            while let Some(superseded) = backlog.take_newest() {
+                let _ = responses.send(RenderResponse::Failed {
+                    request: superseded,
+                    reason: format!(
+                        "superseded by a rebind: the document moved from revision {} to revision {} while this request was queued, and answering it now would return the new revision's geometry",
+                        snapshot.revision, replacement.revision
+                    ),
+                });
+            }
             *snapshot = *replacement;
             cache.retain_revision(snapshot.revision);
             true
@@ -277,5 +355,91 @@ fn convert_file_rotation(rotation: PdfPageRenderRotation) -> Rotation {
         PdfPageRenderRotation::Degrees90 => Rotation::Quarter,
         PdfPageRenderRotation::Degrees180 => Rotation::Half,
         PdfPageRenderRotation::Degrees270 => Rotation::ThreeQuarter,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use opdf_core::{PageSize, Rotation};
+
+    fn build_snapshot(revision: u64, rotation: Rotation) -> DocumentSnapshot {
+        DocumentSnapshot {
+            revision,
+            pages: vec![PageInfo {
+                id: PageId::new(1),
+                size: PageSize::A4,
+                rotation,
+            }],
+        }
+    }
+
+    fn build_request(revision: u64) -> RenderRequest {
+        RenderRequest::new(PageId::new(1), revision, 1.0).unwrap()
+    }
+
+    /// A request accepted while one snapshot was current, then left in the
+    /// backlog while a rebind swapped that snapshot out, used to be rendered
+    /// against the *new* snapshot and cached under its own — now superseded —
+    /// revision key. The tile carried the new revision's geometry under the old
+    /// revision's name, and every later request for the old revision was served
+    /// that tile from the cache.
+    ///
+    /// A rebind therefore supersedes the whole backlog: nothing queued before it
+    /// may be answered after it.
+    #[test]
+    fn a_rebind_supersedes_every_request_queued_before_it() {
+        let (responses_tx, responses_rx) = unbounded::<RenderResponse>();
+        let mut backlog = Backlog::with_capacity(MAX_BACKLOG);
+        let mut snapshot = build_snapshot(7, Rotation::None);
+        let mut cache = TileCache::with_budget(DEFAULT_CACHE_BYTES);
+
+        let queued = build_request(7);
+        assert!(accept_message(
+            WorkerMessage::Render(queued),
+            &mut backlog,
+            &mut snapshot,
+            &mut cache,
+            &responses_tx
+        ));
+        assert!(!backlog.is_empty(), "the request must be queued before the rebind arrives");
+
+        let rebind = WorkerMessage::Rebind(Box::new(build_snapshot(8, Rotation::Quarter)));
+        assert!(accept_message(rebind, &mut backlog, &mut snapshot, &mut cache, &responses_tx));
+
+        assert!(
+            backlog.is_empty(),
+            "a request queued at revision 7 must not survive into revision 8; rendering it now would answer it with revision 8 geometry and cache it under revision 7"
+        );
+
+        let answered: Vec<RenderResponse> = responses_rx.try_iter().collect();
+        assert_eq!(answered.len(), 1, "every superseded request must still receive exactly one response");
+        assert_eq!(*answered[0].request(), queued, "the response must name the request that was superseded");
+        match &answered[0] {
+            RenderResponse::Failed { reason, .. } => assert!(reason.contains("rebind"), "the reason must name the cause, got: {reason}"),
+            RenderResponse::Ready { tile, .. } => panic!("a superseded request must not be answered with a {}x{} tile", tile.width(), tile.height()),
+        }
+    }
+
+    /// The backlog is drained on rebind, but a request that arrives *after* the
+    /// rebind belongs to the new snapshot and must be served normally.
+    #[test]
+    fn a_request_queued_after_a_rebind_is_untouched() {
+        let (responses_tx, responses_rx) = unbounded::<RenderResponse>();
+        let mut backlog = Backlog::with_capacity(MAX_BACKLOG);
+        let mut snapshot = build_snapshot(7, Rotation::None);
+        let mut cache = TileCache::with_budget(DEFAULT_CACHE_BYTES);
+
+        let rebind = WorkerMessage::Rebind(Box::new(build_snapshot(8, Rotation::Quarter)));
+        accept_message(rebind, &mut backlog, &mut snapshot, &mut cache, &responses_tx);
+        accept_message(WorkerMessage::Render(build_request(8)), &mut backlog, &mut snapshot, &mut cache, &responses_tx);
+
+        assert_eq!(
+            backlog.take_newest(),
+            Some(build_request(8)),
+            "a request queued after the rebind must still be served"
+        );
+        assert!(responses_rx.try_iter().next().is_none(), "nothing queued after the rebind may be failed");
     }
 }

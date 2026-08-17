@@ -32,10 +32,24 @@ pub const MAX_TILE_EDGE: u32 = 32_768;
 /// Deliberately the same pixel budget [`opdf_core::fakes::FakeRenderService`]
 /// applies, so the user interface sees one area limit rather than two. The two
 /// renderers do not fail identically: [`MAX_TILE_EDGE`] is an additional
-/// constraint with no analogue in the fake. A single render transiently costs three
-/// buffers of this size — Pdfium's bitmap, the RGBA copy, and the cached tile —
-/// which is why the ceiling sits below the point where one page could exhaust
-/// a workstation's memory.
+/// constraint with no analogue in the fake.
+///
+/// # What one tile at this ceiling actually costs
+///
+/// More than the three buffers this comment used to budget for. Two full-sized
+/// buffers are live simultaneously at each of two moments in serving one
+/// request:
+///
+/// 1. in [`crate::raster::rasterize_page`], Pdfium's own bitmap and the RGBA
+///    copy taken out of it;
+/// 2. in the render worker, the tile in the response and the copy
+///    [`crate::cache::TileCache`] takes when it caches it — `insert` clones.
+///
+/// So 512 MiB is transiently resident twice over for a tile at this ceiling,
+/// against the ~1 GiB the review measured end to end, and the cached copy then
+/// occupies the whole of [`crate::cache::DEFAULT_CACHE_BYTES`] — the two
+/// constants are equal, not four apart. See `DEFAULT_CACHE_BYTES` for why the
+/// ceiling cannot simply come down.
 pub const MAX_TILE_PIXELS: u64 = 64 * 1024 * 1024;
 
 /// Resolve a request against a page's geometry.
