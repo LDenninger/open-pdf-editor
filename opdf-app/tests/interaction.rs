@@ -1038,3 +1038,115 @@ fn opening_another_document_starts_a_fresh_history() {
     );
     assert_eq!(app.redo_depth(), 0);
 }
+
+//---------------------------------------------------------------------
+// Compaction — F16
+//---------------------------------------------------------------------
+//
+// A compacting save purges unreferenced objects, and a page deleted in this
+// session is exactly that: it sits in the trash, referenced only by the undo
+// entry that would restore it. After a compaction that entry cannot succeed —
+// since Track A's fix the compacted bytes become the document's base, so a
+// queued RestorePage is unambiguously dead. The user must therefore be asked
+// first, and on confirming, the history must be discarded rather than left to
+// fail when they press undo.
+
+/// A shell over a fake document, opened from a real path, with one page deleted.
+///
+/// The deletion is what puts a page in the trash, which is what makes a
+/// compaction destructive. Without it these tests would prove nothing.
+fn app_with_a_deleted_page(path: &Path) -> (OpdfApp, Context) {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(path).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened);
+    app.apply_action(MenuAction::DeletePage, &ctx);
+    assert_eq!(app.state().page_count(), 2, "the deletion must land before the test means anything");
+    assert_eq!(app.undo_depth(), 1, "the deletion must be undoable before the test means anything");
+    (app, ctx)
+}
+
+#[test]
+fn compacting_asks_before_it_destroys_undo_of_a_deletion() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&origin);
+
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    assert!(app.compaction_pending(), "Compact must ask before it discards the user's history");
+    assert!(!origin.exists(), "Compact must write nothing until the user has confirmed");
+    assert_eq!(app.undo_depth(), 1, "merely asking must not cost the history");
+}
+
+/// The F16 regression test.
+///
+/// Verified to fail against a build of this same code with the `clear()` call
+/// removed — a test that passes either way would prove nothing.
+#[test]
+fn confirming_a_compaction_clears_the_undo_stack() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&origin);
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    app.confirm_compaction();
+
+    assert!(origin.exists(), "confirming must actually write the compacted document");
+    assert!(!app.compaction_pending(), "the dialog must close once it has been answered");
+    assert_eq!(
+        app.undo_depth(),
+        0,
+        "compaction purged the trashed page, so the queued RestorePage is dead; leaving it on the stack \
+         hands the user an undo that fails instead of an undo that is honestly gone"
+    );
+    assert_eq!(app.redo_depth(), 0, "a redo entry can resolve to RestorePage just as an undo entry can");
+}
+
+#[test]
+fn cancelling_a_compaction_writes_nothing_and_keeps_the_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&origin);
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    app.cancel_compaction();
+
+    assert!(!origin.exists(), "cancelling must write nothing at all");
+    assert!(!app.compaction_pending());
+    assert_eq!(app.undo_depth(), 1, "cancelling must leave the history exactly as it was");
+
+    //--- and the history must still work, not merely still be counted ---
+    app.apply_action(MenuAction::Undo, &ctx);
+    assert_eq!(app.state().page_count(), 3, "the deleted page must come back");
+    assert!(app.last_error().is_none());
+}
+
+/// A compaction that fails must leave the history intact, mirroring `opdf-pdf`,
+/// where a failed compaction leaves the trash intact. Clearing the stack after a
+/// write that never happened would discard history for nothing.
+#[test]
+fn a_failed_compaction_keeps_the_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let unwritable = directory.path().join("no-such-directory").join("orig.pdf");
+    let (mut app, ctx) = app_with_a_deleted_page(&unwritable);
+    app.apply_action(MenuAction::Compact, &ctx);
+
+    app.confirm_compaction();
+
+    assert_eq!(app.undo_depth(), 1, "the compaction failed, so nothing was purged and nothing may be discarded");
+    let message = app.last_error().unwrap_or_default();
+    assert!(message.contains("orig.pdf"), "the failure must name the file, got: {message}");
+}
+
+#[test]
+fn a_compaction_the_user_never_confirmed_cannot_be_confirmed_into_a_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let origin = directory.path().join("orig.pdf");
+    let (mut app, _ctx) = app_with_a_deleted_page(&origin);
+
+    //--- no Compact action was raised, so there is nothing to confirm ---
+    app.confirm_compaction();
+
+    assert!(!origin.exists(), "confirming a dialog that was never raised must not write the document");
+    assert_eq!(app.undo_depth(), 1, "nor may it cost the history");
+}
