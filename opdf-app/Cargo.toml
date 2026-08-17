@@ -17,6 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 opdf-core = { path = "../opdf-core" }
+opdf-pdf = { path = "../opdf-pdf" }
+opdf-render = { path = "../opdf-render" }
 egui = "0.32"
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui-phosphor = "0.10"
