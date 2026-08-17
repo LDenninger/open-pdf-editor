@@ -30,7 +30,16 @@
 //! byte for byte. Saving a document that was not edited reproduces the original
 //! file exactly. [`opdf_core::DocumentIo::save_compacted`] rewrites the file
 //! without its revision history; it is lossy and is only for explicit user
-//! request.
+//! request. Compaction also rebases the document onto the bytes it wrote, so
+//! every later save appends to the compacted file rather than resurrecting the
+//! bytes the compaction was asked to drop.
+//!
+//! # Creating a document
+//!
+//! [`PdfDocument::empty`] builds a document from nothing — a catalog and an
+//! empty page tree. It has no pages, so neither save method will write it until
+//! [`opdf_core::Document::insert_page`] or [`opdf_core::Document::import_pages`]
+//! puts one in; in every other respect it behaves as a parsed document does.
 //!
 //! # Limits of this implementation
 //!
