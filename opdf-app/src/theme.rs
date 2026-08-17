@@ -123,8 +123,8 @@ pub fn apply_theme(ctx: &Context, theme: &Theme) {
     visuals.extreme_bg_color = theme.canvas_background;
     visuals.override_text_color = Some(theme.text_primary);
     visuals.selection.bg_fill = theme.accent.gamma_multiply(0.35);
-    visuals.selection.stroke = egui::Stroke::new(1.0, theme.accent);
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme.separator);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, theme.accent);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, theme.separator);
     ctx.set_visuals(visuals);
 }
 
