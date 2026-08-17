@@ -13,6 +13,56 @@ use opdf_core::page::{PageId, PageSize};
 use opdf_core::render::{RenderRequest, RenderResponse, RenderService};
 use opdf_core::{Error, Result};
 
+/// A document the shell can save.
+///
+/// [`opdf_core::DocumentIo`] is `Sized`, so its save methods cannot be reached
+/// through the `Box<dyn Document>` the shell owns. This trait is the object-safe
+/// subset the shell actually needs: no `open`, because opening produces the
+/// document rather than acting on one, and that is [`DocumentOpener`]'s job.
+pub trait EditableDocument: Document {
+    /// Write changes as an incremental update appended to the original bytes.
+    ///
+    /// The shell's default save path: it appends rather than rewrites, so every
+    /// structure the implementation does not model survives, and it does not
+    /// purge the trash, so undo of a deletion survives it too.
+    fn save_incremental(&mut self, path: &Path) -> Result<()>;
+
+    /// Write a freshly serialized document, discarding unreferenced objects.
+    ///
+    /// Destructive to undo of a deletion — a trashed page is an unreferenced
+    /// object — so the shell only ever reaches this on an explicit, confirmed
+    /// request, and clears its undo stack afterwards.
+    fn save_compacted(&mut self, path: &Path) -> Result<()>;
+}
+
+impl EditableDocument for opdf_pdf::PdfDocument {
+    fn save_incremental(&mut self, path: &Path) -> Result<()> {
+        DocumentIo::save_incremental(self, path)
+    }
+
+    fn save_compacted(&mut self, path: &Path) -> Result<()> {
+        DocumentIo::save_compacted(self, path)
+    }
+}
+
+/// Saving a [`VecDocument`] writes a marker file recording what was asked for.
+///
+/// [`VecDocument`] has no file format, and inventing a PDF writer for it would
+/// be testing a fake against a fake — serializing PDF is `opdf-pdf`'s job. The
+/// marker is enough to prove the call reached the object through the trait, and
+/// which of the two save paths it took.
+impl EditableDocument for VecDocument {
+    fn save_incremental(&mut self, path: &Path) -> Result<()> {
+        std::fs::write(path, format!("incremental {} pages\n", self.page_count()))?;
+        Ok(())
+    }
+
+    fn save_compacted(&mut self, path: &Path) -> Result<()> {
+        std::fs::write(path, format!("compacted {} pages\n", self.page_count()))?;
+        Ok(())
+    }
+}
+
 /// A document the shell has opened, together with the service that renders it.
 ///
 /// The snapshot is taken at open time and handed over with the document so the
@@ -21,7 +71,7 @@ use opdf_core::{Error, Result};
 /// describe.
 pub struct OpenedDocument {
     /// The document itself, kept so later edits and saves have something to act on.
-    pub document: Box<dyn Document>,
+    pub document: Box<dyn EditableDocument>,
     /// The service that rasterizes this document, and only this document.
     pub service: Box<dyn RenderService>,
     /// The snapshot both of the above were built from.
@@ -238,6 +288,18 @@ mod tests {
     fn the_fake_opener_reports_a_configured_failure() {
         let opener = FakeOpener::failing();
         assert!(opener.open(Path::new("broken.pdf")).is_err());
+    }
+
+    #[test]
+    fn an_opened_document_can_be_saved_through_the_trait_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let out = directory.path().join("out.pdf");
+
+        let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+        let mut document = opened.document;
+        document.save_incremental(&out).unwrap();
+
+        assert!(out.exists(), "saving through the trait object must write a file");
     }
 
     #[test]
