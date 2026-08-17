@@ -5,8 +5,20 @@ use opdf_core::{Document, Error, PageId, PageInfo, Result};
 
 use crate::error::convert_lopdf_error;
 use crate::geometry::{read_page_rotation, read_page_size};
-use crate::objects::{ObjectSource, build_blank_page, copy_page_into};
+use crate::objects::{ObjectSource, build_blank_page, build_empty_document_bytes, copy_page_into};
 use crate::page_map::PageMap;
+
+/// The page tree root a document's catalog names.
+///
+/// Returns [`Error::Malformed`] if the catalog is missing or does not name a
+/// page tree, which is the same answer parsing gives for a file without one.
+fn read_root_pages_id(previous: &lopdf::Document) -> Result<ObjectId> {
+    previous
+        .catalog()
+        .and_then(|catalog| catalog.get(b"Pages"))
+        .and_then(Object::as_reference)
+        .map_err(convert_lopdf_error)
+}
 
 /// What a save still has to write out.
 ///
@@ -59,15 +71,42 @@ impl PdfDocument {
         Self::build_from_incremental(incremental)
     }
 
+    /// Create a document with no pages.
+    ///
+    /// The result is a real, saveable PDF the moment it has a page: it is built
+    /// from a minimal catalog and an empty page tree, then opened exactly as a
+    /// file would be, so it satisfies the [`Document`] contract and takes the
+    /// same save path as a parsed document. It has no pages yet, so both save
+    /// methods reject it with [`Error::Unsupported`] until one is added by
+    /// [`Document::insert_page`] or [`Document::import_pages`].
+    ///
+    /// Returns [`Error::Malformed`] if the generated document does not parse,
+    /// which would mean this crate cannot read what it writes.
+    pub fn empty() -> Result<Self> {
+        let bytes = build_empty_document_bytes()?;
+        let mut incremental = IncrementalDocument::load_from(&bytes[..]).map_err(convert_lopdf_error)?;
+        let (root_pages_id, version) = {
+            let previous = incremental.get_prev_documents();
+            (read_root_pages_id(previous)?, previous.version.clone())
+        };
+
+        //--- an appended revision announces the same version as the file it extends ---
+        incremental.new_document.version = version;
+
+        Ok(Self {
+            incremental,
+            root_pages_id,
+            pages: PageMap::new(),
+            revision: 0,
+            dirty: DirtyState::default(),
+        })
+    }
+
     /// Build the identity map and cached geometry from a parsed document.
     pub(crate) fn build_from_incremental(mut incremental: IncrementalDocument) -> Result<Self> {
         let (root_pages_id, pages, version) = {
             let previous = incremental.get_prev_documents();
-            let root_pages_id = previous
-                .catalog()
-                .and_then(|catalog| catalog.get(b"Pages"))
-                .and_then(Object::as_reference)
-                .map_err(convert_lopdf_error)?;
+            let root_pages_id = read_root_pages_id(previous)?;
 
             let mut pages = PageMap::new();
             for object_id in previous.page_iter() {
@@ -92,6 +131,42 @@ impl PdfDocument {
             revision: 0,
             dirty: DirtyState::default(),
         })
+    }
+
+    /// Continue this document from bytes that already hold its whole state.
+    ///
+    /// A compacting save rewrites the file from scratch: the revision history is
+    /// gone, the surviving objects are renumbered, and every pending change has
+    /// been written out. The document must follow, or the next incremental save
+    /// would append to bytes that no longer describe it — re-emitting the file
+    /// the compaction was asked to replace, purged objects included.
+    ///
+    /// Identity is preserved: `PageId`s, page order, geometry and rotation all
+    /// stay as they were, because the bytes were written from them. Only the
+    /// backing objects move, and the revision counter does not advance — the
+    /// document a reader sees is unchanged.
+    ///
+    /// Returns [`Error::Malformed`] if the bytes do not parse, name no page
+    /// tree, or hold a different number of pages than this document does.
+    /// Nothing is changed unless every check passes.
+    pub(crate) fn rebase_onto(&mut self, bytes: &[u8]) -> Result<()> {
+        let mut incremental = IncrementalDocument::load_from(bytes).map_err(convert_lopdf_error)?;
+        let (root_pages_id, object_ids, version) = {
+            let previous = incremental.get_prev_documents();
+            let object_ids: Vec<ObjectId> = previous.page_iter().collect();
+            (read_root_pages_id(previous)?, object_ids, previous.version.clone())
+        };
+
+        //--- the only fallible step that touches state checks itself before writing anything ---
+        self.pages.rebind_objects(&object_ids)?;
+
+        //--- an appended revision announces the same version as the file it extends ---
+        incremental.new_document.version = version;
+        self.incremental = incremental;
+        self.root_pages_id = root_pages_id;
+        //--- the new base already carries every change, so there is nothing left to append ---
+        self.dirty = DirtyState::default();
+        Ok(())
     }
 
     //---------------------------------------------------------------------
@@ -582,6 +657,59 @@ mod tests {
     fn satisfies_the_document_contract() {
         opdf_core::contract::assert_document_contract(|count| {
             PdfDocument::load_from_bytes(&fixture::build_flat_pages(&vec![PageSize::A4; count])).expect("a generated fixture must open")
+        });
+    }
+
+    //---------------------------------------------------------------------
+    // Documents created from nothing
+    //---------------------------------------------------------------------
+
+    #[test]
+    fn creates_a_document_that_holds_no_pages() {
+        let document = PdfDocument::empty().unwrap();
+        assert_eq!(document.page_count(), 0);
+        assert!(document.page_ids().is_empty());
+        assert_eq!(document.revision(), 0, "a created document starts where a parsed one does");
+    }
+
+    #[test]
+    fn fills_a_created_document_by_inserting_pages() {
+        let mut document = PdfDocument::empty().unwrap();
+        let first = document.insert_page(0, PageSize::A4).unwrap();
+        let second = document.insert_page(1, PageSize::LETTER).unwrap();
+
+        assert_eq!(document.page_ids(), vec![first, second]);
+        assert_eq!(document.page(first).unwrap().size, PageSize::A4);
+        assert_eq!(document.page(second).unwrap().size, PageSize::LETTER);
+    }
+
+    #[test]
+    fn rejects_an_insertion_past_the_end_of_a_created_document() {
+        let mut document = PdfDocument::empty().unwrap();
+        assert!(matches!(document.insert_page(1, PageSize::A4), Err(opdf_core::Error::IndexOutOfBounds { .. })));
+        assert_eq!(document.page_count(), 0, "a rejected insertion must not add a page");
+    }
+
+    #[test]
+    fn fills_a_created_document_by_importing_pages() {
+        let source = PdfDocument::load_from_bytes(&fixture::build_flat_pages(&[PageSize::new(100.0, 100.0), PageSize::new(200.0, 200.0)])).unwrap();
+        let mut document = PdfDocument::empty().unwrap();
+        let imported = document.import_pages(&source, &source.page_ids(), 0).unwrap();
+
+        assert_eq!(imported.len(), 2);
+        assert_eq!(document.page_count(), 2);
+        let widths: Vec<f32> = imported.iter().map(|id| document.page(*id).unwrap().size.width_pt).collect();
+        assert_eq!(widths, vec![100.0, 200.0], "imported geometry must survive the copy into a created document");
+    }
+
+    #[test]
+    fn a_created_document_satisfies_the_document_contract() {
+        opdf_core::contract::assert_document_contract(|count| {
+            let mut document = PdfDocument::empty().expect("a created document must be constructible");
+            for index in 0..count {
+                document.insert_page(index, PageSize::A4).expect("appending to a created document must succeed");
+            }
+            document
         });
     }
 }
