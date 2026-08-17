@@ -1,10 +1,12 @@
 //! The open-pdf-editor desktop shell.
 //!
-//! This crate is the user interface and nothing else. It never holds a
+//! This crate is the user interface and nothing else. It never *draws* from a
 //! [`opdf_core::document::Document`]: the render worker owns the document because
-//! the rasterizer is not thread-safe, so the shell holds an immutable
-//! [`opdf_core::document::DocumentSnapshot`] plus a
-//! [`opdf_core::render::RenderService`] handle and asks for pixels asynchronously.
+//! the rasterizer is not thread-safe, so the shell draws an immutable
+//! [`opdf_core::document::DocumentSnapshot`] and asks a
+//! [`opdf_core::render::RenderService`] handle for pixels asynchronously. It does
+//! keep the document itself, so that a later edit or save has something to act
+//! on; where documents come from is [`crate::opener`]'s business alone.
 //!
 //! Layout, zoom, scheduling, and caching are plain functions in their own modules
 //! so that they are testable without a display; the widget modules under
@@ -34,7 +36,7 @@ pub const APPLICATION_NAME: &str = "opdf";
 
 /// A one-line description of this build, for the status bar and `--version`.
 pub fn describe_build() -> String {
-    format!("{APPLICATION_NAME} {} (synthetic documents only)", env!("CARGO_PKG_VERSION"))
+    format!("{APPLICATION_NAME} {} (viewer only: no editing, no text selection)", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -49,8 +51,8 @@ mod tests {
             "the description must lead with the binary name, got: {description}"
         );
         assert!(
-            description.contains("synthetic"),
-            "this build renders synthetic documents only and must say so, got: {description}"
+            description.contains("viewer only"),
+            "this build cannot edit or select text and must say so rather than imply otherwise, got: {description}"
         );
     }
 }
