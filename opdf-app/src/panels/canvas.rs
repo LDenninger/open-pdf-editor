@@ -52,6 +52,29 @@ pub fn draw_page_placeholder(painter: &Painter, rect: Rect, page_number: usize, 
     }
 }
 
+/// Paint a page the rasterizer has refused: the placeholder's geometry, an alarm
+/// border, and a label saying so.
+///
+/// A refusal is permanent — the rasterizer resolves a page through the index map
+/// frozen when the file was opened — so this must not look like the ordinary
+/// placeholder, which means "not yet". A user staring at a grey rectangle that
+/// will never fill in has been told nothing.
+pub fn draw_unrenderable_page(painter: &Painter, rect: Rect, page_number: usize, theme: &Theme) {
+    let radius = CornerRadius::same(theme.corner_radius);
+    painter.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), radius, theme.page_shadow);
+    painter.rect_filled(rect, radius, theme.page_placeholder);
+    painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, theme.error_text), StrokeKind::Inside);
+    if rect.height() > 28.0 && rect.width() > 28.0 {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{page_number} · cannot be rendered"),
+            egui::FontId::proportional(13.0),
+            theme.error_text,
+        );
+    }
+}
+
 /// Paint a page from a cached texture, with the same shadow and border the
 /// placeholder uses so the two do not jump when one replaces the other.
 pub fn draw_page_tile(painter: &Painter, rect: Rect, texture: &TextureHandle, theme: &Theme) {
@@ -112,9 +135,14 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut ViewerState, cache: &mut Textu
                 None => cache.find_nearest_scale(placement.id, revision, page_scale),
             };
 
+            //--- a refusal is only known for the exact request; a page with any cached
+            //--- scale is drawn from it, because pixels beat an explanation ---
+            let refused = exact.is_some_and(|request| cache.has_failed(&request));
+
             match key.and_then(|key| cache.get(&key)) {
                 Some(texture) => draw_page_tile(&painter, page_rect, texture, theme),
-                //--- tier 3: a placeholder, never a blank ---
+                //--- tier 3: a placeholder, never a blank — and one that says which kind it is ---
+                None if refused => draw_unrenderable_page(&painter, page_rect, placement.index + 1, theme),
                 None => draw_page_placeholder(&painter, page_rect, placement.index + 1, theme),
             }
         }
