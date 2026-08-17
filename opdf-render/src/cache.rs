@@ -17,8 +17,27 @@ use opdf_core::{RenderRequest, Tile};
 /// Bytes of rasterized pixels the cache will hold — 256 MiB.
 ///
 /// About thirty A4 pages at scale 2.0, so several screens of scrollback stay
-/// resident, and a quarter of what one request at the tile ceiling could ask
-/// for, so no single tile can evict everything else.
+/// resident under normal scrolling.
+///
+/// # It is exactly one maximum-sized tile
+///
+/// [`crate::geometry::MAX_TILE_PIXELS`] is 64 megapixels, which at four bytes
+/// per pixel is 268 435 456 bytes — the same number as this budget, not a
+/// quarter of it as this comment used to claim. A single tile at the ceiling is
+/// therefore cacheable (the refusal in [`TileCache::insert`] triggers only
+/// *above* the budget) and evicting to make room for it empties the cache
+/// completely. The user who zooms one page to the limit loses every thumbnail
+/// and every neighbouring page they had.
+///
+/// That is a real cost and it is deliberate only in the sense that it is now
+/// known: the ceiling cannot come down, because it is set equal to
+/// [`opdf_core::fakes::FakeRenderService`]'s so the user interface sees one
+/// area limit rather than two. Closing the gap means raising this budget to
+/// 1 GiB, or refusing to cache a tile above some fraction of it. Neither is
+/// done here.
+///
+/// `holds_exactly_one_maximum_sized_tile` pins the arithmetic, so the
+/// relationship cannot drift again without a test saying so.
 pub const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// A byte-budgeted, least-recently-used tile cache.
@@ -201,6 +220,39 @@ mod tests {
         assert_eq!(cache.len(), 1, "only the current revision survives a rebind");
         assert_eq!(cache.bytes(), 40);
         assert!(cache.get(&build_request(1, 8)).is_some());
+    }
+
+    /// The default budget and the tile ceiling were documented as differing by
+    /// a factor of four in both directions — the cache claiming to be a quarter
+    /// of a maximum tile's cost, the ceiling claiming no single tile could
+    /// evict everything. They are equal. Pin it, so the next person to change
+    /// either constant is told what they changed.
+    #[test]
+    fn holds_exactly_one_maximum_sized_tile() {
+        const BYTES_PER_PIXEL: u64 = 4;
+        let ceiling_bytes = crate::geometry::MAX_TILE_PIXELS * BYTES_PER_PIXEL;
+        assert_eq!(
+            ceiling_bytes, DEFAULT_CACHE_BYTES as u64,
+            "a tile at MAX_TILE_PIXELS costs exactly the whole default budget; if this ever stops holding, both constants' doc comments must be rewritten"
+        );
+    }
+
+    /// The consequence of the equality above, stated as behaviour: caching one
+    /// maximum-sized tile leaves nothing else in the cache.
+    #[test]
+    fn a_maximum_sized_tile_evicts_the_entire_cache() {
+        //--- scaled down by a factor of 1024 so the test costs kilobytes, not gigabytes ---
+        let budget = DEFAULT_CACHE_BYTES / 1024;
+        let mut cache = TileCache::with_budget(budget);
+        cache.insert(build_request(1, 7), &build_tile(10));
+        cache.insert(build_request(2, 7), &build_tile(10));
+        assert_eq!(cache.len(), 2);
+
+        let ceiling_tile = build_tile(u32::try_from(budget / 4).unwrap());
+        cache.insert(build_request(3, 7), &ceiling_tile);
+
+        assert_eq!(cache.len(), 1, "a tile the size of the whole budget leaves room for nothing else");
+        assert_eq!(cache.bytes(), budget, "and it fills the budget exactly, so it is cached rather than refused");
     }
 
     #[test]
