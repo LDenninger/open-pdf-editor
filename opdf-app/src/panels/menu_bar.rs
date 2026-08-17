@@ -15,6 +15,13 @@ pub enum MenuAction {
     SaveAs,
     /// Close the open document and show the empty state.
     CloseDocument,
+    /// Reverse the most recent edit.
+    Undo,
+    /// Reapply the most recently undone edit.
+    Redo,
+    /// Turn the current page a quarter turn clockwise. A document edit, unlike
+    /// [`MenuAction::RotateViewClockwise`].
+    RotatePageClockwise,
     /// Exit the application.
     Quit,
     /// Replace the document with a freshly generated synthetic one of this many pages.
@@ -55,6 +62,9 @@ impl MenuAction {
             Self::Save => "Save".to_owned(),
             Self::SaveAs => "Save as…".to_owned(),
             Self::CloseDocument => "Close document".to_owned(),
+            Self::Undo => "Undo".to_owned(),
+            Self::Redo => "Redo".to_owned(),
+            Self::RotatePageClockwise => "Rotate page clockwise".to_owned(),
             Self::Quit => "Quit".to_owned(),
             Self::GenerateSynthetic(page_count) => format!("Generate {page_count} synthetic pages"),
             Self::ZoomIn => "Zoom in".to_owned(),
@@ -116,6 +126,20 @@ pub fn show_menu_bar(ui: &mut egui::Ui) -> Option<MenuAction> {
             }
         });
 
+        ui.menu_button("Edit", |ui| {
+            for action in [MenuAction::Undo, MenuAction::Redo] {
+                if ui.button(action.label()).clicked() {
+                    chosen = Some(action);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button(MenuAction::RotatePageClockwise.label()).clicked() {
+                chosen = Some(MenuAction::RotatePageClockwise);
+                ui.close();
+            }
+        });
+
         ui.menu_button("View", |ui| {
             for action in [
                 MenuAction::ZoomIn,
@@ -162,11 +186,14 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const EVERY_ACTION: [MenuAction; 19] = [
+    const EVERY_ACTION: [MenuAction; 22] = [
         MenuAction::OpenDocument,
         MenuAction::Save,
         MenuAction::SaveAs,
         MenuAction::CloseDocument,
+        MenuAction::Undo,
+        MenuAction::Redo,
+        MenuAction::RotatePageClockwise,
         MenuAction::Quit,
         MenuAction::GenerateSynthetic(12),
         MenuAction::ZoomIn,
