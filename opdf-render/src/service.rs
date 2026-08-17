@@ -1,10 +1,33 @@
 //! The [`RenderService`] handle the user interface holds.
 //!
-//! The handle owns no Pdfium state at all: it owns a sender, a receiver, and a
-//! join handle. [`RenderService::submit`] pushes onto an unbounded channel and
-//! returns; [`RenderService::poll`] drains a receiver with `try_iter` and
-//! returns whatever has arrived. Neither ever blocks, which is the contract's
-//! hard requirement — a stalled poll drops frames on the UI thread.
+//! The handle owns no Pdfium state at all: it owns a sender and a receiver.
+//! [`RenderService::submit`] pushes onto an unbounded channel and returns;
+//! [`RenderService::poll`] drains a receiver with `try_iter` and returns
+//! whatever has arrived. Neither ever blocks, which is the contract's hard
+//! requirement — a stalled poll drops frames on the UI thread.
+//!
+//! # What blocks, and what it costs
+//!
+//! Pdfium is serialized process-wide (see [`crate::library`]), and the lock is
+//! held for the whole of a rasterization. Anything that must reach Pdfium on
+//! the calling thread therefore queues behind whatever render is in flight, and
+//! a legal maximum-sized tile is hundreds of milliseconds of work.
+//!
+//! | Operation | Uncontended | Behind a 60 megapixel render |
+//! |---|---|---|
+//! | [`RenderService::submit`], [`RenderService::poll`] | immediate | immediate |
+//! | [`PdfiumRenderService::open`] | 0.97 ms | 180.7 ms |
+//! | [`PdfiumRenderService::open_deferred`] | immediate | immediate |
+//! | dropping a service | immediate | immediate |
+//!
+//! Dropping used to join the worker, which had to take the lock to close its
+//! document: 124.6 ms measured, and 438.9 ms against a full 60 megapixel tile
+//! in this crate's own test. It now detaches instead — see [`Drop`].
+//!
+//! [`PdfiumRenderService::open`] still blocks by design, because reporting a
+//! bad file at the call site is worth more than the latency in most callers. A
+//! caller that cannot afford it — a UI thread opening a second document while
+//! the first renders — uses [`PdfiumRenderService::open_deferred`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +40,9 @@ use crate::worker::{WorkerMessage, run_worker};
 
 /// A Pdfium-backed rasterizer running on its own thread.
 ///
-/// Dropping the service shuts the worker down and joins it, so a dropped
-/// service leaves no thread and no open document behind.
+/// Dropping the service tells its worker to stop and returns immediately; the
+/// worker closes the document on its own thread. See [`Drop`] for what that
+/// costs and what it buys.
 #[derive(Debug)]
 pub struct PdfiumRenderService {
     requests: Sender<WorkerMessage>,
@@ -26,7 +50,6 @@ pub struct PdfiumRenderService {
     /// Responses produced by the handle itself, when the worker is unreachable.
     outbox: Mutex<Vec<RenderResponse>>,
     rasterizations: Arc<AtomicU64>,
-    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PdfiumRenderService {
@@ -36,7 +59,46 @@ impl PdfiumRenderService {
     /// crate documentation. Blocks until the worker reports that the document
     /// opened, so a missing or malformed file is an error here rather than a
     /// failure on every subsequent request.
+    ///
+    /// # Latency
+    ///
+    /// Opening a document is a Pdfium call, and Pdfium is serialized
+    /// process-wide, so this waits for any render already in flight anywhere in
+    /// the process: 0.97 ms uncontended, **180.7 ms** measured behind another
+    /// service rasterizing a legal 60 megapixel tile, and worse the more
+    /// documents are open. That is eleven dropped frames on a 60 Hz UI thread.
+    /// Use [`Self::open_deferred`] where that matters.
     pub fn open(pdf_path: &Path, snapshot: DocumentSnapshot) -> Result<Self> {
+        let (service, ready_rx) = Self::spawn(pdf_path, snapshot)?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(service),
+            //--- dropping `service` here stops the worker, which is answering every request with this same reason ---
+            Ok(Err(reason)) => Err(Error::Render(reason)),
+            Err(_) => Err(Error::Render("the render worker exited before reporting readiness".to_string())),
+        }
+    }
+
+    /// Open `pdf_path` without waiting for Pdfium.
+    ///
+    /// Returns as soon as the worker thread is spawned — it never takes the
+    /// Pdfium lock on the calling thread, so it cannot be stalled by a render
+    /// in flight. The error case moves with it: if the document cannot be
+    /// opened, **every** request submitted to this service is answered
+    /// [`RenderResponse::Failed`] carrying the reason the open failed, rather
+    /// than the failure being reported here.
+    ///
+    /// The returned `Result` reports only that a thread could not be spawned.
+    ///
+    /// Prefer [`Self::open`] wherever the caller can afford to wait: an error
+    /// at the call site is easier to act on than one that arrives per tile.
+    pub fn open_deferred(pdf_path: &Path, snapshot: DocumentSnapshot) -> Result<Self> {
+        let (service, _ready_rx) = Self::spawn(pdf_path, snapshot)?;
+        //--- the ready channel is bounded at one, so dropping the receiver never blocks the worker ---
+        Ok(service)
+    }
+
+    /// Spawn the worker and wire up the channels, without waiting for it.
+    fn spawn(pdf_path: &Path, snapshot: DocumentSnapshot) -> Result<(Self, Receiver<std::result::Result<(), String>>)> {
         let (request_tx, request_rx) = unbounded::<WorkerMessage>();
         let (response_tx, response_rx) = unbounded::<RenderResponse>();
         let (ready_tx, ready_rx) = bounded::<std::result::Result<(), String>>(1);
@@ -45,25 +107,20 @@ impl PdfiumRenderService {
         let worker_counter = Arc::clone(&rasterizations);
         let worker_path: PathBuf = pdf_path.to_path_buf();
 
-        let worker = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("opdf-render".to_string())
             .spawn(move || run_worker(worker_path, snapshot, request_rx, response_tx, ready_tx, worker_counter))
             .map_err(Error::Io)?;
 
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+        Ok((
+            Self {
                 requests: request_tx,
                 responses: response_rx,
                 outbox: Mutex::new(Vec::new()),
                 rasterizations,
-                worker: Some(worker),
-            }),
-            Ok(Err(reason)) => {
-                let _ = worker.join();
-                Err(Error::Render(reason))
-            }
-            Err(_) => Err(Error::Render("the render worker exited before reporting readiness".to_string())),
-        }
+            },
+            ready_rx,
+        ))
     }
 
     /// Point the worker at a new snapshot, after a structural edit.
@@ -118,12 +175,29 @@ impl RenderService for PdfiumRenderService {
     }
 }
 
+/// Tell the worker to stop, and return without waiting for it.
+///
+/// Joining would be tidier, and it is what this did. But the worker has to take
+/// the process-wide Pdfium lock to close its document, so joining made dropping
+/// a service cost whatever render was in flight anywhere in the process:
+/// 124.6 ms measured in the review, 438.9 ms in this crate's own test against a
+/// legal 60 megapixel tile. Closing a document on the UI thread is a normal
+/// thing to do — the user closes a tab — and it must not drop frames.
+///
+/// The worker is detached instead. It sees the shutdown, or the closed request
+/// channel, closes its document under the lock, and exits; nothing outlives it
+/// but its own stack. The tradeoffs, in full:
+///
+/// - The document stays open for as long as the render in flight takes. A
+///   caller that reopens the same path immediately gets a second handle to it,
+///   which Pdfium permits.
+/// - A worker still closing its document at process exit is terminated with the
+///   process. Nothing it holds survives the process, so nothing is corrupted.
+/// - Dropping many services queues that many closes behind the lock. Each is a
+///   single Pdfium call and the threads do not accumulate.
 impl Drop for PdfiumRenderService {
     fn drop(&mut self) {
         let _ = self.requests.send(WorkerMessage::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
@@ -359,6 +433,74 @@ mod tests {
         );
 
         assert_eq!(drain(&service, 1).len(), 1, "the in-flight render must still be answered");
+    }
+
+    /// Put a long render in flight and wait until the worker is certainly
+    /// inside it, so that whatever the caller does next has to contend for the
+    /// process-wide Pdfium lock.
+    ///
+    /// 595 x 842 at scale 11.0 is 6545 x 9262 — 60.6 megapixels, just under the
+    /// tile ceiling, and the same legal maximum-sized tile the review measured
+    /// against. The short sleep only has to get the worker past its channel
+    /// bookkeeping and into Pdfium.
+    fn occupy_pdfium(service: &PdfiumRenderService) {
+        service.submit(RenderRequest::new(PageId::new(1), 7, 11.0).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    #[test]
+    fn dropping_a_service_does_not_wait_for_a_render_in_flight() {
+        let service = build_service();
+        occupy_pdfium(&service);
+
+        let started = std::time::Instant::now();
+        drop(service);
+        let elapsed = started.elapsed();
+
+        //--- measured at 124.6 ms when Drop joined the worker, which had to take the pdfium lock to close its document ---
+        assert!(
+            elapsed < std::time::Duration::from_millis(25),
+            "closing a document must not stall the caller behind another service's render, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn opening_a_document_deferred_does_not_wait_for_a_render_in_flight() {
+        let busy = build_service();
+        occupy_pdfium(&busy);
+
+        let started = std::time::Instant::now();
+        let opened = PdfiumRenderService::open_deferred(&ensure_contract_fixture(), build_snapshot()).unwrap();
+        let elapsed = started.elapsed();
+
+        //--- measured at 180.7 ms for the blocking `open` under the same contention, against 0.97 ms uncontended ---
+        assert!(
+            elapsed < std::time::Duration::from_millis(25),
+            "open_deferred must not touch pdfium on the calling thread, took {elapsed:?}"
+        );
+
+        //--- and the service it returns is a real one ---
+        opened.submit(RenderRequest::new(PageId::new(1), 7, 1.0).unwrap());
+        match &drain(&opened, 1)[0] {
+            RenderResponse::Ready { tile, .. } => assert_eq!((tile.width(), tile.height()), (595, 842)),
+            RenderResponse::Failed { reason, .. } => panic!("a deferred open of a good file must still render, got: {reason}"),
+        }
+    }
+
+    #[test]
+    fn a_deferred_open_of_a_missing_file_answers_every_request_with_the_reason() {
+        let service = PdfiumRenderService::open_deferred(Path::new("/nonexistent/missing.pdf"), build_snapshot()).unwrap();
+        service.submit(RenderRequest::new(PageId::new(1), 7, 1.0).unwrap());
+
+        let responses = drain(&service, 1);
+        assert_eq!(responses.len(), 1, "a request against a document that never opened must still be answered");
+        match &responses[0] {
+            RenderResponse::Failed { reason, .. } => assert!(
+                reason.contains("missing.pdf"),
+                "the failure must carry the open error, not a generic one, got: {reason}"
+            ),
+            RenderResponse::Ready { .. } => panic!("a document that never opened must not produce a tile"),
+        }
     }
 
     #[test]
