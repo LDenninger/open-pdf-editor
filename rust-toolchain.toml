@@ -1,0 +1,48 @@
+# The exact toolchain the gate runs on, everywhere.
+#
+# Why this file exists
+# --------------------
+# `dtolnay/rust-toolchain@stable` tracks whatever stable is on the day the job
+# runs, so a Rust release could change the meaning of `-D warnings` under a
+# tree nobody had touched. That is not hypothetical: 1.97 added the
+# `float-literal-f32-fallback` lint, `-D warnings` promoted it to an error, and
+# CI went red on code that had been merged green. Worse, it was invisible
+# locally -- the lint does not exist in 1.94, so the same gate command passed
+# on a developer machine and failed on CI for the same commit.
+#
+# Pinning makes a compiler change a deliberate edit to this file, reviewed like
+# any other, instead of something that lands on whoever pushes next.
+#
+# HEADS UP FOR LOCAL WORK
+# -----------------------
+# rustup honours this file automatically and it OVERRIDES your default
+# toolchain. The first cargo command you run in this repo after pulling it will
+# download 1.97.1 if you do not already have it (a few hundred MB, once). This
+# is intended: it is what makes the local gate and the CI gate the same gate.
+# Check with `rustc --version` inside the repo -- it should report 1.97.1 even
+# if `rustup default` says otherwise.
+#
+# It also overrides `+nightly`-less invocations for tooling that needs nightly.
+# `cargo fuzz` is the one that matters here: it must be run as
+# `cargo +nightly fuzz ...`, which is what .github/workflows/
+# scheduled-verification.yml does, because cargo-fuzz needs nightly sanitizer
+# support that this pinned stable cannot provide.
+#
+# Relationship to `rust-version` in Cargo.toml
+# --------------------------------------------
+# Different things, both deliberate. `rust-version = "1.85"` is the MSRV floor:
+# the oldest compiler this crate claims to support, a promise to consumers.
+# This pin is the single version the gate actually exercises. The floor is not
+# verified by the gate and is not changed by editing this file.
+#
+# Bumping
+# -------
+# The `toolchain-canary` job in scheduled-verification.yml runs the gate
+# against floating stable nightly, so a version that would break this pin shows
+# up as a failed canary rather than as a red PR. When it fails, bump the
+# version below, fix whatever the new release complains about, and land both
+# together.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

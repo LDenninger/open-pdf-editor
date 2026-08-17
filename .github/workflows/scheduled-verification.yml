@@ -36,9 +36,13 @@ jobs:
         run: |
           mkdir -p fuzz/corpus/pdf_open
           cp tests/corpus/files/*.pdf fuzz/corpus/pdf_open/
+      # `+nightly` is load-bearing, not decoration: rust-toolchain.toml pins
+      # this repo to stable, and rustup honours that file over the toolchain
+      # this job installed. Without the explicit override cargo-fuzz runs under
+      # the pinned stable and dies on "1 nightly option were parsed".
       - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ matrix.target == 'pdf_open' && 600 || 120 }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ matrix.target == 'pdf_open' && 600 || 120 }}
       - name: Upload crash artifacts, if any
         if: failure()
         uses: actions/upload-artifact@v4
@@ -46,11 +50,59 @@ jobs:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
 
+  # Runs the exact PR gate against whatever stable is today, so that a Rust
+  # release that would break the pin shows up here, on a schedule, instead of
+  # on the next person's pull request. This job failing does not block anything:
+  # nothing merges on the strength of a scheduled run, and the PR gate stays on
+  # the pinned version until someone deliberately bumps it.
+  #
+  # When it goes red: read the version it printed, fix what the new release
+  # complains about, and bump rust-toolchain.toml together with every pinned
+  # `dtolnay/rust-toolchain@<version>` use, in one change. Find them with
+  # `grep -rn 'dtolnay/rust-toolchain@' .github/workflows/` rather than
+  # trusting a count written here, which would go stale the moment a job is
+  # added. The @nightly and @stable uses are deliberate and are not bumped.
+  toolchain-canary:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      OPDF_PDFIUM_LIB_DIR: ${{ github.workspace }}/vendor/pdfium/lib
+      # Load-bearing: rust-toolchain.toml pins this repo to a fixed version and
+      # rustup honours it over the toolchain installed below. Without this
+      # override the canary would re-test the pinned compiler and report
+      # success no matter what stable did -- a canary that cannot detect the
+      # thing it exists to detect.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: canary
+      - name: Report the toolchain under test
+        run: |
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "pinned in rust-toolchain.toml: $(grep '^channel' rust-toolchain.toml)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Fetch Pdfium
+        run: ./scripts/fetch-pdfium.sh
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all --all-features
+
   coverage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to match rust-toolchain.toml. If this installed floating stable
+      # instead, the pin would still select 1.97.1 for every cargo call and
+      # llvm-tools-preview would be installed on a toolchain nothing runs,
+      # leaving cargo-llvm-cov unable to find the tools it needs.
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
@@ -67,7 +119,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to match rust-toolchain.toml, so this job round-trips the corpus
+      # on the same compiler the PR gate used.
+      - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
       # An unreachable upstream is reported as a warning annotation and leaves
       # the specimen uncovered; it does not fail this job, because taking the

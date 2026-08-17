@@ -28,7 +28,12 @@ jobs:
       OPDF_PDFIUM_LIB_DIR: ${{ github.workspace }}/vendor/pdfium/lib
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, and deliberately not @stable: a Rust release must not be able
+      # to change what this gate means under a tree nobody touched. The version
+      # is the one in rust-toolchain.toml and the two must be bumped together.
+      # The toolchain-canary job in scheduled-verification.yml is what notices
+      # when a bump is due.
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
