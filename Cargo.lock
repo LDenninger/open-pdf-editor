@@ -2037,6 +2037,8 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "opdf-core",
+ "opdf-pdf",
+ "opdf-render",
 ]
 
 [[package]]
