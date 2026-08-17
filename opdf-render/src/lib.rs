@@ -62,6 +62,12 @@
 //! before an edit is unreachable after one. Eviction is least-recently-used
 //! and bounded by bytes, defaulting to [`cache::DEFAULT_CACHE_BYTES`].
 //!
+//! The key alone is not enough to keep a revision honest, because the worker
+//! resolves geometry against the snapshot it holds when it *renders*, not when
+//! it accepted the request. A request left in the backlog across a rebind is
+//! therefore superseded rather than answered — see
+//! [`service::PdfiumRenderService::rebind`].
+//!
 //! # Not implemented here
 //!
 //! Text extraction, text selection geometry, search, and printing are out of
