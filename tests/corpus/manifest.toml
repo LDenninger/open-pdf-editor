@@ -95,9 +95,13 @@ notes = "One page, one Type1 font with a non-standard /Differences encoding arra
 file = "yanjingshiji1120ruan.pdf"
 sha256 = "a277c4fc0b0fbd77182ab3938e44ed573a6fa8dc64cd336d0ab5493ff6081319"
 source_url = "https://archive.org/download/yanjingshiji1120ruan/yanjingshiji1120ruan.pdf"
+mirror_urls = [
+    "https://ia902804.us.archive.org/0/items/yanjingshiji1120ruan/yanjingshiji1120ruan.pdf",
+    "https://ia802804.us.archive.org/0/items/yanjingshiji1120ruan/yanjingshiji1120ruan.pdf",
+]
 license = "Public Domain (published 1823, pre-1929)"
 attribution = "Ruan Yuan (1823); digitized by the Internet Archive"
 fetched_on = "2026-08-14"
 tier = "fetched"
 tags = ["cjk", "huge-scan", "real-world", "large"]
-notes = "~274 MB scanned classical Chinese text, 1823 -- too large to check in. Used only by the scheduled 'full corpus' verification job and local OPDF_CORPUS_FULL=1 runs."
+notes = "~274 MB scanned classical Chinese text, 1823 -- too large to check in. Used by the scheduled 'full corpus' verification job and local OPDF_CORPUS_FULL=1 runs. 2026-08-17: the nightly job went red on a 404 from source_url. The specimen is NOT gone -- archive.org's /download/ redirector was routing to a broken mirror node (dn760003.eu.archive.org, 404 then 500), while the item's own data nodes served the file normally. Verified against the archive.org metadata API the same day: the item still lists yanjingshiji1120ruan.pdf at 274454829 bytes, md5 2ed58eaf55fc82c3e6a9092ce7c813f0, sha1 ecd456fbfa200029a0c8cd94a8d80d6b489727f3, all three matching the local cached copy exactly -- so the pinned sha256 below still describes live upstream bytes and no coverage was lost. mirror_urls are those two data nodes, tried after source_url."
