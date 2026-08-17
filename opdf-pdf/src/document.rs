@@ -1,7 +1,7 @@
 //! `PdfDocument`: a real PDF file behind the `Document` contract.
 
 use lopdf::{IncrementalDocument, Object, ObjectId};
-use opdf_core::{Document, Error, PageId, PageInfo, Result};
+use opdf_core::{Document, DocumentId, Error, PageId, PageInfo, Result};
 
 use crate::error::convert_lopdf_error;
 use crate::geometry::{read_page_rotation, read_page_size};
@@ -47,6 +47,7 @@ impl DirtyState {
 /// full so that a save appends an incremental update rather than rewriting.
 #[derive(Debug)]
 pub struct PdfDocument {
+    id: DocumentId,
     incremental: IncrementalDocument,
     root_pages_id: ObjectId,
     pub(crate) pages: PageMap,
@@ -94,6 +95,7 @@ impl PdfDocument {
         incremental.new_document.version = version;
 
         Ok(Self {
+            id: DocumentId::new_unique(),
             incremental,
             root_pages_id,
             pages: PageMap::new(),
@@ -125,6 +127,7 @@ impl PdfDocument {
         incremental.new_document.version = version;
 
         Ok(Self {
+            id: DocumentId::new_unique(),
             incremental,
             root_pages_id,
             pages,
@@ -141,10 +144,13 @@ impl PdfDocument {
     /// would append to bytes that no longer describe it — re-emitting the file
     /// the compaction was asked to replace, purged objects included.
     ///
-    /// Identity is preserved: `PageId`s, page order, geometry and rotation all
-    /// stay as they were, because the bytes were written from them. Only the
-    /// backing objects move, and the revision counter does not advance — the
-    /// document a reader sees is unchanged.
+    /// Identity is preserved: the document's own [`Document::id`], its
+    /// `PageId`s, page order, geometry and rotation all stay as they were,
+    /// because the bytes were written from them. Only the backing objects move,
+    /// and the revision counter does not advance — the document a reader sees is
+    /// unchanged. Minting a fresh identity here would tell every cache and every
+    /// bound command that the user had opened a different file, when all that
+    /// happened is that the one they have open was rewritten.
     ///
     /// Returns [`Error::Malformed`] if the bytes do not parse, name no page
     /// tree, or hold a different number of pages than this document does.
@@ -162,6 +168,7 @@ impl PdfDocument {
 
         //--- an appended revision announces the same version as the file it extends ---
         incremental.new_document.version = version;
+        //--- `self.id` is deliberately untouched: this is the same open document, rewritten ---
         self.incremental = incremental;
         self.root_pages_id = root_pages_id;
         //--- the new base already carries every change, so there is nothing left to append ---
@@ -213,6 +220,10 @@ impl Document for PdfDocument {
     //---------------------------------------------------------------------
     // Inspection
     //---------------------------------------------------------------------
+
+    fn id(&self) -> DocumentId {
+        self.id
+    }
 
     fn revision(&self) -> u64 {
         self.revision
