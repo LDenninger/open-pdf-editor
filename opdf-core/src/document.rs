@@ -1,9 +1,48 @@
 //! The document contract: what every PDF document implementation must provide.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Result;
 use crate::page::{PageId, PageInfo, Rotation};
+
+/// The identity of one open document, unique within this process.
+///
+/// Minted at construction and never reused, including after a document is
+/// dropped. Unlike [`Document::revision`], which every implementation starts at
+/// zero, an identity distinguishes two documents of the same type — which is
+/// what a tile cache, a cross-document command, and a render worker each need
+/// in order to refuse work built for a different document.
+///
+/// It is meaningful within one process only, exactly like [`PageId`]: nothing
+/// in the PDF format can carry it, and persisting one would silently address
+/// the wrong document after a reopen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    /// Mint an identity no other live or past document in this process holds.
+    pub fn new_unique() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Unwrap the raw identifier, for in-memory interchange with code that
+    /// cannot name the `DocumentId` type — a widget id, a bare `u64` key.
+    ///
+    /// The returned value must never be written to disk or carried across a
+    /// save-and-reopen: an identity is unique within one process and means
+    /// nothing outside it. See `docs/architecture/contracts.md`.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DocumentId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "document#{}", self.0)
+    }
+}
 
 /// A paginated document that can be inspected and structurally modified.
 ///
@@ -11,6 +50,19 @@ use crate::page::{PageId, PageInfo, Rotation};
 /// Indices appear only as insertion positions, and are always interpreted
 /// against the document's state at the moment of the call.
 pub trait Document {
+    /// Which document this is, distinct from every other document in this process.
+    ///
+    /// Minted once, at construction, and unchanged for the life of the value —
+    /// through every mutation, and through a compacting save that rewrites the
+    /// backing bytes, because that is the same open document rewritten. A new
+    /// identity means a *different* document, which is exactly what a tile cache
+    /// and a cross-document command need to be told.
+    ///
+    /// Deliberately without a default body: a default would let an
+    /// implementation silently share one identity across every instance, and
+    /// nothing else in the contract would notice.
+    fn id(&self) -> DocumentId;
+
     /// A counter that advances whenever this document's structure changes.
     ///
     /// Tile caches key on this so that an image rendered before a change is never
