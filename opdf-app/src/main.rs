@@ -30,11 +30,11 @@ fn run_opdf(open_path: Option<PathBuf>, pages: usize) -> eframe::Result {
         eprintln!("opdf: showing a synthetic document of {pages} pages instead");
     }
 
-    let snapshot = match opdf_app::synthetic::build_synthetic_snapshot(pages) {
-        Ok(snapshot) => snapshot,
+    let opened = match opdf_app::synthetic::open_synthetic_document(pages) {
+        Ok(opened) => opened,
         Err(error) => {
             eprintln!("opdf: could not build a synthetic document: {error}");
-            opdf_core::document::DocumentSnapshot::default()
+            return Ok(());
         }
     };
 
@@ -49,7 +49,7 @@ fn run_opdf(open_path: Option<PathBuf>, pages: usize) -> eframe::Result {
     eframe::run_native(
         opdf_app::APPLICATION_NAME,
         options,
-        Box::new(move |creation| Ok(Box::new(OpdfApp::new(&creation.egui_ctx, snapshot)))),
+        Box::new(move |creation| Ok(Box::new(OpdfApp::new(&creation.egui_ctx, opened)))),
     )
 }
 
