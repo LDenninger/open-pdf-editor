@@ -64,9 +64,10 @@ pub fn name_texture(request: &RenderRequest) -> String {
 /// prevent.
 ///
 /// A `Failed` response is not an error the caller must handle: rasterization can
-/// fail per page without that being fatal to the document, so the request is
-/// cleared from the pending set (making it retryable) and the canvas shows a
-/// placeholder.
+/// fail per page without that being fatal to the document. The request is
+/// recorded as refused rather than merely cleared — a refusal is an answer, and
+/// asking again every frame is a loop that never settles — and the canvas draws
+/// that page as refused rather than as still loading.
 pub fn absorb_responses(cache: &mut TextureCache, ctx: &Context, revision: u64, responses: Vec<RenderResponse>, protected_since: u64) -> AbsorbReport {
     absorb_responses_routed(&mut [cache], ctx, revision, responses, protected_since)
 }
@@ -113,7 +114,9 @@ pub fn absorb_responses_routed(
                 report.stored += 1;
             }
             RenderResponse::Failed { .. } => {
-                cache.clear_pending(&request);
+                //--- recorded as refused, not merely as not-yet-arrived: a request
+                //--- only cleared is one the scheduler submits again next frame ---
+                cache.note_failed(request);
                 report.failed += 1;
             }
         }
@@ -206,8 +209,15 @@ mod tests {
         assert_eq!(cache.pending_count(), 0, "a discarded response must still release its pending slot");
     }
 
+    /// A refusal is an answer, and the request must not come back.
+    ///
+    /// The rasterizer resolves a page through the index map frozen when the file
+    /// was opened, so a page it cannot place will not become placeable by being
+    /// asked again. Merely releasing the pending slot leaves the scheduler free to
+    /// resubmit on the very next frame: a page that stays a placeholder, a status
+    /// bar stuck on "Rendering 1 page", and an event loop that never sleeps.
     #[test]
-    fn makes_a_failed_request_retryable_without_caching_anything() {
+    fn records_a_failed_request_as_answered_rather_than_as_still_wanted() {
         let ctx = Context::default();
         let mut cache = TextureCache::new(1 << 20);
         let request = build_request(1, 7, 1.0);
@@ -225,7 +235,15 @@ mod tests {
         );
         assert_eq!(report.failed, 1);
         assert!(!cache.contains(&request), "a failed render must not cache an empty texture");
-        assert!(cache.mark_pending(request), "a failed request must be retryable on a later frame");
+        assert_eq!(cache.pending_count(), 0, "a failed response must release the request it answers");
+        assert!(
+            cache.has_failed(&request),
+            "the canvas needs to know this page failed, not merely that it is absent"
+        );
+        assert!(
+            !cache.mark_pending(request),
+            "a refused request submitted again every frame is a loop that never settles"
+        );
     }
 
     #[test]
