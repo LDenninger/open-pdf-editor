@@ -11,9 +11,20 @@ use crate::sequence::Sequence;
 /// no longer exists — every removal already applied is rolled back and the
 /// whole selection is left untouched, per [`Sequence`]'s atomicity
 /// guarantee.
+///
+/// An empty selection yields a command that changes nothing. It is not an
+/// error — the selection simply had nothing in it — and `UndoStack` declines
+/// to record a command that changes nothing, so it costs the user neither an
+/// undo step nor their redo branch.
 pub fn delete_selection<D: Document + 'static>(ids: &[PageId]) -> Box<dyn Command<D>> {
     let commands: Vec<Box<dyn Command<D>>> = ids.iter().map(|&page| Box::new(RemovePage { page }) as Box<dyn Command<D>>).collect();
-    Box::new(Sequence::new(format!("Delete {} pages", ids.len()), commands))
+    //--- the label goes into the undo menu, so it has to agree in number ---
+    let label = match ids.len() {
+        0 => "Delete no pages".to_string(),
+        1 => "Delete 1 page".to_string(),
+        count => format!("Delete {count} pages"),
+    };
+    Box::new(Sequence::new(label, commands))
 }
 
 #[cfg(test)]
@@ -51,6 +62,20 @@ mod tests {
             before.pages,
             "a failing selection must roll back to the exact original page list, ids included"
         );
+    }
+
+    /// The label goes straight into the undo menu, so it has to read as
+    /// English rather than as a format string: "Delete 1 pages" was shipping.
+    #[test]
+    fn the_label_agrees_in_number_with_the_selection() {
+        let one: Box<dyn Command<VecDocument>> = delete_selection(&[PageId::new(0)]);
+        assert_eq!(one.label(), "Delete 1 page");
+
+        let several: Box<dyn Command<VecDocument>> = delete_selection(&[PageId::new(0), PageId::new(1)]);
+        assert_eq!(several.label(), "Delete 2 pages");
+
+        let none: Box<dyn Command<VecDocument>> = delete_selection(&[]);
+        assert_eq!(none.label(), "Delete no pages");
     }
 
     /// This is the ordering test Architecture calls out: deleting a

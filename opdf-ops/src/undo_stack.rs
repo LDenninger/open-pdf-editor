@@ -1,31 +1,87 @@
 //! The undo/redo stack.
 
+use std::num::NonZeroUsize;
+
 use opdf_core::{Command, Document, Result};
+
+/// How many undoable steps [`UndoStack::new`] retains.
+///
+/// A deliberate, ordinary editor-sized history rather than "everything": each
+/// retained entry can be a whole [`crate::Sequence`], and every entry that
+/// resolves to [`crate::RestorePage`] additionally pins a removed page in the
+/// document's trash for as long as it is queued.
+pub const DEFAULT_UNDO_LIMIT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99);
 
 /// A stack of applied commands' inverses, supporting undo and redo.
 ///
 /// Applying a new command after an undo discards the redo stack: once the
 /// user has diverged from a previously-undone branch, redoing back onto it
 /// would silently resurrect state the new command never accounted for.
+///
+/// The history is capped. Once it holds [`UndoStack::limit`] steps, applying
+/// another drops the oldest, which is then permanently un-undoable — the
+/// standard trade every editor makes, and the reason the cap is configurable
+/// through [`UndoStack::with_limit`]. The redo stack needs no separate cap:
+/// entries only ever move between the two stacks, so the two together never
+/// hold more than the limit.
 pub struct UndoStack<D: Document> {
     undo: Vec<Box<dyn Command<D>>>,
     redo: Vec<Box<dyn Command<D>>>,
+    limit: NonZeroUsize,
 }
 
 impl<D: Document> UndoStack<D> {
-    /// An empty stack.
+    /// An empty stack retaining [`DEFAULT_UNDO_LIMIT`] steps.
     pub fn new() -> Self {
+        Self::with_limit(DEFAULT_UNDO_LIMIT)
+    }
+
+    /// An empty stack retaining `limit` steps.
+    pub fn with_limit(limit: NonZeroUsize) -> Self {
         Self {
             undo: Vec::new(),
             redo: Vec::new(),
+            limit,
         }
+    }
+
+    /// The maximum number of undoable steps this stack retains.
+    pub fn limit(&self) -> NonZeroUsize {
+        self.limit
+    }
+
+    /// How many steps are currently undoable.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// How many steps are currently redoable.
+    pub fn redo_depth(&self) -> usize {
+        self.redo.len()
     }
 
     /// Apply a command, pushing its inverse onto the undo stack and
     /// discarding the redo stack.
+    ///
+    /// A command that succeeds without changing the document — an operation
+    /// over an empty selection, say — is applied and then *not* recorded.
+    /// Recording it would put an entry on the history that undoes nothing, so
+    /// the user needs two `Ctrl+Z` presses to reverse one real step, and would
+    /// discard a redo branch the command demonstrably did not diverge from.
+    /// "Changed the document" is read from [`Document::revision`], which the
+    /// contract requires every mutation to advance and every failure and
+    /// read-only call to leave alone.
     pub fn apply(&mut self, document: &mut D, command: Box<dyn Command<D>>) -> Result<()> {
+        let revision_before = document.revision();
         let inverse = command.apply(document)?;
+        if document.revision() == revision_before {
+            return Ok(());
+        }
         self.undo.push(inverse);
+        //--- the limit is editor-sized, so shifting the vector down by one costs nothing worth a VecDeque ---
+        if self.undo.len() > self.limit.get() {
+            self.undo.remove(0);
+        }
         self.redo.clear();
         Ok(())
     }
@@ -118,12 +174,15 @@ impl<D: Document> Default for UndoStack<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
+
     use opdf_core::DocumentSnapshot;
-    use opdf_core::Error;
     use opdf_core::fakes::VecDocument;
     use opdf_core::page::{PageId, PageSize};
+    use opdf_core::{Error, Rotation};
 
     use crate::remove_page::RemovePage;
+    use crate::set_rotation::SetRotation;
 
     /// Applies cleanly `remaining` more times, handing back a successor each
     /// time, and fails on the application after that. Chaining is what lets a
@@ -132,17 +191,25 @@ mod tests {
     /// the public API — and also how one reaches them in production, when
     /// `save_compacted` purges the trash a queued `RestorePage` needs.
     ///
-    /// It never touches the document, so any observed mutation across a
-    /// failed operation came from the stack, not from this command.
+    /// A successful application rotates the first page, purely so that it
+    /// registers as a change: `UndoStack::apply` declines to record a command
+    /// that leaves the revision where it found it, and an entry that is never
+    /// recorded cannot go on to fail. The *failing* application is still inert,
+    /// which is what the tests below rely on — any mutation observed across a
+    /// failed undo or redo came from the stack, not from this command.
     struct FailsAfter {
         remaining: u8,
     }
 
     impl Command<VecDocument> for FailsAfter {
-        fn apply(&self, _document: &mut VecDocument) -> Result<Box<dyn Command<VecDocument>>> {
+        fn apply(&self, document: &mut VecDocument) -> Result<Box<dyn Command<VecDocument>>> {
             match self.remaining {
                 0 => Err(Error::PageNotFound(PageId::new(9_999))),
-                n => Ok(Box::new(FailsAfter { remaining: n - 1 })),
+                n => {
+                    let page = document.page_ids()[0];
+                    document.set_rotation(page, Rotation::Quarter)?;
+                    Ok(Box::new(FailsAfter { remaining: n - 1 }))
+                }
             }
         }
 
@@ -211,6 +278,52 @@ mod tests {
         stack.apply(&mut document, Box::new(RemovePage { page: remaining_ids[1] })).unwrap();
 
         assert!(!stack.can_redo(), "applying a new command after an undo must discard the redo branch");
+    }
+
+    /// An empty selection is a command that changes nothing. Pushing it onto
+    /// the history anyway costs the user their redo branch and adds an undo
+    /// entry that undoes nothing, so two `Ctrl+Z` presses are needed to get
+    /// back one real step.
+    #[test]
+    fn a_command_that_changes_nothing_neither_records_history_nor_destroys_the_redo_branch() {
+        let mut document = VecDocument::with_pages(3, PageSize::A4);
+        let ids = document.page_ids();
+        let mut stack: UndoStack<VecDocument> = UndoStack::new();
+
+        stack.apply(&mut document, Box::new(RemovePage { page: ids[0] })).unwrap();
+        stack.undo(&mut document).unwrap();
+        assert!(stack.can_redo(), "there must be a redo branch to lose before the no-op is applied");
+
+        let empty: Box<dyn Command<VecDocument>> = crate::delete_selection(&[]);
+        stack.apply(&mut document, empty).unwrap();
+
+        assert!(stack.can_redo(), "a command that changed nothing must not discard the redo branch");
+        assert!(!stack.can_undo(), "a command that changed nothing must not be recorded as an undoable step");
+    }
+
+    /// `UndoStack` grew without bound: a long editing session retained every
+    /// inverse ever produced, and for a deletion each of those pins the
+    /// document's trashed page as well.
+    #[test]
+    fn the_history_is_capped_and_drops_its_oldest_entries_first() {
+        let mut document = VecDocument::with_pages(1, PageSize::A4);
+        let limit = NonZeroUsize::new(3).unwrap();
+        let mut stack: UndoStack<VecDocument> = UndoStack::with_limit(limit);
+
+        let page = document.page_ids()[0];
+        for _ in 0..10 {
+            let command: Box<dyn Command<VecDocument>> = Box::new(SetRotation {
+                page,
+                rotation: Rotation::Quarter,
+            });
+            stack.apply(&mut document, command).unwrap();
+        }
+
+        assert_eq!(stack.undo_depth(), 3, "the undo history must never exceed its limit");
+        for _ in 0..3 {
+            assert!(stack.undo(&mut document).unwrap(), "every retained entry must still be usable");
+        }
+        assert!(!stack.can_undo(), "nothing beyond the limit may have been retained");
     }
 
     /// The corruption this guards against is not the failed undo — it is the

@@ -1,17 +1,74 @@
 //! Extracting a contiguous range of pages into a target document.
 
-use opdf_core::{Command, Document, Error, Result};
+use opdf_core::{Command, Document, Error, PageId, Result};
 
+use crate::binding::BoundInverse;
 use crate::remove_page::RemovePage;
 use crate::sequence::Sequence;
+
+//---------------------------------------------------------------------
+// The result of an extraction
+//---------------------------------------------------------------------
+
+/// What [`extract_range`] added to the target, and how to take it back out.
+///
+/// Deliberately **not** a [`Command`]. The inverse of an extraction undoes the
+/// append into the *target*, and it names the target's page ids; but
+/// `Command::apply` and `UndoStack::apply` take any `&mut D` at all, and every
+/// document implementation allocates page ids from zero, so those ids resolve
+/// against the source too — against completely unrelated pages. Returning a
+/// bare `Box<dyn Command<D>>` let a caller undo an extraction into the source
+/// document and silently delete as many source pages as it had extracted.
+///
+/// Undoing therefore goes through [`Extraction::undo`], whose parameter is
+/// named for the document it wants, and the command behind it is a
+/// [`BoundInverse`] that rejects any other document even when it is handed
+/// one — including via [`Extraction::into_target_command`], the only route
+/// onto an undo stack.
+pub struct Extraction<D: Document> {
+    page_ids: Vec<PageId>,
+    inverse: BoundInverse<D>,
+}
+
+impl<D: Document + 'static> Extraction<D> {
+    /// The identities the extracted pages were given in the target, in the
+    /// order they were appended.
+    pub fn page_ids(&self) -> &[PageId] {
+        &self.page_ids
+    }
+
+    /// Remove the extracted pages from `target`, restoring it to its
+    /// pre-extraction state.
+    ///
+    /// Returns [`Error::Unsupported`] without touching anything if `target` is
+    /// not the document the pages were extracted into.
+    pub fn undo(&self, target: &mut D) -> Result<()> {
+        self.inverse.apply(target)?;
+        Ok(())
+    }
+
+    /// Take the inverse as a plain command, for the *target* document's undo
+    /// stack.
+    ///
+    /// The command keeps its binding, so pushing it onto the wrong document's
+    /// stack is an error at apply time rather than data loss.
+    pub fn into_target_command(self) -> Box<dyn Command<D>> {
+        Box::new(self.inverse)
+    }
+}
+
+//---------------------------------------------------------------------
+// Extraction
+//---------------------------------------------------------------------
 
 /// Copy pages `start_index..end_index` from `source` into `target`,
 /// appending them at `target`'s current end.
 ///
 /// `source` is never mutated. `target` need not be empty — extraction
 /// always appends, so repeated extractions accumulate rather than
-/// overwrite. Returns the inverse of the append into `target`.
-pub fn extract_range<D: Document + 'static>(source: &D, target: &mut D, start_index: usize, end_index: usize) -> Result<Box<dyn Command<D>>> {
+/// overwrite. The returned [`Extraction`] undoes the append into `target`,
+/// and only into `target`.
+pub fn extract_range<D: Document + 'static>(source: &D, target: &mut D, start_index: usize, end_index: usize) -> Result<Extraction<D>> {
     let page_ids = source.page_ids();
     if end_index > page_ids.len() {
         return Err(Error::IndexOutOfBounds {
@@ -31,8 +88,13 @@ pub fn extract_range<D: Document + 'static>(source: &D, target: &mut D, start_in
     let ids = &page_ids[start_index..end_index];
     let at_index = target.page_count();
     let new_ids = target.import_pages(source, ids, at_index)?;
-    let removals: Vec<Box<dyn Command<D>>> = new_ids.into_iter().map(|page| Box::new(RemovePage { page }) as Box<dyn Command<D>>).collect();
-    Ok(Box::new(Sequence::new("Undo extraction".to_string(), removals)))
+    let removals: Vec<Box<dyn Command<D>>> = new_ids.iter().map(|&page| Box::new(RemovePage { page }) as Box<dyn Command<D>>).collect();
+    let inverse: Box<dyn Command<D>> = Box::new(Sequence::new("Undo extraction".to_string(), removals));
+    //--- bound to `target`, which the borrow checker guarantees is not `source` ---
+    Ok(Extraction {
+        page_ids: new_ids,
+        inverse: BoundInverse::new(target, inverse),
+    })
 }
 
 #[cfg(test)]
@@ -69,10 +131,11 @@ mod tests {
         let mut target = VecDocument::new();
         let before = DocumentSnapshot::of(&target).unwrap();
 
-        let inverse = extract_range(&source, &mut target, 1, 3).unwrap();
+        let extraction = extract_range(&source, &mut target, 1, 3).unwrap();
         assert_eq!(target.page_count(), 2);
+        assert_eq!(extraction.page_ids().len(), 2, "the extraction must report the identities it created");
 
-        inverse.apply(&mut target).unwrap();
+        extraction.undo(&mut target).unwrap();
         assert_eq!(DocumentSnapshot::of(&target).unwrap().pages, before.pages);
     }
 
@@ -117,6 +180,69 @@ mod tests {
         let result = extract_range(&source, &mut target, 9, 2);
 
         assert!(result.is_err());
+    }
+
+    /// F12 reproduction. Every `VecDocument` allocates page ids from zero, so
+    /// the ids the extraction created in `target` collide with ids that name
+    /// entirely different, live pages in `source`. Applying the extraction's
+    /// inverse to the source used to succeed and delete two source pages —
+    /// measured, 4 pages down to 2 — with the type system unable to object
+    /// because both documents are the same `D`.
+    #[test]
+    fn the_inverse_refuses_to_apply_to_the_source_document() {
+        let mut source = VecDocument::with_pages(4, PageSize::A4);
+        let mut target = VecDocument::new();
+        let before = DocumentSnapshot::of(&source).unwrap();
+
+        let extraction = extract_range(&source, &mut target, 1, 3).unwrap();
+        let result = extraction.undo(&mut source);
+
+        assert!(result.is_err(), "an inverse built against the target must not apply to the source");
+        assert_eq!(
+            DocumentSnapshot::of(&source).unwrap().pages,
+            before.pages,
+            "the rejected inverse must not have removed a single source page"
+        );
+    }
+
+    /// The same guard has to survive being taken out as a plain command, which
+    /// is the only shape an undo stack can hold and therefore the only shape
+    /// that reaches production.
+    #[test]
+    fn the_inverse_still_refuses_the_source_once_it_is_a_plain_command() {
+        let mut source = VecDocument::with_pages(4, PageSize::A4);
+        let mut target = VecDocument::new();
+        let before = DocumentSnapshot::of(&source).unwrap();
+
+        let command = extract_range(&source, &mut target, 1, 3).unwrap().into_target_command();
+
+        assert!(command.apply(&mut source).is_err(), "a bare command must carry the binding too");
+        assert_eq!(DocumentSnapshot::of(&source).unwrap().pages, before.pages);
+        command.apply(&mut target).unwrap();
+        assert_eq!(target.page_count(), 0, "the guard must not stand in the way of the legitimate undo");
+    }
+
+    /// A third, unrelated document is the case a page-id or page-count check
+    /// would wave through: it looks exactly like the target did.
+    #[test]
+    fn the_inverse_refuses_a_look_alike_third_document() {
+        let source = VecDocument::with_pages(4, PageSize::A4);
+        let mut target = VecDocument::new();
+        let mut look_alike = VecDocument::new();
+
+        let extraction = extract_range(&source, &mut target, 0, 4).unwrap();
+        let other = extract_range(&source, &mut look_alike, 0, 4).unwrap();
+        assert_eq!(
+            extraction.page_ids(),
+            other.page_ids(),
+            "the two targets must be indistinguishable by page id for this test to mean anything"
+        );
+
+        assert!(
+            extraction.undo(&mut look_alike).is_err(),
+            "identical page ids must not make one document pass for the other"
+        );
+        assert_eq!(look_alike.page_count(), 4);
     }
 
     #[test]

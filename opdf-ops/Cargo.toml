@@ -12,3 +12,7 @@ opdf-core = { path = "../opdf-core" }
 
 [dev-dependencies]
 opdf-core = { path = "../opdf-core", features = ["contract-tests"] }
+# Property tests for the invertibility claim every command in this crate makes.
+# Kept off the workspace dependency table because no other crate needs it, and
+# the root manifest is not this crate's to edit.
+proptest = { version = "1", default-features = false, features = ["std"] }
