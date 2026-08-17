@@ -13,8 +13,10 @@
 
 use opdf_core::Result;
 use opdf_core::document::{Document, DocumentSnapshot};
-use opdf_core::fakes::VecDocument;
+use opdf_core::fakes::{FakeRenderService, VecDocument};
 use opdf_core::page::{PageSize, Rotation};
+
+use crate::opener::OpenedDocument;
 
 /// Page sizes the generator cycles through, in points.
 ///
@@ -57,6 +59,23 @@ pub fn build_synthetic_document(page_count: usize) -> Result<VecDocument> {
 pub fn build_synthetic_snapshot(page_count: usize) -> Result<DocumentSnapshot> {
     let document = build_synthetic_document(page_count)?;
     DocumentSnapshot::of(&document)
+}
+
+/// Build a synthetic document in the shape the shell accepts: the document, a
+/// service built from the same snapshot, and that snapshot.
+///
+/// The shell takes a [`crate::opener::OpenedDocument`] however the document was
+/// produced, so the synthetic path is one more producer rather than a second
+/// route into the shell.
+pub fn open_synthetic_document(page_count: usize) -> Result<OpenedDocument> {
+    let document = build_synthetic_document(page_count)?;
+    let snapshot = DocumentSnapshot::of(&document)?;
+    let service = Box::new(FakeRenderService::new(snapshot.clone()));
+    Ok(OpenedDocument {
+        document: Box::new(document),
+        service,
+        snapshot,
+    })
 }
 
 #[cfg(test)]
