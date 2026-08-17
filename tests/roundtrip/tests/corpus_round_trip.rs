@@ -21,8 +21,17 @@ use opdf_roundtrip::{CorpusEntry, CorpusManifest, RoundTripStrength, assert_roun
 /// be asking the wrong question.
 const PATHOLOGICAL: &str = "pathological";
 
+/// Set to opt into the `fetched` tier — the large specimens that live in
+/// `tests/corpus/.cache/` after `tests/corpus/fetch_corpus.py` has run, and
+/// are far too big to check into git or to round-trip on every PR.
+const FULL_CORPUS_ENV: &str = "OPDF_CORPUS_FULL";
+
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus")
+}
+
+fn cache_dir() -> PathBuf {
+    corpus_dir().join(".cache")
 }
 
 fn load_manifest() -> CorpusManifest {
@@ -121,4 +130,90 @@ fn a_zero_byte_file_is_rejected_rather_than_opened_as_an_empty_document() {
         PdfDocument::open(&path_of(entry)).is_err(),
         "an empty file must not open; opening it as a document with no pages would let a later save overwrite it with a valid PDF"
     );
+}
+
+/// The same promise, over the `fetched` tier — the specimens too large to
+/// check in.
+///
+/// This is what makes the nightly `full-corpus` job a corpus job rather than a
+/// download job. `OPDF_CORPUS_FULL` was set in the workflow and read by nothing;
+/// the job fetched ~274 MB and then ran the same eight unit tests the PR had
+/// already run. This test is the code that finally reads it.
+///
+/// Availability and correctness are separated deliberately. A specimen whose
+/// upstream is unreachable is reported as uncovered and does not fail the run —
+/// `fetch_corpus.py` has already warned about it, loudly and as a GitHub
+/// Actions annotation, and taking the job red for someone else's outage hides
+/// every other result in it. A specimen that *is* present and hashes wrong, or
+/// fails to round-trip, fails hard: those are statements about this project.
+#[test]
+fn the_fetched_corpus_tier_round_trips_when_requested() {
+    if std::env::var_os(FULL_CORPUS_ENV).is_none() {
+        println!("FULL CORPUS: skipped — set {FULL_CORPUS_ENV}=1 and run tests/corpus/fetch_corpus.py to include the fetched tier");
+        return;
+    }
+
+    let manifest = load_manifest();
+    let mut covered: Vec<String> = Vec::new();
+    let mut unavailable: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut listed = 0;
+
+    for entry in manifest.fetched() {
+        listed += 1;
+        let path = cache_dir().join(&entry.file);
+        if !path.is_file() {
+            unavailable.push(entry.file.clone());
+            continue;
+        }
+
+        //--- the fetched tier is not in git, so nothing has verified these
+        //--- bytes before this point; check them before trusting a result
+        //--- taken from them ---
+        let bytes = std::fs::read(&path).expect("a cached corpus file must be readable");
+        let actual = opdf_roundtrip::sha256_hex(&bytes);
+        assert_eq!(
+            actual, entry.sha256,
+            "{}: cached bytes hash to {actual}, manifest pins {} — the cache is stale or corrupt",
+            entry.file, entry.sha256
+        );
+        drop(bytes);
+
+        if entry.tags.iter().any(|tag| tag == PATHOLOGICAL) {
+            //--- same bar as the checked-in pathological files: surviving the
+            //--- call is the assertion ---
+            let _ = PdfDocument::open(&path);
+        } else if let Err(failure) = assert_round_trip::<PdfDocument>(&path, RoundTripStrength::ByteIdentical) {
+            failures.push(format!("{}: {failure}", entry.file));
+        }
+        covered.push(entry.file.clone());
+    }
+
+    println!(
+        "FULL CORPUS: {} of {listed} fetched specimens round-tripped: {}",
+        covered.len(),
+        covered.join(", ")
+    );
+
+    assert!(
+        listed > 0,
+        "{FULL_CORPUS_ENV} is set but the manifest lists no fetched entries at all — the large-specimen tier has vanished from the manifest, so this job cannot prove anything"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} fetched specimen(s) failed the round trip:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    if !unavailable.is_empty() {
+        //--- not a failure, but never silent: the run covered less than it
+        //--- was asked to, and the summary has to say so ---
+        eprintln!(
+            "FULL CORPUS: {} of {listed} specimen(s) NOT covered — not present in {}: {}. Run tests/corpus/fetch_corpus.py; if it reported them unreachable, this run verified less than its name claims.",
+            unavailable.len(),
+            cache_dir().display(),
+            unavailable.join(", ")
+        );
+    }
 }
