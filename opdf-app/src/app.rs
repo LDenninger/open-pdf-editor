@@ -4,7 +4,7 @@
 //! This module routes; it does not compute. Everything it decides was decided by
 //! [`crate::layout`], [`crate::zoom`], [`crate::scheduler`], and [`crate::viewer`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use opdf_core::document::{Document, DocumentSnapshot};
 use opdf_core::fakes::FakeRenderService;
@@ -27,11 +27,24 @@ pub const CANVAS_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// keep its own working set even while the canvas churns.
 pub const RAIL_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
+/// Which of the two save paths a write takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaveMode {
+    /// Append the changes to the original bytes, preserving everything else.
+    Incremental,
+    /// Serialize the document afresh, discarding unreferenced objects.
+    ///
+    /// Discards trashed pages along with them, which is why reaching this
+    /// requires a confirmation and costs the undo history.
+    Compacted,
+}
+
 /// The application.
 pub struct OpdfApp {
     theme: Theme,
     state: ViewerState,
     document: Option<Box<dyn EditableDocument>>,
+    document_path: Option<PathBuf>,
     service: Box<dyn RenderService>,
     canvas_cache: TextureCache,
     rail_cache: TextureCache,
@@ -57,6 +70,7 @@ impl OpdfApp {
             state: ViewerState::new(opened.snapshot, &theme),
             theme,
             document: Some(opened.document),
+            document_path: opened.path,
             service: opened.service,
             canvas_cache: TextureCache::new(CANVAS_CACHE_BUDGET_BYTES),
             rail_cache: TextureCache::new(RAIL_CACHE_BUDGET_BYTES),
@@ -119,7 +133,7 @@ impl OpdfApp {
     /// service is likewise kept for its own reasons: the rasterizer resolves page
     /// positions against the file it opened, which is a different file now.
     pub fn open_document(&mut self, opened: OpenedDocument) {
-        self.install_document(Some(opened.document), opened.service, opened.snapshot);
+        self.install_document(Some(opened.document), opened.path, opened.service, opened.snapshot);
     }
 
     /// Open `path` through `opener`, replacing whatever is currently open.
@@ -169,13 +183,22 @@ impl OpdfApp {
     /// closing cannot forget a step opening remembers.
     fn close_document(&mut self) {
         let snapshot = DocumentSnapshot::default();
-        self.install_document(None, Box::new(FakeRenderService::new(snapshot.clone())), snapshot);
+        self.install_document(None, None, Box::new(FakeRenderService::new(snapshot.clone())), snapshot);
     }
 
-    /// The one place a document, its service, and its snapshot are installed
-    /// together.
-    fn install_document(&mut self, document: Option<Box<dyn EditableDocument>>, service: Box<dyn RenderService>, snapshot: DocumentSnapshot) {
+    /// The one place a document, its origin, its service, and its snapshot are
+    /// installed together.
+    fn install_document(
+        &mut self,
+        document: Option<Box<dyn EditableDocument>>,
+        path: Option<PathBuf>,
+        service: Box<dyn RenderService>,
+        snapshot: DocumentSnapshot,
+    ) {
         self.document = document;
+        //--- the path travels with the document, so closing or replacing one
+        //--- cannot leave Save aimed at the previous document's file ---
+        self.document_path = path;
         //--- the previous service is dropped here, which is what keeps a late
         //--- response from the old document out of the new one's cache ---
         self.service = service;
@@ -183,6 +206,76 @@ impl OpdfApp {
             .open_document(snapshot, &self.theme, &mut [&mut self.canvas_cache, &mut self.rail_cache]);
         self.state.scroll_to_page(0, 0.0);
         self.page_entry = "1".to_owned();
+    }
+
+    /// Where the open document will be written by Save, if it has an origin.
+    pub fn document_path(&self) -> Option<&Path> {
+        self.document_path.as_deref()
+    }
+
+    /// Write the open document to `path`, remembering it as the document's home.
+    ///
+    /// Does nothing at all when no document is open: Save with an empty window is
+    /// a no-op, not an error worth interrupting anyone over. A failed write is
+    /// reported through `last_error` and leaves the document exactly as it was —
+    /// the file on disk may be damaged, but the copy the user is editing is not,
+    /// and that is the copy they can still save elsewhere.
+    ///
+    /// Returns whether the document was written.
+    pub fn save_to(&mut self, path: &Path, mode: SaveMode) -> bool {
+        let Some(document) = self.document.as_mut() else {
+            return false;
+        };
+        let result = match mode {
+            SaveMode::Incremental => document.save_incremental(path),
+            SaveMode::Compacted => document.save_compacted(path),
+        };
+        match result {
+            Ok(()) => {
+                self.document_path = Some(path.to_owned());
+                self.last_error = None;
+                true
+            }
+            Err(error) => {
+                self.last_error = Some(format!("could not save {}: {error}", path.display()));
+                false
+            }
+        }
+    }
+
+    /// Save to the document's own path, asking for one if it has none.
+    ///
+    /// Incremental is the default path for a reason worth restating here: it
+    /// appends to the original bytes, so every structure the implementation does
+    /// not model survives, and it does not purge the trash, so undo of a deletion
+    /// survives it too. Compaction does neither, which is why it is a separate,
+    /// confirmed action rather than a faster default.
+    fn save_in_place(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+        match self.document_path.clone() {
+            Some(path) => {
+                self.save_to(&path, SaveMode::Incremental);
+            }
+            None => self.save_to_chosen_path(),
+        }
+    }
+
+    /// Ask where to write the document, then write it, doing nothing if the user
+    /// cancels.
+    ///
+    /// The check for an open document comes *before* the dialog, not after it:
+    /// asking someone to name a file and then writing nothing to it is worse than
+    /// doing nothing at all, and with no document open there is nothing to name.
+    fn save_to_chosen_path(&mut self) {
+        if self.document.is_none() {
+            return;
+        }
+        let Some(path) = self.chooser.choose_save_path() else {
+            return;
+        };
+        self.save_to(&path, SaveMode::Incremental);
     }
 
     /// Replace the document with a freshly generated synthetic one.
@@ -206,6 +299,8 @@ impl OpdfApp {
         let current = self.state.current_page().unwrap_or(0);
         match action {
             MenuAction::OpenDocument => self.open_chosen_path(),
+            MenuAction::Save => self.save_in_place(),
+            MenuAction::SaveAs => self.save_to_chosen_path(),
             MenuAction::CloseDocument => self.close_document(),
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::GenerateSynthetic(page_count) => self.load_synthetic(page_count),
