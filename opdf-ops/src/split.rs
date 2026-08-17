@@ -2,6 +2,7 @@
 
 use opdf_core::{Command, Document, Error, Result};
 
+use crate::binding::BoundInverse;
 use crate::remove_page::RemovePage;
 use crate::sequence::Sequence;
 
@@ -16,6 +17,11 @@ use crate::sequence::Sequence;
 /// [`RemovePage`]'s `RestorePage` inverse. It does not undo `target`'s
 /// population; a caller undoing a split discards `target` rather than
 /// asking it to undo itself.
+///
+/// The inverse is a [`BoundInverse`] tied to `document`. Both documents are
+/// the same type `D` and both allocate page ids from zero, so without the
+/// binding the returned inverse would be accepted by `target` as readily as by
+/// `document` — naming, there, pages it has no business restoring.
 ///
 /// If the import into `target` succeeds but the following removal from
 /// `document` fails — which, given page ids read fresh from `document`
@@ -35,7 +41,8 @@ pub fn split_at<D: Document + 'static>(document: &mut D, target: &mut D, boundar
     target.import_pages(document, tail_ids, at_index)?;
 
     let removals: Vec<Box<dyn Command<D>>> = tail_ids.iter().map(|&page| Box::new(RemovePage { page }) as Box<dyn Command<D>>).collect();
-    Sequence::new("Split off the tail".to_string(), removals).apply(document)
+    let inverse = Sequence::new("Split off the tail".to_string(), removals).apply(document)?;
+    Ok(Box::new(BoundInverse::new(document, inverse)))
 }
 
 #[cfg(test)]
@@ -70,6 +77,24 @@ mod tests {
             before.pages,
             "restore_page makes undoing the document-side removal exact, ids included"
         );
+    }
+
+    /// The mirror of the extraction defect: the inverse restores `document`'s
+    /// pages, and `target`'s ids overlap `document`'s entirely, so `target`
+    /// must not be able to accept it.
+    #[test]
+    fn the_inverse_refuses_to_apply_to_the_split_off_target() {
+        let mut document = VecDocument::with_pages(4, PageSize::A4);
+        let mut target = VecDocument::new();
+
+        let inverse = split_at(&mut document, &mut target, 2).unwrap();
+        let before = DocumentSnapshot::of(&target).unwrap();
+
+        assert!(
+            inverse.apply(&mut target).is_err(),
+            "an inverse that restores the source's pages must not be applicable to the target"
+        );
+        assert_eq!(DocumentSnapshot::of(&target).unwrap().pages, before.pages);
     }
 
     #[test]
