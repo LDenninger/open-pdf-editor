@@ -7,6 +7,7 @@
 //! rasterizer is not thread-safe.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use opdf_core::document::DocumentSnapshot;
 use opdf_core::page::Rotation;
@@ -23,6 +24,36 @@ use crate::zoom::{anchor_scroll_offset, clamp_zoom, fit_page_zoom, fit_width_zoo
 /// renderer without doubling the work for a stationary view.
 pub const OVERSCAN_SCREENS: f32 = 0.5;
 
+/// How much the viewport must change before a fit mode is reapplied, in screen
+/// points.
+///
+/// A scroll bar appearing or disappearing moves the viewport by a few points, and
+/// refitting on that change would move it back — so the tolerance is wider than
+/// any such wobble and far narrower than a real resize.
+const FIT_VIEWPORT_TOLERANCE_PX: f32 = 4.0;
+
+/// Which document the viewer is showing, distinct for every document opened in
+/// this process.
+///
+/// `opdf_core` has no such notion and does not need one: a
+/// [`DocumentSnapshot::revision`] counts edits *within* one document, and page ids
+/// are allocated per document, so every document — synthetic or parsed — starts
+/// both counts at zero. Two documents therefore produce colliding
+/// [`opdf_core::render::RenderRequest`]s, and a tile cache keyed by request alone
+/// cannot tell one document's pixels from another's. Only the shell knows that a
+/// *different* document was opened, so identity is minted here, and
+/// [`ViewerState::open_document`] is what turns it into a cleared cache.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    /// Mint an identity no other document in this process will be given.
+    pub fn allocate() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// How the zoom responds to a resize.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum FitMode {
@@ -38,9 +69,18 @@ pub enum FitMode {
 /// Everything the viewer carries between frames.
 #[derive(Debug)]
 pub struct ViewerState {
+    document: DocumentId,
     snapshot: DocumentSnapshot,
     layout: DocumentLayout,
     current_page: Option<usize>,
+    /// Viewport size the current zoom was last fitted to, in screen points.
+    ///
+    /// A fit mode is a standing promise, so it has to be reapplied whenever the
+    /// viewport changes and not only when the user asks for it. Comparing against
+    /// the size last fitted to — rather than against last frame's size — is what
+    /// makes the check idempotent: once the fit is applied, it does not fire again
+    /// until the viewport genuinely moves.
+    fitted_viewport_px: (f32, f32),
     /// Current zoom factor, where 1.0 is 72 dpi — one screen point per PDF point.
     pub zoom: f32,
     /// Scroll offset from the top of the content box, in screen points.
@@ -76,9 +116,11 @@ impl ViewerState {
         let layout = compute_document_layout(&snapshot, theme.page_gap_pt, theme.canvas_margin_pt);
         let current_page = if layout.is_empty() { None } else { Some(0) };
         Self {
+            document: DocumentId::allocate(),
             snapshot,
             layout,
             current_page,
+            fitted_viewport_px: (0.0, 0.0),
             zoom: 1.0,
             scroll_offset_px: 0.0,
             viewport_size_px: (0.0, 0.0),
@@ -88,6 +130,12 @@ impl ViewerState {
             rail_visible: true,
             scroll_request_px: None,
         }
+    }
+
+    /// Which document is being shown. Changes only through
+    /// [`ViewerState::open_document`], never through an edit.
+    pub fn document_id(&self) -> DocumentId {
+        self.document
     }
 
     /// The snapshot being drawn. Every render request is built from this.
@@ -110,12 +158,42 @@ impl ViewerState {
         self.snapshot.page_count()
     }
 
-    /// Adopt a new snapshot, recompute the layout, and drop every cached texture
-    /// belonging to the superseded revision.
+    /// Show a **different document**: mint a new identity, recompute the layout,
+    /// and empty every cache outright.
+    ///
+    /// This is the path `Open`, `Close`, and generating a synthetic document take.
+    /// Discarding by revision would not be enough and is the bug this method
+    /// exists to prevent: the new document's revision and page ids both start
+    /// where the previous one's did, so its requests are keyed exactly as the
+    /// previous document's cached tiles — open A, then B, and B's pages would be
+    /// drawn from A's pixels.
+    ///
+    /// Use [`ViewerState::replace_snapshot`] instead for an edit to the document
+    /// already open, which must keep the tiles it can still serve.
+    pub fn open_document(&mut self, snapshot: DocumentSnapshot, theme: &Theme, caches: &mut [&mut TextureCache]) {
+        self.document = DocumentId::allocate();
+        self.layout = compute_document_layout(&snapshot, theme.page_gap_pt, theme.canvas_margin_pt);
+        for cache in caches.iter_mut() {
+            cache.clear();
+        }
+        self.snapshot = snapshot;
+        self.refresh_current_page();
+        //--- a fit mode is fitted to a content box, and this is a different one ---
+        self.reapply_fit_mode();
+    }
+
+    /// Adopt a new snapshot **of the document already open** — an edit — recompute
+    /// the layout, and drop every cached texture belonging to the superseded
+    /// revision.
     ///
     /// Passing the caches in is not optional bookkeeping: entries from the old
     /// revision can never be served again, because the revision participates in
-    /// `RenderRequest`'s equality, so leaving them in place is a pure leak.
+    /// `RenderRequest`'s equality, so leaving them in place is a pure leak. Tiles
+    /// at the new revision are kept, which is what stops an undo from blanking the
+    /// canvas.
+    ///
+    /// Never call this for a document the user opened; see
+    /// [`ViewerState::open_document`].
     pub fn replace_snapshot(&mut self, snapshot: DocumentSnapshot, theme: &Theme, caches: &mut [&mut TextureCache]) {
         self.layout = compute_document_layout(&snapshot, theme.page_gap_pt, theme.canvas_margin_pt);
         for cache in caches.iter_mut() {
@@ -123,6 +201,8 @@ impl ViewerState {
         }
         self.snapshot = snapshot;
         self.refresh_current_page();
+        //--- an edit can change the widest page, and with it the fit ---
+        self.reapply_fit_mode();
     }
 
     /// The content box's size in screen points at the current zoom.
@@ -195,11 +275,12 @@ impl ViewerState {
         }
     }
 
-    /// Reapply the current fit mode after a viewport resize.
+    /// Reapply the current fit mode to the viewport as it is now.
     ///
     /// A no-op in [`FitMode::Free`], so a user-chosen zoom survives a window resize.
     pub fn reapply_fit_mode(&mut self) {
         let (width_px, height_px) = self.viewport_size_px;
+        self.fitted_viewport_px = self.viewport_size_px;
         let new_zoom = match self.fit_mode {
             FitMode::Free => return,
             FitMode::Width => fit_width_zoom(self.layout.content_width_pt, width_px),
@@ -209,6 +290,33 @@ impl ViewerState {
             },
         };
         self.set_zoom_anchored(new_zoom, height_px * 0.5);
+    }
+
+    /// Reapply the fit mode if the viewport has changed size since it was last
+    /// fitted, returning whether the zoom was refitted.
+    ///
+    /// Call this once per frame, after the canvas has written back the viewport it
+    /// actually got. Without it a fit mode is a one-shot zoom rather than a mode:
+    /// `Fit width` on a wide window, then halve the window, and the content stays
+    /// at its old width in a viewport half the size.
+    ///
+    /// [`FitMode::Width`] watches only the width, so shortening the window does not
+    /// disturb a zoom that does not depend on the height.
+    pub fn sync_fit_to_viewport(&mut self) -> bool {
+        let (width_px, height_px) = self.viewport_size_px;
+        let (fitted_width_px, fitted_height_px) = self.fitted_viewport_px;
+        let width_moved = (width_px - fitted_width_px).abs() > FIT_VIEWPORT_TOLERANCE_PX;
+        let height_moved = (height_px - fitted_height_px).abs() > FIT_VIEWPORT_TOLERANCE_PX;
+        let stale = match self.fit_mode {
+            FitMode::Free => false,
+            FitMode::Width => width_moved,
+            FitMode::Page => width_moved || height_moved,
+        };
+        if !stale {
+            return false;
+        }
+        self.reapply_fit_mode();
+        true
     }
 }
 
@@ -394,6 +502,126 @@ mod tests {
 
         assert_eq!(cache.pending_count(), 0, "requests in flight for the old revision must be forgotten");
         assert_eq!(state.snapshot().revision, stale.revision + 1, "the viewer must now be drawing the new snapshot");
+    }
+
+    /// The case `retain_revision` cannot see: a *different* document whose
+    /// revision and page ids collide with the one already open, which is every
+    /// pair of freshly opened documents.
+    #[test]
+    fn drops_every_texture_when_a_different_document_is_opened() {
+        let ctx = egui::Context::default();
+        let (mut state, theme) = build_viewer(10);
+        let service = FakeRenderService::new(state.snapshot().clone());
+        let mut cache = TextureCache::new(1 << 26);
+        step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
+        step_render_service(&state, &service, &mut [&mut cache], &ctx, 1.0);
+        assert!(!cache.is_empty(), "the cache must warm before this test means anything");
+
+        let other = build_synthetic_snapshot(10).unwrap();
+        assert_eq!(other.revision, state.snapshot().revision, "the colliding case is the one that matters here");
+        assert_eq!(
+            other.pages[0].id,
+            state.snapshot().pages[0].id,
+            "page ids are allocated per document and collide too"
+        );
+
+        state.open_document(other, &theme, &mut [&mut cache]);
+
+        assert!(
+            cache.is_empty(),
+            "the previous document's tiles are keyed exactly as the new document looks them up, so keeping them draws A's pixels for B"
+        );
+        assert_eq!(cache.pending_count(), 0, "a request in flight for the previous document must be forgotten");
+    }
+
+    #[test]
+    fn mints_a_new_identity_per_document_but_not_per_edit() {
+        let (mut state, theme) = build_viewer(10);
+        let opened = state.document_id();
+
+        state.open_document(build_synthetic_snapshot(10).unwrap(), &theme, &mut []);
+        let reopened = state.document_id();
+        assert_ne!(opened, reopened, "a document that merely looks the same is still a different document");
+
+        let mut edited = state.snapshot().clone();
+        edited.revision += 1;
+        state.replace_snapshot(edited, &theme, &mut []);
+        assert_eq!(reopened, state.document_id(), "an edit must not change which document is open");
+    }
+
+    #[test]
+    fn refits_the_width_when_the_viewport_changes_and_not_otherwise() {
+        let (mut state, _theme) = build_viewer(10);
+        state.fit_mode = FitMode::Width;
+        state.reapply_fit_mode();
+        let fitted_zoom = state.zoom;
+        assert!(!state.sync_fit_to_viewport(), "an unchanged viewport must not refit");
+
+        state.viewport_size_px = (500.0, 800.0);
+        assert!(state.sync_fit_to_viewport(), "a resized viewport must refit, with no action from the user");
+        assert!(state.zoom < fitted_zoom, "a narrower viewport must fit at a smaller zoom");
+        assert!(
+            (state.layout().content_width_pt * state.zoom - 500.0).abs() < 1e-2,
+            "the content must fill the new viewport width, but is {} pt wide",
+            state.layout().content_width_pt * state.zoom
+        );
+        assert!(!state.sync_fit_to_viewport(), "the refit must settle, not fire again on every following frame");
+    }
+
+    #[test]
+    fn refits_a_fitted_page_only_when_an_axis_it_depends_on_moves() {
+        let (mut state, _theme) = build_viewer(10);
+        state.fit_mode = FitMode::Width;
+        state.reapply_fit_mode();
+        state.viewport_size_px = (1000.0, 400.0);
+        assert!(
+            !state.sync_fit_to_viewport(),
+            "fit-width does not depend on the height, so shortening the window must leave the zoom alone"
+        );
+
+        state.fit_mode = FitMode::Page;
+        state.reapply_fit_mode();
+        //--- 300 pt still fits an A4 page above MIN_ZOOM, so the clamp is not what is being measured ---
+        state.viewport_size_px = (1000.0, 300.0);
+        assert!(state.sync_fit_to_viewport(), "fit-page depends on the height and must follow it");
+        let placement = state.layout().placement(state.current_page().unwrap_or(0)).unwrap();
+        assert!(
+            placement.height_pt * state.zoom <= 300.0 + 1e-2,
+            "the fitted page is {} pt tall in a 300 pt viewport",
+            placement.height_pt * state.zoom
+        );
+    }
+
+    #[test]
+    fn refits_a_newly_opened_document_to_the_viewport_it_is_shown_in() {
+        let (mut state, theme) = build_viewer(10);
+        state.fit_mode = FitMode::Width;
+        state.reapply_fit_mode();
+        let wide_document_zoom = state.zoom;
+
+        //--- one A4 page is a much narrower content box than ten varied ones ---
+        state.open_document(build_synthetic_snapshot(1).unwrap(), &theme, &mut []);
+
+        assert!(
+            state.zoom > wide_document_zoom,
+            "a narrower document under fit-width must fill the same viewport at a larger zoom: {wide_document_zoom} -> {}",
+            state.zoom
+        );
+        assert!(
+            (state.layout().content_width_pt * state.zoom - state.viewport_size_px.0).abs() < 1e-2,
+            "the new document is {} pt wide in a {} pt viewport",
+            state.layout().content_width_pt * state.zoom,
+            state.viewport_size_px.0
+        );
+    }
+
+    #[test]
+    fn leaves_a_freely_chosen_zoom_alone_across_a_resize() {
+        let (mut state, _theme) = build_viewer(10);
+        state.set_zoom_anchored(2.0, 400.0);
+        state.viewport_size_px = (400.0, 300.0);
+        assert!(!state.sync_fit_to_viewport());
+        assert_eq!(state.zoom, 2.0, "a user-chosen zoom must survive a window resize untouched");
     }
 
     #[test]
