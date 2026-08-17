@@ -24,13 +24,13 @@ pub const DEFAULT_UNDO_LIMIT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99
 /// through [`UndoStack::with_limit`]. The redo stack needs no separate cap:
 /// entries only ever move between the two stacks, so the two together never
 /// hold more than the limit.
-pub struct UndoStack<D: Document> {
+pub struct UndoStack<D: Document + ?Sized> {
     undo: Vec<Box<dyn Command<D>>>,
     redo: Vec<Box<dyn Command<D>>>,
     limit: NonZeroUsize,
 }
 
-impl<D: Document> UndoStack<D> {
+impl<D: Document + ?Sized> UndoStack<D> {
     /// An empty stack retaining [`DEFAULT_UNDO_LIMIT`] steps.
     pub fn new() -> Self {
         Self::with_limit(DEFAULT_UNDO_LIMIT)
@@ -165,7 +165,7 @@ impl<D: Document> UndoStack<D> {
     }
 }
 
-impl<D: Document> Default for UndoStack<D> {
+impl<D: Document + ?Sized> Default for UndoStack<D> {
     fn default() -> Self {
         Self::new()
     }
@@ -216,6 +216,39 @@ mod tests {
         fn label(&self) -> String {
             format!("Fails after {} more applications", self.remaining)
         }
+    }
+
+    /// The shape the shell actually holds.
+    ///
+    /// `opdf-app` owns a `Box<dyn Document>` — it is handed one by the opener and
+    /// cannot name the concrete type — so an undo stack it can use has to be
+    /// `UndoStack<dyn Document>`. That did not compile while `Command<D>` and
+    /// `UndoStack<D>` carried the implicit `Sized` bound on `D`, which left the
+    /// shell unable to hold a history over the document it owns.
+    ///
+    /// A compile-time requirement wearing a test's clothes, like
+    /// `Document::stays_object_safe`: reinstating either bound stops this
+    /// compiling, here rather than in a dependent crate.
+    #[test]
+    fn an_undo_stack_works_over_a_document_behind_a_trait_object() {
+        let mut document: Box<dyn Document> = Box::new(VecDocument::with_pages(3, PageSize::A4));
+        let ids = document.page_ids();
+        let before = DocumentSnapshot::of(document.as_ref()).unwrap();
+        let mut stack: UndoStack<dyn Document> = UndoStack::new();
+
+        let command: Box<dyn Command<dyn Document>> = Box::new(RemovePage { page: ids[0] });
+        stack.apply(document.as_mut(), command).unwrap();
+        assert_eq!(document.page_count(), 2);
+
+        assert!(stack.undo(document.as_mut()).unwrap());
+        assert_eq!(
+            DocumentSnapshot::of(document.as_ref()).unwrap().pages,
+            before.pages,
+            "undo through a trait object must restore the document exactly, as it does through a concrete type"
+        );
+
+        assert!(stack.redo(document.as_mut()).unwrap());
+        assert_eq!(document.page_count(), 2, "redo must work through the trait object too");
     }
 
     #[test]
