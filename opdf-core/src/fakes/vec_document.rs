@@ -2,7 +2,7 @@
 //! crates before a real PDF parser exists.
 
 use crate::Result;
-use crate::document::Document;
+use crate::document::{Document, DocumentId};
 use crate::error::Error;
 use crate::page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
 
@@ -11,12 +11,29 @@ use crate::page::{PageId, PageIdAllocator, PageInfo, PageSize, Rotation};
 /// Removed pages are moved to `removed` rather than dropped, so that
 /// [`Document::restore_page`] can hand back the original page — same identity,
 /// same geometry, same rotation — instead of an approximation of it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VecDocument {
+    id: DocumentId,
     pages: Vec<PageInfo>,
     removed: Vec<PageInfo>,
     allocator: PageIdAllocator,
     revision: u64,
+}
+
+/// Deliberately hand-written rather than derived: a derived `Default` would give
+/// every `VecDocument` the same [`DocumentId`], which is precisely the defect
+/// [`Document::id`] exists to prevent, and every construction path in this file
+/// routes through here.
+impl Default for VecDocument {
+    fn default() -> Self {
+        Self {
+            id: DocumentId::new_unique(),
+            pages: Vec::new(),
+            removed: Vec::new(),
+            allocator: PageIdAllocator::default(),
+            revision: 0,
+        }
+    }
 }
 
 impl VecDocument {
@@ -64,6 +81,10 @@ impl VecDocument {
 }
 
 impl Document for VecDocument {
+    fn id(&self) -> DocumentId {
+        self.id
+    }
+
     fn revision(&self) -> u64 {
         self.revision
     }
