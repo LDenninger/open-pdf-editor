@@ -5,11 +5,12 @@
 //! headless test run the open path without PDFium on the machine.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use opdf_core::document::{Document, DocumentIo, DocumentSnapshot};
 use opdf_core::fakes::{FakeRenderService, VecDocument};
-use opdf_core::page::PageSize;
-use opdf_core::render::RenderService;
+use opdf_core::page::{PageId, PageSize};
+use opdf_core::render::{RenderRequest, RenderResponse, RenderService};
 use opdf_core::{Error, Result};
 
 /// A document the shell has opened, together with the service that renders it.
@@ -68,18 +69,39 @@ impl DocumentOpener for PdfiumDocumentOpener {
 /// Used by every test that needs the open path without needing PDFium.
 pub struct FakeOpener {
     page_count: Option<usize>,
+    unrenderable_index: Option<usize>,
 }
 
 impl FakeOpener {
     /// An opener that always succeeds, producing a document of `page_count`
-    /// A4 pages.
+    /// A4 pages, every one of which rasterizes.
     pub fn with_pages(page_count: usize) -> Self {
-        Self { page_count: Some(page_count) }
+        Self {
+            page_count: Some(page_count),
+            unrenderable_index: None,
+        }
     }
 
     /// An opener that always fails, for testing the error path.
     pub fn failing() -> Self {
-        Self { page_count: None }
+        Self {
+            page_count: None,
+            unrenderable_index: None,
+        }
+    }
+
+    /// An opener whose service refuses the page at `unrenderable_index`.
+    ///
+    /// This is not a contrived case: after the F5 fix the rasterizer resolves a
+    /// page through the index map frozen when the file was opened, so a page
+    /// inserted since then has no position in the file and is refused by design.
+    /// The shell has to survive a page that will never rasterize, however long it
+    /// waits.
+    pub fn with_unrenderable_page(page_count: usize, unrenderable_index: usize) -> Self {
+        Self {
+            page_count: Some(page_count),
+            unrenderable_index: Some(unrenderable_index),
+        }
     }
 }
 
@@ -90,12 +112,64 @@ impl DocumentOpener for FakeOpener {
         };
         let document = VecDocument::with_pages(page_count, PageSize::A4);
         let snapshot = DocumentSnapshot::of(&document)?;
-        let service = Box::new(FakeRenderService::new(snapshot.clone()));
+        let refused = self.unrenderable_index.and_then(|index| snapshot.pages.get(index)).map(|page| page.id);
+        let service: Box<dyn RenderService> = match refused {
+            Some(page) => Box::new(RefusingRenderService::new(snapshot.clone(), page)),
+            None => Box::new(FakeRenderService::new(snapshot.clone())),
+        };
         Ok(OpenedDocument {
             document: Box::new(document),
             service,
             snapshot,
         })
+    }
+}
+
+/// A service that answers one page with a failure and delegates the rest.
+///
+/// The refusal is permanent and instant, which is the shape that matters: a page
+/// the rasterizer cannot resolve does not become resolvable by asking again.
+struct RefusingRenderService {
+    inner: FakeRenderService,
+    unrenderable: PageId,
+    refused: Mutex<Vec<RenderRequest>>,
+}
+
+impl RefusingRenderService {
+    fn new(snapshot: DocumentSnapshot, unrenderable: PageId) -> Self {
+        Self {
+            inner: FakeRenderService::new(snapshot),
+            unrenderable,
+            refused: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl RenderService for RefusingRenderService {
+    fn submit(&self, request: RenderRequest) {
+        if request.page != self.unrenderable {
+            self.inner.submit(request);
+            return;
+        }
+        //--- the contract promises exactly one response per request, refusal included ---
+        if let Ok(mut refused) = self.refused.lock() {
+            refused.push(request);
+        }
+    }
+
+    fn poll(&self) -> Vec<RenderResponse> {
+        let mut responses: Vec<RenderResponse> = match self.refused.lock() {
+            Ok(mut refused) => refused
+                .drain(..)
+                .map(|request| RenderResponse::Failed {
+                    request,
+                    reason: format!("{} has no position in the file this service was opened from", request.page),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        responses.extend(self.inner.poll());
+        responses
     }
 }
 
