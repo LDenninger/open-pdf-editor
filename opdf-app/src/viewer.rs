@@ -7,9 +7,8 @@
 //! rasterizer is not thread-safe.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use opdf_core::document::DocumentSnapshot;
+use opdf_core::document::{DocumentId, DocumentSnapshot};
 use opdf_core::page::Rotation;
 use opdf_core::render::RenderService;
 
@@ -32,28 +31,6 @@ pub const OVERSCAN_SCREENS: f32 = 0.5;
 /// any such wobble and far narrower than a real resize.
 const FIT_VIEWPORT_TOLERANCE_PX: f32 = 4.0;
 
-/// Which document the viewer is showing, distinct for every document opened in
-/// this process.
-///
-/// `opdf_core` has no such notion and does not need one: a
-/// [`DocumentSnapshot::revision`] counts edits *within* one document, and page ids
-/// are allocated per document, so every document — synthetic or parsed — starts
-/// both counts at zero. Two documents therefore produce colliding
-/// [`opdf_core::render::RenderRequest`]s, and a tile cache keyed by request alone
-/// cannot tell one document's pixels from another's. Only the shell knows that a
-/// *different* document was opened, so identity is minted here, and
-/// [`ViewerState::open_document`] is what turns it into a cleared cache.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct DocumentId(u64);
-
-impl DocumentId {
-    /// Mint an identity no other document in this process will be given.
-    pub fn allocate() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self(NEXT.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
 /// How the zoom responds to a resize.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum FitMode {
@@ -69,7 +46,6 @@ pub enum FitMode {
 /// Everything the viewer carries between frames.
 #[derive(Debug)]
 pub struct ViewerState {
-    document: DocumentId,
     snapshot: DocumentSnapshot,
     layout: DocumentLayout,
     current_page: Option<usize>,
@@ -116,7 +92,6 @@ impl ViewerState {
         let layout = compute_document_layout(&snapshot, theme.page_gap_pt, theme.canvas_margin_pt);
         let current_page = if layout.is_empty() { None } else { Some(0) };
         Self {
-            document: DocumentId::allocate(),
             snapshot,
             layout,
             current_page,
@@ -132,10 +107,18 @@ impl ViewerState {
         }
     }
 
-    /// Which document is being shown. Changes only through
-    /// [`ViewerState::open_document`], never through an edit.
+    /// Which document is being shown.
+    ///
+    /// Read straight off the snapshot, which reads it off the document itself.
+    /// The shell used to mint its own identity here, from a private `AtomicU64`,
+    /// because `opdf_core::Document` exposed none — and the renderer could not
+    /// see that value, so the only way to act on it was to empty every cache
+    /// whenever it changed. It is now the same value the renderer keys on.
+    ///
+    /// Changes only through [`ViewerState::open_document`], never through an
+    /// edit: an edit produces a new snapshot of the same document.
     pub fn document_id(&self) -> DocumentId {
-        self.document
+        self.snapshot.document
     }
 
     /// The snapshot being drawn. Every render request is built from this.
@@ -158,20 +141,24 @@ impl ViewerState {
         self.snapshot.page_count()
     }
 
-    /// Show a **different document**: mint a new identity, recompute the layout,
+    /// Show a **different document**: adopt its identity, recompute the layout,
     /// and empty every cache outright.
     ///
     /// This is the path `Open`, `Close`, and generating a synthetic document take.
-    /// Discarding by revision would not be enough and is the bug this method
-    /// exists to prevent: the new document's revision and page ids both start
-    /// where the previous one's did, so its requests are keyed exactly as the
-    /// previous document's cached tiles — open A, then B, and B's pages would be
-    /// drawn from A's pixels.
+    /// Discarding by revision alone would not be enough: the new document's
+    /// revision and page ids both start where the previous one's did, so those
+    /// fields cannot tell the two apart. The snapshot's
+    /// [`DocumentSnapshot::document`] can, and it is part of every render
+    /// request's key — so a late response from the previous document is now
+    /// *rejected by key* rather than merely unlikely to be claimed.
+    ///
+    /// Emptying the caches is still right, and is kept: the previous document's
+    /// tiles can never be served again, so holding them is pure memory cost.
+    /// What changed is that correctness no longer rests on it happening.
     ///
     /// Use [`ViewerState::replace_snapshot`] instead for an edit to the document
     /// already open, which must keep the tiles it can still serve.
     pub fn open_document(&mut self, snapshot: DocumentSnapshot, theme: &Theme, caches: &mut [&mut TextureCache]) {
-        self.document = DocumentId::allocate();
         self.layout = compute_document_layout(&snapshot, theme.page_gap_pt, theme.canvas_margin_pt);
         for cache in caches.iter_mut() {
             cache.clear();
@@ -366,7 +353,7 @@ pub fn step_render_service(
     let snapshot = state.snapshot();
 
     //--- one poll, never waited on; each answer goes to the cache that asked ---
-    let absorbed = absorb_responses_routed(caches, ctx, snapshot.revision, service.poll(), frame_clock);
+    let absorbed = absorb_responses_routed(caches, ctx, snapshot, service.poll(), frame_clock);
 
     let Some(canvas) = caches.first_mut() else {
         return FrameOutcome::default();
@@ -493,7 +480,7 @@ mod tests {
     fn drops_superseded_textures_when_the_snapshot_is_replaced() {
         let (mut state, theme) = build_viewer(10);
         let mut cache = TextureCache::new(1 << 20);
-        let stale = RenderRequest::new(state.snapshot().pages[0].id, state.snapshot().revision, 1.0).unwrap();
+        let stale = RenderRequest::new(state.snapshot().document, state.snapshot().pages[0].id, state.snapshot().revision, 1.0).unwrap();
         cache.mark_pending(stale);
 
         let mut next = build_synthetic_snapshot(10).unwrap();
@@ -726,7 +713,7 @@ mod tests {
             .visible_pages()
             .filter(|index| {
                 snapshot.pages.get(*index).is_none_or(|page| {
-                    let Ok(request) = RenderRequest::new(page.id, snapshot.revision, settings.scale_for_page(page.display_size())) else {
+                    let Ok(request) = RenderRequest::new(snapshot.document, page.id, snapshot.revision, settings.scale_for_page(page.display_size())) else {
                         return false;
                     };
                     !cache.contains(&request.with_rotation(settings.view_rotation))
