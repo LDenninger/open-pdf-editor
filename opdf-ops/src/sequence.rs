@@ -27,7 +27,7 @@ use opdf_core::{Command, Document, Error, Result};
 /// a caller has to be able to tell "your command failed" from "your command
 /// failed *and* the document is now inconsistent", and match on it, because the
 /// second calls for a reload rather than a retry.
-pub(crate) fn roll_back<D: Document>(document: &mut D, applied: Vec<Box<dyn Command<D>>>, label: &str, original: Error) -> Error {
+pub(crate) fn roll_back<D: Document + ?Sized>(document: &mut D, applied: Vec<Box<dyn Command<D>>>, label: &str, original: Error) -> Error {
     for rollback in applied.into_iter().rev() {
         if let Err(rollback_error) = rollback.apply(document) {
             //--- the labels go in the rollback cause, which is the one naming a step the caller did not write ---
@@ -72,19 +72,19 @@ pub(crate) fn roll_back<D: Document>(document: &mut D, applied: Vec<Box<dyn Comm
 /// This is reachable only for a [`Document`] whose mutations can fail for
 /// reasons other than a bad argument — `opdf_core::fakes::VecDocument` cannot
 /// reach it, a document backed by a real file can.
-pub struct Sequence<D: Document> {
+pub struct Sequence<D: Document + ?Sized> {
     label: String,
     commands: Vec<Box<dyn Command<D>>>,
 }
 
-impl<D: Document + 'static> Sequence<D> {
+impl<D: Document + ?Sized + 'static> Sequence<D> {
     /// Build a sequence from an ordered list of sub-commands.
     pub fn new(label: String, commands: Vec<Box<dyn Command<D>>>) -> Self {
         Self { label, commands }
     }
 }
 
-impl<D: Document + 'static> Command<D> for Sequence<D> {
+impl<D: Document + ?Sized + 'static> Command<D> for Sequence<D> {
     fn apply(&self, document: &mut D) -> Result<Box<dyn Command<D>>> {
         let mut applied: Vec<Box<dyn Command<D>>> = Vec::with_capacity(self.commands.len());
         for command in &self.commands {
@@ -119,7 +119,7 @@ mod tests {
     /// rollback path by construction rather than by inspecting the code.
     struct AlwaysFails;
 
-    impl<D: Document> Command<D> for AlwaysFails {
+    impl<D: Document + ?Sized> Command<D> for AlwaysFails {
         fn apply(&self, _document: &mut D) -> Result<Box<dyn Command<D>>> {
             Err(Error::Unsupported("deliberately fails".to_string()))
         }
