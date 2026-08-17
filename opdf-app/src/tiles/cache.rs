@@ -120,6 +120,17 @@ impl<T> TileCache<T> {
         self.entries.contains_key(request)
     }
 
+    /// Every cached entry as a `(request, value)` pair, in no particular order,
+    /// without marking any of them as used.
+    ///
+    /// The drawing code looks entries up by key and has no use for this; it
+    /// exists so that a test can ask *what* the cache is holding rather than only
+    /// how much, which is the difference between proving a tile arrived and
+    /// proving the right pixels did.
+    pub fn entries(&self) -> impl Iterator<Item = (&RenderRequest, &T)> {
+        self.entries.iter().map(|(request, entry)| (request, &entry.value))
+    }
+
     /// Whether this request still needs rasterizing — neither cached nor
     /// already in flight.
     ///
