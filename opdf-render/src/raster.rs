@@ -37,9 +37,10 @@ fn compute_residual_rotation(total: Rotation, file_rotation: Rotation) -> Result
 ///
 /// # Locking
 ///
-/// The caller must already hold [`crate::library::lock_pdfium`], and must keep
+/// The caller must already hold the process-wide Pdfium lock, and must keep
 /// holding it until `page` itself has been dropped. This function calls into
-/// Pdfium throughout, and so do the drops of the page it borrows.
+/// Pdfium throughout, and so do the drops of the page it borrows. Inside
+/// [`crate::library::with_pdfium`] both conditions hold by construction.
 pub fn rasterize_page(page: &PdfPage<'_>, geometry: TileGeometry, file_rotation: Rotation) -> Result<Tile, String> {
     let residual = compute_residual_rotation(geometry.total_rotation, file_rotation)?;
 
