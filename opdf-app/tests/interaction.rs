@@ -22,7 +22,7 @@ use std::path::Path;
 use egui::epaint::ClippedShape;
 use egui::{Context, Event, Key, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Shape, TextureId, Vec2, pos2, vec2};
 use opdf_app::app::OpdfApp;
-use opdf_app::opener::{DocumentOpener, FakeOpener};
+use opdf_app::opener::{DocumentOpener, FakeChooser, FakeOpener};
 use opdf_app::panels::menu_bar::MenuAction;
 use opdf_app::panels::thumbnail_rail::lay_out_thumbnails;
 use opdf_app::synthetic::open_synthetic_document;
@@ -786,4 +786,49 @@ fn an_unrenderable_page_shows_that_it_failed_and_stops_being_requested() {
         repaint_delay > std::time::Duration::ZERO,
         "the shell must settle once every page has an answer, but it asked to be repainted immediately"
     );
+}
+
+//---------------------------------------------------------------------
+// The File menu
+//---------------------------------------------------------------------
+
+#[test]
+fn the_file_menu_opens_the_document_the_chooser_returned() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing("chosen.pdf")), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::OpenDocument, &ctx);
+
+    assert_eq!(app.state().page_count(), 9, "File ▸ Open must open the file the dialog returned");
+    assert_eq!(app.document().map(|document| document.page_count()), Some(9));
+    assert!(app.last_error().is_none());
+}
+
+#[test]
+fn a_cancelled_file_dialog_leaves_the_document_alone_and_reports_nothing() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::cancelling()), Box::new(FakeOpener::with_pages(9)));
+
+    app.apply_action(MenuAction::OpenDocument, &ctx);
+
+    assert_eq!(app.state().page_count(), 3, "cancelling the dialog must not disturb the open document");
+    assert!(
+        app.last_error().is_none(),
+        "changing your mind is not a failure and must not be reported as one"
+    );
+}
+
+#[test]
+fn a_file_menu_open_that_fails_keeps_the_document_and_says_why() {
+    let ctx = Context::default();
+    let opened = FakeOpener::with_pages(3).open(Path::new("a.pdf")).unwrap();
+    let mut app = OpdfApp::new(&ctx, opened).with_open_route(Box::new(FakeChooser::choosing("broken.pdf")), Box::new(FakeOpener::failing()));
+
+    app.apply_action(MenuAction::OpenDocument, &ctx);
+
+    assert_eq!(app.state().page_count(), 3);
+    let message = app.last_error().unwrap_or_default();
+    assert!(message.contains("broken.pdf"), "the failure must name the file the user picked, got: {message}");
 }
